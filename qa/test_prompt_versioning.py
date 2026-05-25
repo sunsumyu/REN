@@ -2,13 +2,17 @@ import os
 import sys
 import shutil
 
-# Delete existing DB before import to ensure test is fully idempotent
+# Clean the DB tables before import to ensure test is fully idempotent (without deleting the file since it may be locked by the web server)
 db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.db")
-if os.path.exists(db_path):
-    try:
-        os.remove(db_path)
-    except Exception:
-        pass
+import sqlite3
+try:
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TABLE IF EXISTS prompt_versions;")
+    conn.commit()
+    conn.close()
+    print("  - [Idempotent DB Reset] SQLite tables dropped successfully for a pristine test environment.")
+except Exception as e:
+    pass
 
 # Add current directory to path to ensure we can import prompts
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))

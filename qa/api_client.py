@@ -3,6 +3,7 @@ import httpx
 import logging
 import random
 from typing import List, Dict, Any, Set
+from pydantic import BaseModel
 import config
 
 # Setup logging
@@ -40,9 +41,20 @@ class APIClient:
                     raise Exception(error_msg)  # 致命错误，直接抛出，中断重试循环
                 else:
                     response.raise_for_status()
-                    return response.json()
-            except (httpx.HTTPError, httpx.NetworkError) as e:
-                logger.error(f"HTTP/Network error on request {method} {url}: {e}")
+                    res_json = response.json()
+                    if isinstance(res_json, dict) and "error" in res_json and res_json["error"]:
+                        err_detail = res_json["error"]
+                        err_msg = err_detail.get("message", "Unknown API error")
+                        err_code = err_detail.get("code", "")
+                        logger.warning(f"API gateway returned error payload inside HTTP 200: {err_msg} (code: {err_code})")
+                        raise httpx.HTTPStatusError(
+                            message=f"API payload error: {err_msg} (code: {err_code})",
+                            request=response.request,
+                            response=response
+                        )
+                    return res_json
+            except (httpx.HTTPStatusError, httpx.HTTPError, httpx.NetworkError) as e:
+                logger.error(f"HTTP/API error on request {method} {url}: {e}")
             
             retries += 1
             if retries > config.MAX_RETRIES:
@@ -139,3 +151,83 @@ class APIClient:
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Failed to parse LLM response format: {response_data}")
             raise Exception(f"Invalid LLM response format: {e}")
+
+    async def call_llm_structured(self, messages: List[Dict[str, str]], response_model: type) -> Any:
+        """
+        Calls the LLM using API-level Structured Outputs with JSON Schema strict constraints.
+        Includes a 2-attempt Self-Healing loop to correct formats recursively in case of Pydantic validation failures.
+        Returns an instance of the validated response_model.
+        """
+        if not config.LLM_API_KEY:
+            logger.warning("LLM_API_KEY is not set! Call might fail.")
+            
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        # Handle Bearer token
+        api_key = config.LLM_API_KEY.strip()
+        if api_key:
+            if api_key.startswith("Bearer "):
+                headers["Authorization"] = api_key
+            else:
+                headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["Authorization"] = "Bearer dummy"
+
+        # Self-healing retry loop (limit to 2 retries)
+        max_healing_attempts = 2
+        current_messages = list(messages)
+        
+        for attempt in range(max_healing_attempts + 1):
+            data = {
+                "model": config.LLM_MODEL,
+                "messages": current_messages,
+                "temperature": 0.1,  # Keep low temperature for strict schema generation
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": response_model.__name__,
+                        "strict": True,
+                        "schema": response_model.model_json_schema()
+                    }
+                }
+            }
+            
+            if attempt > 0:
+                logger.warning(f"Self-Healing formatted retry attempt {attempt} / {max_healing_attempts} for model: {response_model.__name__}")
+            else:
+                logger.info(f"Calling LLM ({config.LLM_MODEL}) in Structured Output Mode for {response_model.__name__}...")
+                
+            response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
+            
+            try:
+                content = response_data["choices"][0]["message"]["content"]
+                # Validate and parse directly into the Pydantic model
+                return response_model.model_validate_json(content)
+            except Exception as e:
+                logger.error(f"Pydantic Validation or parsing failed on attempt {attempt}: {e}")
+                if attempt >= max_healing_attempts:
+                    logger.critical(f"Self-Healing exhausted all {max_healing_attempts} retries for model: {response_model.__name__}")
+                    raise e
+                
+                # Fetch incorrect content safely
+                raw_incorrect = ""
+                try:
+                    raw_incorrect = response_data["choices"][0]["message"]["content"]
+                except Exception:
+                    raw_incorrect = str(response_data)
+                
+                # Append assistant incorrect answer and correction prompt as user
+                current_messages.append({"role": "assistant", "content": raw_incorrect})
+                
+                # Construct detailed error description to feed back
+                error_desc = str(e)
+                feedback_prompt = (
+                    f"Your previous response failed Pydantic validation with the following error:\n"
+                    f"'{error_desc}'\n\n"
+                    f"Please output a corrected, valid JSON object that strictly adheres to the requested JSON schema. "
+                    f"Ensure all required fields are filled correctly and values match any defined Enums exactly. "
+                    f"Do not add any markup wrapping, markdown fences, or conversational prefix/suffix text."
+                )
+                current_messages.append({"role": "user", "content": feedback_prompt})

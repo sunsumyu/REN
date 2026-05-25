@@ -3,6 +3,13 @@ import json
 import os
 import sys
 import logging
+
+# Reconfigure stdout/stderr to use UTF-8 under Windows to prevent GBK UnicodeEncodeErrors when printing emojis
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 from api_client import APIClient
 from pipeline import MedicalQAPipeline
 
