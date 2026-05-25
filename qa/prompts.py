@@ -1,7 +1,7 @@
 from jinja2 import Template
 
-# 1. 问题创造者 (Question Creator)
-QUESTION_CREATOR_TEMPLATE = """<role>
+# 1. 问题创造者 (Question Creator) - 默认自引导模版
+_BOOTSTRAP_QUESTION_CREATOR_TEMPLATE = """<role>
 问题创造者（Question Creator）
 </role>
 
@@ -44,8 +44,8 @@ context: [
 - 只输出 JSON 数组
 """
 
-# 2. 角度规划者 (Facet Planner)
-FACET_PLANNER_TEMPLATE = """<role>
+# 2. 角度规划者 (Facet Planner) - 默认自引导模版
+_BOOTSTRAP_FACET_PLANNER_TEMPLATE = """<role>
 问题角度规划者（Facet Planner）
 </role>
 
@@ -81,8 +81,8 @@ query: {{ query }}
 ## 输出
 """
 
-# 3. 角度补充者 (Facet Expander)
-FACET_EXPANDER_TEMPLATE = """<role>
+# 3. 角度补充者 (Facet Expander) - 默认自引导模版
+_BOOTSTRAP_FACET_EXPANDER_TEMPLATE = """<role>
 Facet Expander
 </role>
 
@@ -110,8 +110,8 @@ Facet Expander
 ## 输出
 """
 
-# 4. 角度筛选者 (Facet Reducer)
-FACET_REDUCER_TEMPLATE = """<role>
+# 4. 角度筛选者 (Facet Reducer) - 默认自引导模版
+_BOOTSTRAP_FACET_REDUCER_TEMPLATE = """<role>
 Facet Reducer
 </role>
 
@@ -145,8 +145,8 @@ Facet Reducer
 ## 输出
 """
 
-# 5. 按角度回答 (FacetGraph-QA Agent)
-FACET_QA_TEMPLATE = """# FacetGraph-QA Agent（Synthesis / Evidence-First）
+# 5. 按角度回答 (FacetGraph-QA Agent) - 默认自引导模版
+_BOOTSTRAP_FACET_QA_TEMPLATE = """# FacetGraph-QA Agent（Synthesis / Evidence-First）
 
 你是一个“Facet 驱动的知识图谱问答生成器（FacetGraph-QA Agent）”。你的任务是：在给定问题 **Q** 与**facet（回答出发点/侧重点）** 的同时，还会给你一组与问题高度相关的 **参考资料包（refs）**。
 
@@ -261,8 +261,8 @@ FACET_QA_TEMPLATE = """# FacetGraph-QA Agent（Synthesis / Evidence-First）
 请直接生成包含 `<think><facet = {{ facet }}>...</think>` 推理部分以及后续正文回答的文本。
 """
 
-# 6. 多角度回答去除冗余 (Facet Redundancy Detector)
-FACET_REDUNDANCY_DETECTOR_TEMPLATE = """<role>
+# 6. 多角度回答去除冗余 (Facet Redundancy Detector) - 默认自引导模版
+_BOOTSTRAP_FACET_REDUNDANCY_DETECTOR_TEMPLATE = """<role>
 多角度回答冗余判别器（Facet Redundancy Detector）
 </role>
 
@@ -357,8 +357,8 @@ Step 3: 去重原则
 </output_format>
 """
 
-# 7. 多答案综合总结器 (Multi-Answer Synthesis Agent)
-MULTI_ANSWER_SYNTHESIS_TEMPLATE = """<role>
+# 7. 多答案综合总结器 (Multi-Answer Synthesis Agent) - 默认自引导模版
+_BOOTSTRAP_MULTI_ANSWER_SYNTHESIS_TEMPLATE = """<role>
 多答案综合总结器（Multi-Answer Synthesis Agent）
 </role>
 
@@ -436,8 +436,8 @@ Step 5：质量自检
 </output_requirement>
 """
 
-# 8. 多轮下一问题生成器 (Next Question Generator)
-NEXT_QUESTION_TEMPLATE = """<role>
+# 8. 多轮下一问题生成器 (Next Question Generator) - 默认自引导模版
+_BOOTSTRAP_NEXT_QUESTION_TEMPLATE = """<role>
 多轮对话下一问创造者 (Next Question Generator)
 </role>
 
@@ -480,3 +480,61 @@ def render_prompt(template_str: str, **kwargs) -> str:
     """
     t = Template(template_str)
     return t.render(**kwargs)
+
+
+# ==========================================
+# 提示词版本管理器透明集成层
+# ==========================================
+from prompt_manager import PromptManager
+
+_manager = PromptManager()
+
+PROMPT_NAMES = [
+    "QUESTION_CREATOR_TEMPLATE", 
+    "FACET_PLANNER_TEMPLATE",
+    "FACET_EXPANDER_TEMPLATE", 
+    "FACET_REDUCER_TEMPLATE",
+    "FACET_QA_TEMPLATE", 
+    "FACET_REDUNDANCY_DETECTOR_TEMPLATE",
+    "MULTI_ANSWER_SYNTHESIS_TEMPLATE", 
+    "NEXT_QUESTION_TEMPLATE"
+]
+
+# 自动引导灌入默认版本
+for name in PROMPT_NAMES:
+    default_val = globals().get(f"_BOOTSTRAP_{name}")
+    if default_val:
+        _manager.register_prompt(name, default_val)
+
+def __getattr__(name: str) -> str:
+    """
+    拦截对模板的变量读取，自动从数据库获取当前被激活的提示词。
+    符合 Python 3.7+ 模块级动态属性规范。
+    """
+    if name in PROMPT_NAMES:
+        return _manager.get_prompt(name)
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+def update_prompt(name: str, new_content: str, description: str = "") -> int:
+    """
+    保存并激活某个提示词的新版本，旧版本自动退役为历史记录。
+    """
+    if name not in PROMPT_NAMES:
+        raise ValueError(f"Unknown prompt name: {name}. Must be one of {PROMPT_NAMES}")
+    return _manager.save_new_version(name, new_content, description)
+
+def rollback_prompt(name: str, version: int) -> bool:
+    """
+    将某个提示词回滚并重新激活历史指定版本。
+    """
+    if name not in PROMPT_NAMES:
+        raise ValueError(f"Unknown prompt name: {name}")
+    return _manager.rollback_to_version(name, version)
+
+def list_prompt_versions(name: str) -> list:
+    """
+    查询某个提示词的完整历史版本清单。
+    """
+    if name not in PROMPT_NAMES:
+        raise ValueError(f"Unknown prompt name: {name}")
+    return _manager.list_versions(name)

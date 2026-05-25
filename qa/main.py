@@ -12,7 +12,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("D:\\REN\\pipeline_execution.log", encoding="utf-8")
+        logging.FileHandler(os.path.join(os.path.dirname(__file__), "pipeline_execution.log"), encoding="utf-8")
     ]
 )
 logger = logging.getLogger("MedicalQA.Main")
@@ -25,7 +25,7 @@ async def run_generator():
     if not config.LLM_API_KEY:
         print("="*60)
         print("警告: 您的 LLM_API_KEY 环境变量未设置！")
-        print("请在 D:\\REN\\.env 文件中配置您的大模型 API 密钥。例如:")
+        print("请在 .env 文件中配置您的大模型 API 密钥。例如:")
         print("LLM_API_KEY=Bearer 您的密钥")
         print("="*60)
         # Continue anyway, let the client try to send requests (maybe it's a public interface)
@@ -38,14 +38,14 @@ async def run_generator():
         dataset = await pipeline.generate_multi_round_dataset()
         
         # Save output JSON
-        output_file = "D:\\REN\\medical_qa_dataset.json"
+        output_file = os.path.join(os.path.dirname(__file__), "medical_qa_dataset.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(dataset, f, indent=2, ensure_ascii=False)
             
         print("\n" + "="*60)
         print("🎉 医药知识图谱多视角多轮问答数据集生成成功！")
         print(f"📁 数据集保存路径: {output_file}")
-        print(f"📝 运行执行日志: D:\\REN\\pipeline_execution.log")
+        print(f"📝 运行执行日志: {os.path.join(os.path.dirname(__file__), 'pipeline_execution.log')}")
         
         # Display a quick summary of the generated conversation
         print("\n=== 对话数据概览 ===")
@@ -60,7 +60,7 @@ async def run_generator():
     except Exception as e:
         logger.critical(f"Pipeline execution encountered an unhandled exception: {e}", exc_info=True)
         print(f"\n❌ 生成失败: {e}", file=sys.stderr)
-        print("请检查网络连通性、API Key 配置或日志文件 D:\\REN\\pipeline_execution.log", file=sys.stderr)
+        print("请检查网络连通性、API Key 配置或日志文件 pipeline_execution.log", file=sys.stderr)
     finally:
         await client.close()
 
