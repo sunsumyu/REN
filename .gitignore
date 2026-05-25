@@ -1,0 +1,21 @@
+# Environment variables (Sensitive API keys)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Generated logs & datasets
+*.log
+medical_qa_dataset.json
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
