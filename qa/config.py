@@ -29,6 +29,11 @@ MAX_RETRIES = 5  # 提升重试次数提升鲁棒性
 RETRY_BACKOFF_FACTOR = 2.0  # 增加退避斜率以充分应对网关滑动窗口
 CONCURRENT_QA_LIMIT = 4     # 并行解答的并发度限制
 
+# 批处理高并发速率控制
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))                  # 单次并发生成的总样本数
+BATCH_CONCURRENCY_LIMIT = int(os.getenv("BATCH_CONCURRENCY_LIMIT", "3"))  # 同时进行的多轮对话生成任务上限
+GLOBAL_API_SEMAPHORE = int(os.getenv("GLOBAL_API_SEMAPHORE", "6"))      # 全局大模型并发限制（防429）
+
 # 裁判打分阶段前的缓冲避让冷却（秒）
 SOFT_DELAY_BEFORE_JUDGE = float(os.getenv("SOFT_DELAY_BEFORE_JUDGE", "3.0"))
 

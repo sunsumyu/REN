@@ -444,15 +444,16 @@ class MedicalQAPipeline:
         }
         return round_data
 
-    async def generate_multi_round_dataset(self) -> Dict[str, Any]:
+    async def generate_multi_round_dataset(self, intent: Dict[str, Any] = None, task_id_label: str = "") -> Dict[str, Any]:
         """
         Executes a 3 to 8 round dialog flow, generating and nesting QA rounds.
         Upgraded to Intention-Guided Graph-RAG (Phase 4), merging high-quality clinical themes to isolate intent context.
         """
+        log_prefix = f"[{task_id_label}] " if task_id_label else ""
         # Determine random number of rounds
         import os
         num_rounds = int(os.getenv("NUM_ROUNDS", 1))
-        logger.info(f"=== Starting Multi-Round Generation: {num_rounds} Rounds ===")
+        logger.info(f"{log_prefix}=== Starting Multi-Round Generation: {num_rounds} Rounds ===")
         
         # Phase 4 Intention themes and seed structures
         intents = [
@@ -488,14 +489,14 @@ class MedicalQAPipeline:
             }
         ]
         
-        selected_intent = random.choice(intents)
-        logger.info(f"--- Intention-Guided Graph-RAG Active! Selected Theme: '{selected_intent['theme']}' ---")
+        selected_intent = intent if intent is not None else random.choice(intents)
+        logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Active! Selected Theme: '{selected_intent['theme']}' ---")
         
         # 1. Fetch initial graph context and merge with intent seeds
         try:
             graph_data = await self.api_client.fetch_random_knowledge_graph(count=1)
         except Exception as e:
-            logger.warning(f"Failed to fetch random KG data: {e}. Reverting entirely to intent seeds.")
+            logger.warning(f"{log_prefix}Failed to fetch random KG data: {e}. Reverting entirely to intent seeds.")
             graph_data = {"entities": [], "relationships": []}
             
         if "entities" not in graph_data or not graph_data["entities"]:
@@ -527,7 +528,7 @@ class MedicalQAPipeline:
         current_q = q1
         
         for r in range(1, num_rounds + 1):
-            logger.info(f"=== Running Round {r} / {num_rounds} ===")
+            logger.info(f"{log_prefix}=== Running Round {r} / {num_rounds} ===")
             
             # Execute round pipeline
             round_result = await self.generate_single_round(current_q, refs, history)
@@ -540,17 +541,17 @@ class MedicalQAPipeline:
                 # Add small random chance to pull more KG entities to keep context rich in long dialogues
                 if random.random() < 0.3:
                     try:
-                        logger.info("Random trigger: Fetching additional entities to expand dialog horizon...")
+                        logger.info(f"{log_prefix}Random trigger: Fetching additional entities to expand dialog horizon...")
                         additional_graph = await self.api_client.fetch_random_knowledge_graph(count=1)
                         new_context, new_refs = await self._prepare_context_and_refs(additional_graph, query=current_q)
                         context_list.extend(new_context)
                         refs.extend(new_refs)
                     except Exception as e:
-                        logger.warning(f"Failed to fetch additional KG entities: {e}. Continuing with current context.")
+                        logger.warning(f"{log_prefix}Failed to fetch additional KG entities: {e}. Continuing with current context.")
                         
                 current_q = await self.generate_next_question(context_list, history, round_result["summary"])
                 
-        logger.info("=== Multi-Round Dialog Generation Completed! ===")
+        logger.info(f"{log_prefix}=== Multi-Round Dialog Generation Completed! ===")
         # The final dialog trajectory is the last round structure, which contains all previous history
         history[-1]["refs"] = refs
         return history[-1]

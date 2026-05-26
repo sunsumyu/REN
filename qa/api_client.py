@@ -17,6 +17,7 @@ class APIClient:
         # Using httpx.AsyncClient for high performance asynchronous calls
         self.client = httpx.AsyncClient(timeout=60.0)
         self.supported_models: List[str] = []
+        self.global_semaphore = asyncio.Semaphore(config.GLOBAL_API_SEMAPHORE)
 
     async def close(self):
         await self.client.aclose()
@@ -30,7 +31,8 @@ class APIClient:
         
         while True:
             try:
-                response = await self.client.request(method, url, **kwargs)
+                async with self.global_semaphore:
+                    response = await self.client.request(method, url, **kwargs)
                 
                 # Check for rate limit or server errors
                 if response.status_code == 429:
