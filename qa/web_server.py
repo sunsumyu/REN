@@ -92,6 +92,66 @@ class MixedHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 logger.error(f"Failed to fetch history for {prompt_name}: {e}")
                 self.send_error_response(500, f"Error: {e}")
                 
+        # 3. API: Fetch the latest automated evaluation report
+        elif path == "/api/evals/report":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            
+            try:
+                report_file = os.path.join(DIRECTORY, "evaluation_report.json")
+                if os.path.exists(report_file):
+                    with open(report_file, "r", encoding="utf-8") as f:
+                        report_data = json.load(f)
+                    response = {"success": True, "data": report_data}
+                else:
+                    response = {
+                        "success": True,
+                        "data": {
+                            "summary": {
+                                "total_cases": 0,
+                                "average_grounding_score": 0.0,
+                                "average_isolation_score": 0.0,
+                                "schema_conformance_rate": 0.0,
+                                "refusal_avoidance_rate": 0.0
+                            },
+                            "results": []
+                        }
+                    }
+                self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Failed to fetch evaluation report: {e}")
+                self.send_error_response(500, f"Error: {e}")
+                
+        # 4. API: Fetch all combined daily datasets (supports new JSONL and old JSON fallbacks)
+        elif path == "/api/datasets/all":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            
+            try:
+                combined_data = []
+                
+                # 1. Load from the new standard medical_qa_dataset.jsonl line by line
+                jsonl_file = os.path.join(DIRECTORY, "medical_qa_dataset.jsonl")
+                if os.path.exists(jsonl_file):
+                    try:
+                        with open(jsonl_file, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        combined_data.append(json.loads(line))
+                                    except Exception as line_e:
+                                        logger.warning(f"Failed to parse JSONL line: {line_e}")
+                    except Exception as e:
+                        logger.error(f"Could not load JSONL dataset file {jsonl_file}: {e}")
+                                
+                self.wfile.write(json.dumps(combined_data, ensure_ascii=False).encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Failed to fetch combined datasets: {e}")
+                self.send_error_response(500, f"Error: {e}")
+                
         else:
             # Fallback to standard static file serving
             super().do_GET()

@@ -132,7 +132,7 @@ class MedicalQAPipeline:
         Generate multiple questions from context and pick one randomly.
         """
         prompt = prompts.render_prompt(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
-        response = await self.api_client.call_llm(prompt)
+        response = await self.api_client.call_llm(prompt, model_pool="lightweight")
         questions = parse_json_safely(response, [])
         
         if not questions:
@@ -152,7 +152,7 @@ class MedicalQAPipeline:
         messages = [{"role": "user", "content": prompt}]
         try:
             # Enforce dynamic structured output using FacetPlan Pydantic model
-            result: FacetPlan = await self.api_client.call_llm_structured(messages, FacetPlan)
+            result: FacetPlan = await self.api_client.call_llm_structured(messages, FacetPlan, model_pool="lightweight")
             # Extract list of facet values (strings) from Pydantic Enum list
             facets = [f.value for f in result.facets]
             logger.info(f"Planned initial facets strictly via Pydantic: {facets}")
@@ -172,7 +172,7 @@ class MedicalQAPipeline:
         if count > 8:
             logger.info(f"Facet count {count} > 8. Running Facet Reducer...")
             prompt = prompts.render_prompt(prompts.FACET_REDUCER_TEMPLATE, query=query, facets=facets)
-            response = await self.api_client.call_llm(prompt)
+            response = await self.api_client.call_llm(prompt, model_pool="lightweight")
             reduced_facets = parse_json_safely(response, [])
             if len(reduced_facets) == 8:
                 return reduced_facets
@@ -183,7 +183,7 @@ class MedicalQAPipeline:
         elif 2 < count < 8:
             logger.info(f"Facet count {count} is between 2 and 8. Running Facet Expander...")
             prompt = prompts.render_prompt(prompts.FACET_EXPANDER_TEMPLATE, query=query, facets=facets)
-            response = await self.api_client.call_llm(prompt)
+            response = await self.api_client.call_llm(prompt, model_pool="lightweight")
             expanded_new = parse_json_safely(response, [])
             
             # Combine unique facets
@@ -233,7 +233,7 @@ class MedicalQAPipeline:
                 # Structured output loop with quality check retries
                 for q_attempt in range(max_quality_attempts + 1):
                     # Enforce structural decoding using FacetQAOutput model
-                    result: FacetQAOutput = await self.api_client.call_llm_structured(messages, FacetQAOutput)
+                    result: FacetQAOutput = await self.api_client.call_llm_structured(messages, FacetQAOutput, model_pool="premium")
                     
                     is_passed, reason = self._check_answer_quality(result.answer_body)
                     if is_passed:
@@ -282,7 +282,7 @@ class MedicalQAPipeline:
                 reason = ""
                 
                 for fb_attempt in range(max_quality_attempts + 1):
-                    raw_response = await self.api_client.call_llm(fallback_prompt)
+                    raw_response = await self.api_client.call_llm(fallback_prompt, model_pool="premium")
                     
                     check_body = raw_response
                     if "</think>" in raw_response:
@@ -342,7 +342,7 @@ class MedicalQAPipeline:
         Call Facet Redundancy Detector to filter out redundant perspective answers.
         """
         prompt = prompts.render_prompt(prompts.FACET_REDUNDANCY_DETECTOR_TEMPLATE, query=query, planners=planners)
-        response = await self.api_client.call_llm(prompt)
+        response = await self.api_client.call_llm(prompt, model_pool="lightweight")
         indices_to_remove = parse_json_safely(response, [])
         
         if not isinstance(indices_to_remove, list):
@@ -375,7 +375,7 @@ class MedicalQAPipeline:
             answers_clean.append(ans_body)
             
         prompt = prompts.render_prompt(prompts.MULTI_ANSWER_SYNTHESIS_TEMPLATE, query=query, answers=answers_clean)
-        summary = await self.api_client.call_llm(prompt)
+        summary = await self.api_client.call_llm(prompt, model_pool="premium")
         logger.info("Successfully synthesized final answer summary.")
         return summary
 
@@ -389,7 +389,7 @@ class MedicalQAPipeline:
             history=history,
             summary=previous_summary
         )
-        next_q = await self.api_client.call_llm(prompt)
+        next_q = await self.api_client.call_llm(prompt, model_pool="lightweight")
         next_q = next_q.strip().strip('"').strip("'")
         logger.info(f"Generated next question: '{next_q}'")
         return next_q
@@ -541,6 +541,7 @@ class MedicalQAPipeline:
                 
         logger.info("=== Multi-Round Dialog Generation Completed! ===")
         # The final dialog trajectory is the last round structure, which contains all previous history
+        history[-1]["refs"] = refs
         return history[-1]
 
     def _check_answer_quality(self, answer_body: str) -> Tuple[bool, str]:

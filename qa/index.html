@@ -31,6 +31,10 @@
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.5 1z"></path></svg>
                 提示词控制台 (Prompt Hub)
             </button>
+            <button class="tab-btn" id="tab-evals" onclick="switchTab('evals')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                质量评估大盘 (Evals)
+            </button>
         </nav>
     </header>
 
@@ -126,6 +130,113 @@
                 </h3>
                 <div id="version-timeline" class="version-timeline">
                     <!-- Timeline items injected here -->
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- TAB 3: EVALUATION EXPLORER VIEW -->
+    <div class="app-layout" id="layout-evals">
+        <aside class="sidebar">
+            <h2>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="22" y1="12" x2="18" y2="12"></line><line x1="6" y1="12" x2="2" y2="12"></line><line x1="12" y1="6" x2="12" y2="2"></line><line x1="12" y1="22" x2="12" y2="18"></line></svg>
+                测试用例集
+            </h2>
+            <div id="eval-cases-list" class="round-list">
+                <!-- Evals cases items injected here -->
+            </div>
+        </aside>
+
+        <main class="main-content flex-row">
+            <!-- Left panel: Metrics summaries and Radar chart representation -->
+            <section class="prompt-workspace-panel">
+                <div class="question-header" style="margin-bottom: 24px;">
+                    <div class="question-label">自动化评测质量指标总览 (Quality Summary)</div>
+                    <div class="question-text" style="font-size: 1.1em; color: var(--text-muted); line-height: 1.6;">
+                        参考 Anthropic 智能体评估原则，我们将自动化基准测试结果分为四个核心维度打分。
+                    </div>
+                </div>
+
+                <!-- Metrics scoreboard -->
+                <div class="eval-metrics-grid">
+                    <div class="metric-score-card">
+                        <div class="metric-card-title">业务成功率 (Business Success)</div>
+                        <div class="metric-card-value" id="val-success-rate">0%</div>
+                        <div class="metric-card-desc">各项底线及质量指标均达标的完美用例占比。</div>
+                    </div>
+                    <div class="metric-score-card">
+                        <div class="metric-card-title">平均召回率 (Average Recall)</div>
+                        <div class="metric-card-value" id="val-recall-rate">0%</div>
+                        <div class="metric-card-desc">生成的回答中命中了预期核心知识点关键词的平均占比。</div>
+                    </div>
+                    <div class="metric-score-card">
+                        <div class="metric-card-title">格式契合率 (Schema Conformance)</div>
+                        <div class="metric-card-value" id="val-schema-rate">0%</div>
+                        <div class="metric-card-desc">大模型输出完美通过 Pydantic 强类型解析的占比。</div>
+                    </div>
+                    <div class="metric-score-card">
+                        <div class="metric-card-title">防拒答通过率 (Refusal Avoidance)</div>
+                        <div class="metric-card-value" id="val-refusal-rate">0%</div>
+                        <div class="metric-card-desc">成功产出高质量中立事实医学正文，没有发生逃避拒答的占比。</div>
+                    </div>
+                    <div class="metric-score-card">
+                        <div class="metric-card-title">事实忠实度评分 (Grounding Score)</div>
+                        <div class="metric-card-value" id="val-grounding-score">0.0 / 10</div>
+                        <div class="metric-card-desc">裁判模型评分：是否有超出 refs 范围的臆造幻觉或漏掉核心配伍禁忌。</div>
+                    </div>
+                    <div class="metric-score-card">
+                        <div class="metric-card-title">领域隔离度评分 (Domain Isolation)</div>
+                        <div class="metric-card-value" id="val-isolation-score">0.0 / 10</div>
+                        <div class="metric-card-desc">裁判模型评分：正文中是否完美清除了 data few-shot 带来的非医学跑题词。</div>
+                    </div>
+                </div>
+
+                <!-- Radar representation mock -->
+                <div class="eval-radar-mock">
+                    <div style="margin-bottom: 12px; font-weight: 500; font-size: 0.9em; text-transform: uppercase; color: var(--accent-bright);">智能体综合防线雷达 (Agent Defense Radar)</div>
+                    <div class="radar-bars-container">
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">格式物理概率锁 (Pydantic Strict Decoding)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-schema" style="width: 0%;"></div></div>
+                        </div>
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">事实指南锚定防线 (Guideline Grounding)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-grounding" style="width: 0%; background: linear-gradient(90deg, #10b981, #34d399);"></div></div>
+                        </div>
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">Few-shot 隔离防线 (Domain Isolation)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-isolation" style="width: 0%; background: linear-gradient(90deg, #8b5cf6, #a78bfa);"></div></div>
+                        </div>
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">学术豁免防拒答防线 (Safety Refusal Bypass)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-refusal" style="width: 0%; background: linear-gradient(90deg, #f59e0b, #fbbf24);"></div></div>
+                        </div>
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">逻辑推导可解释性 (Explainability)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-explainability" style="width: 0%; background: linear-gradient(90deg, #ec4899, #f472b6);"></div></div>
+                        </div>
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">临床用语专业性 (Professionalism)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-professionalism" style="width: 0%; background: linear-gradient(90deg, #0ea5e9, #38bdf8);"></div></div>
+                        </div>
+                        <div class="radar-bar-item">
+                            <span class="radar-bar-label">核心诉求相关性 (Relevance)</span>
+                            <div class="radar-bar-outer"><div class="radar-bar-inner" id="radar-bar-relevance" style="width: 0%; background: linear-gradient(90deg, #14b8a6, #2dd4bf);"></div></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right panel: Selected Case Detailed report -->
+            <section class="prompt-history-panel" style="width: 450px;">
+                <h3>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                    评测用例详情 (Case Inspector)
+                </h3>
+                <div id="eval-case-inspector" class="eval-case-inspector">
+                    <div style="text-align: center; color: var(--text-muted); margin-top: 100px;">
+                        请从左侧测试用例集中选择用例查看裁判详细评审评语。
+                    </div>
                 </div>
             </section>
         </main>

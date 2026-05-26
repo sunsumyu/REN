@@ -30,6 +30,8 @@ function switchTab(tabName) {
     // Load data for the selected tab if needed
     if (tabName === 'prompt' && allPrompts.length === 0) {
         fetchPrompts();
+    } else if (tabName === 'evals') {
+        fetchEvaluationReport();
     }
 }
 
@@ -38,16 +40,27 @@ function switchTab(tabName) {
 // ==========================================================
 async function fetchDataset() {
     try {
-        const response = await fetch('medical_qa_dataset.json');
+        const response = await fetch('/api/datasets/all');
         if (!response.ok) throw new Error('Network response was not ok');
         const data = await response.json();
         
         allRounds = [];
-        if (data.history && Array.isArray(data.history)) {
-            data.history.forEach(h => allRounds.push(h));
-        }
-        if (data.Q) {
-            allRounds.push(data);
+        if (Array.isArray(data)) {
+            data.forEach(dataset => {
+                if (dataset.history && Array.isArray(dataset.history)) {
+                    dataset.history.forEach(h => allRounds.push(h));
+                }
+                if (dataset.Q) {
+                    allRounds.push(dataset);
+                }
+            });
+        } else {
+            if (data.history && Array.isArray(data.history)) {
+                data.history.forEach(h => allRounds.push(h));
+            }
+            if (data.Q) {
+                allRounds.push(data);
+            }
         }
 
         if (allRounds.length === 0) {
@@ -377,4 +390,184 @@ function escapeHtml(unsafe) {
          .replace(/>/g, "&gt;")
          .replace(/"/g, "&quot;")
          .replace(/'/g, "&#039;");
+}
+
+// ==========================================================
+// TAB 3: EVALUATION REPORT LOGIC
+// ==========================================================
+let evaluationData = null;
+
+async function fetchEvaluationReport() {
+    try {
+        const response = await fetch('/api/evals/report');
+        if (!response.ok) throw new Error('API connection failed');
+        const res = await response.json();
+        
+        if (res.success && res.data) {
+            evaluationData = res.data;
+            renderEvaluationDashboard();
+        } else {
+            throw new Error(res.msg || 'Failed to fetch evels data');
+        }
+    } catch (error) {
+        console.error('Failed to load evaluation report:', error);
+        showToast('无法连接评测API，请确认 run_evals.py 运行生成过报告！', 'error');
+    }
+}
+
+function renderEvaluationDashboard() {
+    if (!evaluationData) return;
+    
+    const summary = evaluationData.summary || {};
+    const results = evaluationData.results || [];
+    
+    // Update Scorecard Values
+    document.getElementById('val-success-rate').textContent = `${summary.success_rate || 0}%`;
+    document.getElementById('val-recall-rate').textContent = `${summary.average_recall ? (summary.average_recall * 100).toFixed(1) : 0}%`;
+    document.getElementById('val-schema-rate').textContent = `${summary.schema_conformance_rate || 0}%`;
+    document.getElementById('val-refusal-rate').textContent = `${summary.refusal_avoidance_rate || 0}%`;
+    
+    // Animate Radar bars
+    const schemaRate = summary.schema_conformance_rate || 0;
+    const refusalRate = summary.refusal_avoidance_rate || 0;
+    const groundingPct = (summary.average_grounding_score || 0) * 10;
+    const isolationPct = (summary.average_isolation_score || 0) * 10;
+    const explainabilityPct = (summary.average_explainability_score || 0) * 10;
+    const professionalismPct = (summary.average_professionalism_score || 0) * 10;
+    const relevancePct = (summary.average_relevance_score || 0) * 10;
+    
+    document.getElementById('radar-bar-schema').style.width = `${schemaRate}%`;
+    document.getElementById('radar-bar-grounding').style.width = `${groundingPct}%`;
+    document.getElementById('radar-bar-isolation').style.width = `${isolationPct}%`;
+    document.getElementById('radar-bar-refusal').style.width = `${refusalRate}%`;
+    document.getElementById('radar-bar-explainability').style.width = `${explainabilityPct}%`;
+    document.getElementById('radar-bar-professionalism').style.width = `${professionalismPct}%`;
+    document.getElementById('radar-bar-relevance').style.width = `${relevancePct}%`;
+    
+    // Populate Cases list (Left Sidebar)
+    const list = document.getElementById('eval-cases-list');
+    list.innerHTML = '';
+    
+    if (results.length === 0) {
+        list.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 20px;">基准测试集为空。</div>`;
+        return;
+    }
+    
+    results.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.className = 'round-item';
+        
+        // Custom badge representation
+        const categoryLabel = item.category === 'standard_clinical' ? '循证' : (item.category === 'refusal_boundary' ? '边界' : '防泄露');
+        
+        div.innerHTML = `
+            <div class="round-item-title" style="display: flex; justify-content: space-between; align-items: center;">
+                <span>用例 ${item.case_id} (${categoryLabel})</span>
+                <span class="timeline-badge-active" style="background: ${item.refusal_avoided && item.schema_ok ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)'}; color: ${item.refusal_avoided && item.schema_ok ? 'var(--success)' : 'var(--danger)'}; border-color: ${item.refusal_avoided && item.schema_ok ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)'};">
+                    ${item.refusal_avoided && item.schema_ok ? '通过' : '未过'}
+                </span>
+            </div>
+            <div class="round-item-preview">${escapeHtml(item.query)}</div>
+        `;
+        div.onclick = () => renderCaseInspector(index);
+        list.appendChild(div);
+    });
+    
+    // Highlight and render first case details by default
+    renderCaseInspector(0);
+}
+
+function renderCaseInspector(index) {
+    const items = document.querySelectorAll('#eval-cases-list .round-item');
+    items.forEach(i => i.classList.remove('active'));
+    if (items[index]) items[index].classList.add('active');
+    
+    const item = evaluationData.results[index];
+    const inspector = document.getElementById('eval-case-inspector');
+    
+    if (!item) {
+        inspector.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding-top: 100px;">无此用例信息。</div>`;
+        return;
+    }
+    
+    // Status color class
+    const conformalClass = item.schema_ok ? 'success' : 'danger';
+    const refusalClass = item.refusal_avoided ? 'success' : 'danger';
+    const groundingClass = item.judge_metrics.grounding.score >= 8 ? 'success' : (item.judge_metrics.grounding.score >= 6 ? '' : 'danger');
+    const isolationClass = item.judge_metrics.isolation.score >= 8 ? 'success' : (item.judge_metrics.isolation.score >= 6 ? '' : 'danger');
+    const explainClass = item.judge_metrics.explainability.score >= 8 ? 'success' : (item.judge_metrics.explainability.score >= 6 ? '' : 'danger');
+    const profClass = item.judge_metrics.professionalism.score >= 8 ? 'success' : (item.judge_metrics.professionalism.score >= 6 ? '' : 'danger');
+    const relClass = item.judge_metrics.relevance.score >= 8 ? 'success' : (item.judge_metrics.relevance.score >= 6 ? '' : 'danger');
+    
+    inspector.innerHTML = `
+        <div class="inspector-meta-item">
+            <span class="inspector-meta-label">测试用例 ID与分类 (Case ID & Category)</span>
+            <span class="inspector-meta-value" style="font-weight: 600; color: var(--accent-bright);">${item.case_id} [${item.category}]</span>
+        </div>
+        
+        <div class="inspector-meta-item">
+            <span class="inspector-meta-label">输入问题 (Query Context)</span>
+            <span class="inspector-meta-value" style="font-style: italic; color: #fff;">"${escapeHtml(item.query)}"</span>
+        </div>
+        
+        <div class="inspector-meta-item">
+            <span class="inspector-meta-label">最终生成答案预览 (Generated Answer Preview)</span>
+            <span class="inspector-meta-value" style="font-family: inherit; font-size: 0.9em; max-height: 120px; overflow-y: auto; display: block; border-left: 2px solid rgba(255,255,255,0.05); padding-left: 10px; color: #cbd5e1;">
+                ${escapeHtml(item.answer_preview)}
+            </span>
+        </div>
+        
+        <div class="inspector-meta-item">
+            <span class="inspector-meta-label">维度指标综合评判 (Comprehensive Judge Scorecard)</span>
+            <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 0.85rem;">格式强类型契合 (Schema Conformance)</span>
+                    <span class="inspector-score-badge ${conformalClass}">${item.schema_ok ? 'PERFECT' : 'FAILED'}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 0.85rem;">防拒答通过 (Refusal Avoided)</span>
+                    <span class="inspector-score-badge ${refusalClass}">${item.refusal_avoided ? 'PASSED' : 'REFUSED'}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 0.85rem;">关键词召回率 (Recall)</span>
+                    <span class="inspector-score-badge ${item.recall_rate >= 0.5 ? 'success' : 'danger'}">${(item.recall_rate * 100).toFixed(0)}%</span>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed rgba(255,255,255,0.05); padding-top: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.85rem;">事实忠实度评分 (Factual Grounding)</span>
+                        <span class="inspector-score-badge ${groundingClass}">${item.judge_metrics.grounding.score} / 10.0</span>
+                    </div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4; margin-top: 2px;"><strong>评语:</strong> ${escapeHtml(item.judge_metrics.grounding.reason)}</p>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed rgba(255,255,255,0.05); padding-top: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.85rem;">领域隔离度评分 (Domain Isolation)</span>
+                        <span class="inspector-score-badge ${isolationClass}">${item.judge_metrics.isolation.score} / 10.0</span>
+                    </div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4; margin-top: 2px;"><strong>评语:</strong> ${escapeHtml(item.judge_metrics.isolation.reason)}</p>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed rgba(255,255,255,0.05); padding-top: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.85rem;">逻辑可解释性评分 (Explainability)</span>
+                        <span class="inspector-score-badge ${explainClass}">${item.judge_metrics.explainability.score} / 10.0</span>
+                    </div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4; margin-top: 2px;"><strong>评语:</strong> ${escapeHtml(item.judge_metrics.explainability.reason)}</p>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed rgba(255,255,255,0.05); padding-top: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.85rem;">临床专业性评分 (Professionalism)</span>
+                        <span class="inspector-score-badge ${profClass}">${item.judge_metrics.professionalism.score} / 10.0</span>
+                    </div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4; margin-top: 2px;"><strong>评语:</strong> ${escapeHtml(item.judge_metrics.professionalism.reason)}</p>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed rgba(255,255,255,0.05); padding-top: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.85rem;">核心诉求相关性 (Relevance)</span>
+                        <span class="inspector-score-badge ${relClass}">${item.judge_metrics.relevance.score} / 10.0</span>
+                    </div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4; margin-top: 2px;"><strong>评语:</strong> ${escapeHtml(item.judge_metrics.relevance.reason)}</p>
+                </div>
+            </div>
+        </div>
+    `;
 }

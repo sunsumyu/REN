@@ -17,9 +17,22 @@ LLM_API_URL = "https://volley.inner.yzint.cn/v1/chat/completions"
 # 从环境变量中读取 API Key
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 # 默认使用通用的大模型（支持同 GPT / 千问的调用）
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-pro")
+
+# 大模型池路由配置
+MODEL_POOL_LIGHTWEIGHT = os.getenv("MODEL_POOL_LIGHTWEIGHT", "deepseek-v4-flash")
+MODEL_POOL_PREMIUM = os.getenv("MODEL_POOL_PREMIUM", "deepseek-v4-pro")
+MODEL_POOL_JUDGE = os.getenv("MODEL_POOL_JUDGE", "deepseek-v4-pro")
 
 # 流程控制配置
-MAX_RETRIES = 3
-RETRY_BACKOFF_FACTOR = 1.5  # 指数退避系数
+MAX_RETRIES = 5  # 提升重试次数提升鲁棒性
+RETRY_BACKOFF_FACTOR = 2.0  # 增加退避斜率以充分应对网关滑动窗口
 CONCURRENT_QA_LIMIT = 4     # 并行解答的并发度限制
+
+# 裁判打分阶段前的缓冲避让冷却（秒）
+SOFT_DELAY_BEFORE_JUDGE = float(os.getenv("SOFT_DELAY_BEFORE_JUDGE", "3.0"))
+
+# LLM 生成超参数
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
+LLM_FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.2"))
