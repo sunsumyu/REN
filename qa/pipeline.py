@@ -57,7 +57,7 @@ class MedicalQAPipeline:
     def __init__(self, api_client: APIClient):
         self.api_client = api_client
 
-    def _prepare_context_and_refs(self, graph_data: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    async def _prepare_context_and_refs(self, graph_data: Dict[str, Any], query: str = "") -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         """
         Converts Knowledge Graph response (entities & relationships) into context and reference blocks.
         Additionally performs clinical Guideline Grounding by injecting authoritative rules from the local DB.
@@ -68,12 +68,10 @@ class MedicalQAPipeline:
         context_list = []
         refs = []
         
-        # Import local guideline grounding database
-        try:
-            from guideline_db import get_guideline_refs
-        except ImportError:
-            get_guideline_refs = lambda name: []
-            
+        # Phase 4 Guideline Grounding Injection using Tiered Retrieval orchestrator
+        from retrieval.retrieval_manager import RetrievalManager
+        retrieval_mgr = RetrievalManager()
+        
         # Format entities
         for entity in entities:
             name = entity.get("name", "未命名实体")
@@ -95,15 +93,14 @@ class MedicalQAPipeline:
                 "source": f"refs:《实体库:{name}》"
             })
             
-            # Phase 4 Guideline Grounding Injection
-            guideline_items = get_guideline_refs(name)
-            if guideline_items:
-                logger.info(f"Guideline Grounding matches found for entity '{name}': injecting {len(guideline_items)} clinical reference items.")
-                for g_item in guideline_items:
-                    refs.append({
-                        "context": f"【国家官方临床指南/药品说明书权威规定】: {g_item['context']}",
-                        "source": g_item['source']
-                    })
+            # Clinical Guideline Grounding matched via 3-tiered retrieval (Local -> API -> Restricted Search)
+            try:
+                tiered_refs, tier_label = await retrieval_mgr.get_grounding_references(query, name)
+                logger.info(f"Tiered Grounding match found for '{name}' via [{tier_label}]: injecting {len(tiered_refs)} reference items.")
+                for r_item in tiered_refs:
+                    refs.append(r_item)
+            except Exception as e:
+                logger.error(f"Failed to fetch tiered retrieval grounding for entity '{name}': {e}")
             
         # Format relationships
         for rel in relationships:
@@ -125,6 +122,7 @@ class MedicalQAPipeline:
                 "source": f"refs:《图谱关系:{src}-{tgt}》"
             })
             
+        retrieval_mgr.close()
         return context_list, refs
 
     async def generate_initial_question(self, context_list: List[Dict[str, str]]) -> str:
@@ -520,7 +518,7 @@ class MedicalQAPipeline:
             if not any(r.get("sourceName") == rel["sourceName"] and r.get("targetName") == rel["targetName"] for r in graph_data["relationships"]):
                 graph_data["relationships"].append(rel)
                 
-        context_list, refs = self._prepare_context_and_refs(graph_data)
+        context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_intent["theme"])
         
         # 2. Generate first question
         q1 = await self.generate_initial_question(context_list)
@@ -544,7 +542,7 @@ class MedicalQAPipeline:
                     try:
                         logger.info("Random trigger: Fetching additional entities to expand dialog horizon...")
                         additional_graph = await self.api_client.fetch_random_knowledge_graph(count=1)
-                        new_context, new_refs = self._prepare_context_and_refs(additional_graph)
+                        new_context, new_refs = await self._prepare_context_and_refs(additional_graph, query=current_q)
                         context_list.extend(new_context)
                         refs.extend(new_refs)
                     except Exception as e:
