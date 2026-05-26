@@ -3,7 +3,7 @@ import httpx
 import logging
 import random
 import json
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Tuple
 from pydantic import BaseModel
 import config
 
@@ -260,6 +260,67 @@ class APIClient:
             logger.error(f"Failed to parse LLM response format: {response_data}")
             raise Exception(f"Invalid LLM response format: {e}")
 
+    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium") -> Tuple[str, str]:
+        """
+        Call the Large Language Model completions API with smart model pool routing and dynamic model-not-found self-healing fallback.
+        Returns a tuple of (content, reasoning_content).
+        """
+        await self.init_supported_models()
+        if not config.LLM_API_KEY:
+            logger.warning("LLM_API_KEY is not set! Call might fail if the server requires authentication.")
+            
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        # Handle Bearer token prefix if missing
+        api_key = config.LLM_API_KEY.strip()
+        if api_key:
+            if api_key.startswith("Bearer "):
+                headers["Authorization"] = api_key
+            else:
+                headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["Authorization"] = "Bearer dummy"
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        resolved_model = self._resolve_model(model_pool)
+
+        data = {
+            "model": resolved_model,
+            "messages": messages,
+            "temperature": config.LLM_TEMPERATURE,
+            "top_p": config.LLM_TOP_P,
+            "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
+        }
+        
+        logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}]...")
+        try:
+            response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
+        except Exception as e:
+            if ("模型不存在" in str(e) or "20201" in str(e)) and resolved_model != config.LLM_MODEL:
+                logger.warning(f"Model '{resolved_model}' from pool '{model_pool}' is not supported by the upstream gateway. Gracefully falling back to default LLM_MODEL '{config.LLM_MODEL}'...")
+                resolved_model = config.LLM_MODEL
+                data["model"] = resolved_model
+                logger.info(f"Retrying Call with Fallback LLM ({resolved_model})...")
+                response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
+            else:
+                raise e
+        
+        # Parse standard chat completion response
+        try:
+            message = response_data["choices"][0]["message"]
+            content = message["content"]
+            reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
+            return content.strip(), reasoning_content.strip()
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Failed to parse LLM response format: {response_data}")
+            raise Exception(f"Invalid LLM response format: {e}")
+
     async def call_llm_structured(self, messages: List[Dict[str, str]], response_model: type, model_pool: str = "premium") -> Any:
         """
         Calls the LLM using API-level Structured Outputs with JSON Schema strict constraints.
@@ -346,9 +407,15 @@ class APIClient:
                     raise e
             
             try:
-                content = response_data["choices"][0]["message"]["content"]
+                message = response_data["choices"][0]["message"]
+                content = message["content"]
+                reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
+                
                 # Validate and parse directly into the Pydantic model
-                return response_model.model_validate_json(content)
+                obj = response_model.model_validate_json(content)
+                # Dynamically attach reasoning_content to the object
+                object.__setattr__(obj, "_reasoning_content", reasoning_content.strip())
+                return obj
             except Exception as e:
                 logger.error(f"Pydantic Validation or parsing failed on attempt {attempt}: {e}")
                 if attempt >= max_healing_attempts:

@@ -245,27 +245,35 @@ class MedicalQAPipeline:
                     # Trigger the exception block so that we go to fallback
                     raise ValueError(f"Quality Guardrail failed repeatedly for structured output: {reason}")
                 
-                # 5. Re-assemble reasoning details into standard `<think>` block for perfect backward compatibility
-                evidences_str = "\n".join([
-                    f"[证据R{i+1}：来源={e.source}，定位={e.location}，要点={e.summary}]"
-                    for i, e in enumerate(result.evidences)
-                ])
+                # 5. Extract native reasoning_content or build fallback artificial one
+                reasoning_content = getattr(result, "_reasoning_content", "")
                 
-                reasoning_str = "\n".join([
-                    f"- {step.step_id}: {step.logic}"
-                    for step in result.reasoning_chains
-                ])
-                
-                sub_questions_str = "\n".join([f"- {q}" for q in result.sub_questions])
-                
-                think_block = (
-                    f"<think><facet = {facet}>\n"
-                    f"问题拆解：\n{sub_questions_str}\n"
-                    f"证据清单：\n{evidences_str}\n"
-                    f"推理链：\n{reasoning_str}\n"
-                    f"最终结论摘要：\n- {result.final_conclusion_summary}\n"
-                    f"</think>\n"
-                )
+                if reasoning_content:
+                    # Clean out duplicate XML tags if present
+                    cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
+                    think_block = f"<think><facet = {facet}>\n{cleaned_reasoning}\n</think>\n"
+                else:
+                    # Re-assemble reasoning details into standard `<think>` block for perfect backward compatibility
+                    evidences_str = "\n".join([
+                        f"[证据R{i+1}：来源={e.source}，定位={e.location}，要点={e.summary}]"
+                        for i, e in enumerate(result.evidences)
+                    ])
+                    
+                    reasoning_str = "\n".join([
+                        f"- {step.step_id}: {step.logic}"
+                        for step in result.reasoning_chains
+                    ])
+                    
+                    sub_questions_str = "\n".join([f"- {q}" for q in result.sub_questions])
+                    
+                    think_block = (
+                        f"<think><facet = {facet}>\n"
+                        f"问题拆解：\n{sub_questions_str}\n"
+                        f"证据清单：\n{evidences_str}\n"
+                        f"推理链：\n{reasoning_str}\n"
+                        f"最终结论摘要：\n- {result.final_conclusion_summary}\n"
+                        f"</think>\n"
+                    )
                 
                 # Reconstruct the expected response combining thinking with final answer body
                 response = think_block + result.answer_body
@@ -278,11 +286,12 @@ class MedicalQAPipeline:
                 fallback_prompt = f"{system_prompt}\n\n{user_prompt}"
                 
                 raw_response = ""
+                reasoning_content = ""
                 is_passed = False
                 reason = ""
                 
                 for fb_attempt in range(max_quality_attempts + 1):
-                    raw_response = await self.api_client.call_llm(fallback_prompt, model_pool="premium")
+                    raw_response, reasoning_content = await self.api_client.call_llm_with_reasoning(fallback_prompt, model_pool="premium")
                     
                     check_body = raw_response
                     if "</think>" in raw_response:
@@ -314,8 +323,12 @@ class MedicalQAPipeline:
                 if "<think>" in raw_response and f"facet =" not in raw_response:
                     response = raw_response.replace("<think>", f"<think><facet = {facet}>")
                 elif not raw_response.startswith("<think"):
-                    mock_think = f"<think><facet = {facet}>\n问题拆解：\n- S1: 针对{facet}进行多视角切入回答。\n证据清单：\n[证据R1：来源=refs:《实体库汇总》，定位=全面，要点=结合图谱背景信息]\n推理链：\n- P1: 基于背景知识 -> 归纳总结 -> 输出正文。\n最终结论摘要：\n- 形成多视角{facet}高质量医学分析。\n</think>\n"
-                    response = mock_think + raw_response
+                    if reasoning_content:
+                        cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
+                        response = f"<think><facet = {facet}>\n{cleaned_reasoning}\n</think>\n" + raw_response
+                    else:
+                        mock_think = f"<think><facet = {facet}>\n问题拆解：\n- S1: 针对{facet}进行多视角切入回答。\n证据清单：\n[证据R1：来源=refs:《实体库汇总》，定位=全面，要点=结合图谱背景信息]\n推理链：\n- P1: 基于背景知识 -> 归纳总结 -> 输出正文。\n最终结论摘要：\n- 形成多视角{facet}高质量医学分析。\n</think>\n"
+                        response = mock_think + raw_response
                 else:
                     response = raw_response
                     
