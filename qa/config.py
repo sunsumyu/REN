@@ -13,7 +13,7 @@ DEFAULT_ENTITY_COUNT = 2
 DEFAULT_HOP_COUNT = 2
 
 # 大模型 API 配置
-LLM_API_URL = "https://volley.inner.yzint.cn/v1/chat/completions"
+LLM_API_URL = "https://volley.yzint.cn/api/v1/chat/completions"
 # 从环境变量中读取 API Key
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 # 默认使用通用的大模型（支持同 GPT / 千问的调用）

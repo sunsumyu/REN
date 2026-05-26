@@ -9,7 +9,7 @@ import config
 headers = {
     "Authorization": f"Bearer {config.LLM_API_KEY.strip()}" if config.LLM_API_KEY else "Bearer dummy"
 }
-url = "https://volley.inner.yzint.cn/v1/models"
+url = "https://volley.yzint.cn/api/v1/models"
 print(f"Fetching from {url}...")
 try:
     res = httpx.get(url, headers=headers, timeout=10.0)
