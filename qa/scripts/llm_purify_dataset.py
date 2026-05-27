@@ -76,12 +76,12 @@ JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量�
 
 1. 🟢 【维度一：语义纯净度 (semantic_purity_score - 0到100分)】
    - **判定逻辑**：思维链中绝对不能包含任何【工程管线与伪净化噪声】以及【RAG 局限抱怨】。
-   - **禁止词汇范畴（检出一个即扣 20 分）**：
-     - *工程噪声类*：凡涉及JSON结构、代码占位符、自动化流水线标识、元指令元数据等非医学自然的表述（包括但不限于 `"JSON"`, `"Schema"`, `"step_id"`, `"markdown"`, `"代码块"`, `"API"`, `"图谱"`, `"refs"`, `"Answer Body"`, `"子问题拆解"`, `"推理链条如下"`, `"最终结论"` 等元叙述）。
+   - **绝对禁止词汇（工程流水线与伪净化词汇，检出一个即扣 20 分）**：
+     - *工程噪声类*：凡涉及JSON结构、代码占位符、自动化流水线标识、元指令元数据等非医学自然的表述（包括但不限于 `"JSON"`, `"Schema"`, `"step_id"`, `"markdown"`, `"代码块"`, `"API"`, `"图谱节点"`, `"refs"`, `"L1/L2/L3层"`, `"元指令"`, `"Answer Body"`, `"子问题拆解"`, `"推理链条如下"`, `"最终结论"` 等元叙述）。
      - *RAG抱怨/依赖类*：**任何体现对外部检索上下文依赖、声称资料未提供、推卸推理责任的表述**（包括但不限于 `"根据参考资料"`, `"现有资料未"`, `"未提及具体"`, `"没有提供各成分"`, `"证据中未进一步"`, `"由于资料有限"` 等）。
-   - **结构化泄漏惩罚**：**如果净化后的文本中出现任何形式的结构化标题、序号或提纲标记，判定为格式泄漏，此维度得分一票否决，直接降至 60 分以下！**
+   - **结构化泄漏惩罚**：**如果净化后的文本中出现“阶段一”、“阶段①”、“【核心矛盾】”、“微观演绎”等结构化标题或序号，判定为格式泄漏，此维度得分一票否决，直接降至 60 分以下！**
    - **白名单词汇（允许且鼓励的循证/临床逻辑词，禁止扣分）**：
-     `"证据"`, `"循证"`, `"排除"`, `"无关"`, `"忽略"`, `"临床指南"`, `"药理关联"`, `"机制"`, `"诊断"`, `"自我修正"`。
+     `"证据"`, `"循证"`, `"排除"`, `"无关"`, `"忽略"`, `"临床指南"`, `"药理关联"`, `"机制"`, `"诊断"`, `"自我修正"`.
 
 2. 🩺 【维度二：医学事实严谨度 (medical_rigor_score - 0到100分)】
    - **核心判定逻辑**：评估净化后的思维链是否完整保留了原问题与原始素材中核心的“医学事实与硬数据”。
@@ -91,10 +91,10 @@ JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量�
      - **扣分刻度**：若发生上述任何硬性数据的遗漏或事实曲解，此项得分强制锁定在 80 分以下。
 
 3. 🧠 【维度三：逻辑深度与思维熵 (logical_depth_score - 0到100分)】
-   - **判定逻辑**：评估思维链是否呈现了饱满的临床推理过程，彻底杜绝走捷径、干瘪的“常识陈述”。
+   - **核心判定逻辑**：评估思维链是否呈现了饱满的临床推理过程，彻底杜绝走捷径、干瘪的“常识陈述”。
    - **🚨 负面惩罚样例与控分机制（严防阿谀奉承与对长文本的虚高评价）**：
-     - *案例一（堆砌名词而无临床闭环）*：如果模型只是单纯堆砌、罗列一长串高深的专业医学名词（如各种受体名称、生理通路等），但并未真正结合当前病人的特定情况展开针对性的因果推导，亦未能输出闭环给药或诊断决策，此维度得分**绝对不能超过 75 分**。
-     - *案例二（强行脑补自我纠偏）*：如果模型写出的自我修正属于低级、生搬硬套（如为了强行迎合纠偏得分点而写出弱智的、缺乏实际医学逻辑价值的低级自问自答否定句），视同严重注水噪声，扣除 **20-40 分**。
+     - *类型一（概念名词堆砌而无临床闭环）*：如果模型只是单纯罗列一长串高深的专业医学名词（如各种细胞色素酶、生理学通路名称），但未能紧扣患者面临的特定临床矛盾展开针对性的病理推导，亦未能输出闭环给药或诊断建议，此维度得分**绝对不能超过 75 分**。
+     - *类型二（低级做作的自我纠偏）*：如果模型写出的自我修正纯属无医学逻辑价值的注水废话（如：“等一下，不对，该药不是中成药吗？哦，它是的，刚才看错了”等生硬做作的否定句），视同严重干扰噪声，扣除 **20-40 分**。
      - *字数与结构约束*：思维链过短（少于 150 字）或仅为说明书条目复读的，此项得分直接扣至 70 分以下。
 
 ### 📤 输出格式要求：
@@ -133,6 +133,52 @@ def calculate_similarity(s1: str, s2: str) -> float:
     set1, set2 = set(words1), set(words2)
     intersection = set1 & set2
     return len(intersection) / max(len(set1), len(set2))
+
+def has_repetition_loop(text: str, chunk_size: int = 50, threshold: float = 0.8) -> bool:
+    """
+    企业级 N-Gram 文本死循环/复读检测算法。
+    如果文本后半部分与前半部分存在大段重合，判定为 Loop，强制打回重写。
+    """
+    if len(text) < 150:
+        return False
+    
+    mid = len(text) // 2
+    part1 = text[:mid]
+    part2 = text[mid:]
+    
+    # 提取 part1 中的长字符片段
+    part1_chunks = [part1[i:i+chunk_size] for i in range(0, len(part1) - chunk_size, chunk_size // 2)]
+    if not part1_chunks:
+        return False
+        
+    overlap_count = 0
+    for chunk in part1_chunks:
+        if chunk in part2:
+            overlap_count += 1
+            
+    overlap_ratio = overlap_count / len(part1_chunks)
+    return overlap_ratio > threshold
+
+def pre_strip_engineering_noise(raw_text: str) -> str:
+    """前置物理剥离：破坏原始文本中的 JSON 结构引力"""
+    noise_patterns = [
+        r'"sub_questions":\s*\[.*?\]',
+        r'"evidences":\s*\[',
+        r'"reasoning_chains":\s*\[',
+        r'\{"step_id".*?"logic":\s*',
+        r'"location":\s*".*?"',
+        r'"source":\s*".*?"'
+    ]
+    cleaned = raw_text
+    for pattern in noise_patterns:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'[\{\}\[\]]', ' ', cleaned)
+    return cleaned.strip()
+
+def is_catastrophic_format_collapse(text: str) -> bool:
+    """后置硬性网关：检测是否残留 JSON 语法废墟"""
+    invalid_chars = ['{', '}', '[', ']', '",', '我决定构建']
+    return any(char in text for char in invalid_chars)
 
 async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_think: str, purified_think: str) -> Dict[str, Any]:
     """
@@ -191,16 +237,19 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     last_scores = {}
     
     for attempt in range(max_retries):
+        # 1. 前置物理剥离，从源头切断 JSON 结构对大模型注意力机制的干扰引力
+        stripped_think = pre_strip_engineering_noise(current_think)
+        
         prompt = f"""问题: {q}
 切面视角: {planner}
 原始思维链 (CoT) 内容:
 \"\"\"
-{current_think}
+{stripped_think}
 \"\"\"
 
 请严格按照清洗净化准则进行处理，并只输出清洗净化后的纯净思维链文本。"""
         try:
-            # 1. 语义重构净化
+            # 2. 语义重构提纯
             purified = await client.call_llm(prompt, system_prompt=PURIFY_SYSTEM_PROMPT, model_pool="premium")
             purified = purified.replace("<think>", "").replace("</think>", "").strip()
             
@@ -211,8 +260,28 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
                 purified = "\n".join(purified.splitlines()[:-1])
             purified = purified.strip()
             
-            # 2. 裁判大模型质检打分
-            scores = await evaluate_purified_think(client, q, planner, raw_think, purified)
+            # 3. 后置物理硬校验 (O(1) 复杂度极速拦截格式崩溃，直接省去调用 Judge LLM 费用与算力)
+            if is_catastrophic_format_collapse(purified):
+                logger.warning(f"   🚨 Attempt {attempt+1} triggered SYNTAX FORMAT COLLAPSE! Local intercepting and forcing retry...")
+                scores = {
+                    "semantic_purity_score": 0,
+                    "medical_rigor_score": 90,
+                    "logical_depth_score": 0,
+                    "reason": "触发物理格式崩溃硬性熔断门禁。输出中残留了中括号、大括号、JSON键值对碎片或大模型重写时内心的碎碎念（如‘我决定构建如下’），属于严重指令穿透。"
+                }
+            # 4. N-Gram 本地死循环检测
+            elif has_repetition_loop(purified):
+                logger.warning(f"   🚨 Attempt {attempt+1} triggered N-Gram repetition penalty! Local intercepting and forcing retry...")
+                scores = {
+                    "semantic_purity_score": 50,
+                    "medical_rigor_score": 90,
+                    "logical_depth_score": 50,
+                    "reason": "检测到提纯后的文本发生了大面积死循环与复读退化（Repetition Collapse），这在思维链微调语料中属于致命缺陷。请确保重构后的思维链推导流畅，不包含任何长段落的复读复印！"
+                }
+            # 5. 移交裁判大模型进行高精质检打分
+            else:
+                scores = await evaluate_purified_think(client, q, planner, raw_think, purified)
+            
             last_scores = scores
             
             p_score = scores["semantic_purity_score"]
@@ -242,7 +311,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
             logger.error(f"   ⚠️ Error during purification attempt {attempt+1}: {e}")
             
     logger.warning("   ⚠️ Quality Gate Max Retries exceeded. Gracefully falling back to regex heuristic fallback to ensure safety.")
-    # 极端失败退避：使用本地 of regex 精细化清洗作为防空保护
+    # 极端失败退避：使用本地 regex 精细化清洗作为防空保护
     try:
         from clean_dataset import clean_think_text
         purified = clean_think_text(raw_think)
@@ -349,14 +418,13 @@ async def main():
         line_num = i + 1
         should_purify = True
         
-        # 1. 检查是否在指定行号列表中
+        # 1. 检查是否在用户行号指定列表中
         if PURIFY_LINES:
             if line_num not in PURIFY_LINES:
                 should_purify = False
                 
-        # 2. 检查是否超出条数限制
+        # 2. 检查是否需要净化与超额限制
         if should_purify:
-            # 只有当该行确实有 <think> 标签可以提纯时，才参与计额
             try:
                 data = json.loads(line)
                 has_think = any(
@@ -378,11 +446,11 @@ async def main():
         
     processed_results = await asyncio.gather(*tasks)
     
-    # 写回文件
+    # 写入净化结果，保证使用正确的 utf-8 编码写回
     with open(dataset_path, 'w', encoding='utf-8') as f:
         f.writelines(processed_results)
         
-    # --- 生成 Markdown Diff 差异日志写入 logs 目录 ---
+    # --- 差异对比 Markdown Diff 日志生成并同步到 logs 目录 ---
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     diff_log_path = logs_dir / f"purification_run_{timestamp}.md"
     latest_log_path = logs_dir / "purification_run.md"
@@ -390,11 +458,11 @@ async def main():
     
     with open(diff_log_path, 'w', encoding='utf-8') as lf:
         lf.write("# 🩺 医疗问答思维链提纯净化 Diff 对照差异报告\n\n")
-        lf.write(f"本差异报告详细记录了对数据集 `medical_qa_dataset.jsonl` 执行大模型思维链提纯净化前后的对比信息，包含各个视角的裁判评分详情。\n\n")
+        lf.write("本差异报告详细记录了对数据集 `medical_qa_dataset.jsonl` 执行大模型思维链提纯净化前后的对比信息，包含各个视角的裁判评分详情。\n\n")
         lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)}\n\n")
         lf.write("## 📊 提纯报告详情列表\n\n")
         
-        # 按行号和视角名称排序，便于对齐与审计
+        # 依据行号及切面排序，以便审计和报告展示
         sorted_diff_logs = sorted(purified_diff_logs, key=lambda x: (x["line_number"], x["facet"]))
         for idx, item in enumerate(sorted_diff_logs):
             lf.write(f"### [{idx+1}] (数据集第 {item['line_number']} 行) | 临床视角: **{item['facet']}**\n")
@@ -407,11 +475,11 @@ async def main():
             lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
             lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
             if sc.get("purity_bypass"):
-                lf.write(f"    - ⚠️ **绕过警告**: 评分高但相似度极高且依然带有噪声，怀疑存在防拷贝绕过！\n\n")
+                lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
             else:
                 lf.write("\n")
             
-            # 使用 Carousel 展示对比
+            # 使用 Carousel 展示差异比对
             lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
             lf.write("````carousel\n")
             
@@ -432,27 +500,27 @@ async def main():
             lf.write("````\n\n")
             lf.write("---\n\n")
             
-    # 自动同步副本到 purification_run.md
+    # 同步最新日志标准路径 latest_log_path
     try:
         shutil.copyfile(diff_log_path, latest_log_path)
         logger.info(f"✨ Synced latest log copy to standard path: {latest_log_path}")
     except Exception as e:
         logger.warning(f"⚠️ Failed to sync standard log copy: {e}")
             
-    # 汇总输出 Bypass 警告
+    # 绕过拦截提示
     bypass_list = [item for item in purified_diff_logs if item["scores"].get("purity_bypass")]
     if bypass_list:
         logger.warning("\n" + "="*60)
-        logger.warning("⚠️ [WARNING] 发现存在可能绕过净化的潜在样本 (Purity Bypass Detected):")
+        logger.warning("⚠️ [WARNING] 发现大模型存在高度拷贝且有残留工程废料的绕过违规 (Purity Bypass Detected):")
         for idx, item in enumerate(bypass_list):
             logger.warning(f"  [{idx+1}] 行号: {item['line_number']} | 视角: {item['facet']} | 问题: {item['question'][:20]}...")
-            logger.warning(f"      - 相似度过高且疑似包含禁止词，建议人工二次审查！")
+            logger.warning("      - 该提纯评分被强制驳回并列为不达标，建议进行人工确认或降低阈值！")
         logger.warning("="*60 + "\n")
     else:
         logger.info("\n🎉 所有思维链均已成功完成高质量提纯净化，未发现任何绕过违规！\n")
             
     logger.info("=========================================")
-    logger.info(f"🚀 LLM Semantic Purification & Quality Gate Validation Complete!")
+    logger.info("🚀 LLM Semantic Purification & Quality Gate Validation Complete!")
     logger.info(f"💾 Purified dataset saved successfully to: {dataset_path}")
     logger.info(f"📄 Markdown diff run logs saved to: {diff_log_path}")
     logger.info("=========================================")
