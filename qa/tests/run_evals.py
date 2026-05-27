@@ -32,7 +32,6 @@ sys.path.append(parent_dir)
 
 from api_client import APIClient
 from pipeline import MedicalQAPipeline
-from guideline_db import get_guideline_refs
 from eval_models import JudgeMetric, ComprehensiveJudgeMetrics, EvalResultItem
 
 # 裁判大模型综合 Prompt 模板
@@ -96,13 +95,20 @@ async def run_evaluation():
         
         logger.info(f"\n[{idx+1}/{len(cases)}] Running Case {case_id} ({category}): '{query[:35]}...'")
         
-        # 2. Build refs grounding context using guideline database
+        # 2. Build refs grounding context dynamically using the Retrieval Manager
         refs = []
-        from guideline_db import GUIDELINE_DATA
-        for kw in GUIDELINE_DATA.keys():
-            if kw in query:
-                refs.extend(get_guideline_refs(kw))
-                
+        try:
+            from retrieval.retrieval_manager import RetrievalManager
+            retrieval_mgr = RetrievalManager()
+            for kw in ["愈肝片", "慢性乙型肝炎", "二甲双胍", "2型糖尿病", "阿司匹林", "车前草"]:
+                if kw in query:
+                    word_refs, _ = await retrieval_mgr.get_grounding_references(query, kw)
+                    for wr in word_refs:
+                        if not any(r.get("context") == wr.get("context") for r in refs):
+                            refs.append(wr)
+        except Exception as e:
+            logger.error(f"Failed to fetch dynamic refs for case {case_id}: {e}")
+            
         if not refs:
             # Safe baseline mock refs if no specific keywords match
             refs = [{

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 大模型语义化清洗医学问答数据集 CoT（思维链）脚本 (企业升级版 - 带 Diff 日志记录)。
-利用智能质检裁判大模型（Judge LLM），对重写后的思维链从“语义纯净度”、“医学严谨度”和“逻辑连贯性”三个维度进行量化评分（Quality Gate），
+利用智能质检裁判大模型（Judge LLM），对重写后的思维链从“语义纯净度”、“医学严谨度”和“逻辑深度”三个维度进行量化评分（Quality Gate），
 对于不达标的样本执行自动重新净化重写，确保 100% 达成生产级微调的严苛质量要求。
 清洗完成后，会将所有修改过的 CoT 原始版本、净化版本以及裁判评分日志以 Markdown 差异报告的形式写入 logs 文件夹下。
 """
@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 import shutil
+import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
@@ -22,64 +23,89 @@ parent_dir = current_dir.parent
 sys.path.append(str(current_dir))
 sys.path.append(str(parent_dir))
 
-from config import LLM_MODEL
+from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES
 from api_client import APIClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
-PURIFY_SYSTEM_PROMPT = """您是一位拥有极高专业素养的医学微调数据集清洗与净化专家。您的任务是净化医学多维多轮问答数据集中的 `<think>`（思维链/CoT）内容，使其达到顶尖的生产级微调标准。
+PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型微调标准。
 
 ### 为什么需要净化？
-当前数据集是通过工程 Pipeline 自动生成的，其 `<think>` 块中混杂了大量的【工程指令噪声】和【格式约束废话】（例如格式自我纠结、避让免责声明、JSON字段拼装、非医学文档过滤等）。这些非医学推理的信息如果被用于大模型微调，会导致模型学到无关的元指令，并在后续推理时产生严重的“格式幻觉”（例如在普通对话中突然输出“我们被要求输出JSON”或“注意不要加免责声明”）。
+当前 `<think>` 块是工程 Pipeline 自动生成的，混杂了大量【工程指令垃圾】（如 JSON Schema 拼装、JSON 避让、step_id、Markdown 代码块标记等）。若直接用于模型微调，会导致模型在后续推理时频繁产生“格式泄漏”和“系统指令幻觉”。
 
-### 清洗净化准则：
-1. **彻底清除工程格式废话**：
-   - 移除非医学推理的特定模板描述（例如：‘首先理解问题...’、‘我们被要求从某某视角回答...’、‘角度是【...】，所以回答要强调...’）。
-   - 移除所有关于输出格式、JSON约束、Schema结构、Markdown标记、避让免责声明的指令（例如：‘我们将输出 JSON。确保不含 markdown。’、‘现在构建JSON’、‘最终JSON为...’、‘注意：禁止任何免责声明，直接结束。’）。
-   - 移除中间步骤或临时推理标记（例如：‘step_id: P1, logic: ...’，‘子问题拆解：1. ...’，‘证据提取：源：refs...’等结构化占位描述）。
-   
-2. **彻底清除检索与工程清洗的中间思考**：
-   - 移除关于检索文档筛选和忽略的纠结过程（例如：‘检查refs：有很多关于二甲双胍、2型糖尿病的内容，但与问题不直接相关。问题只问... 忽略’、‘其他refs都是关于...，与问题无关，可以忽略’）。
-   
-3. **保留并优化真正的【医学/临床/药理推理】核心**：
-   - 保留从参考文档（refs）中提取实体和硬指标（如发生率、不良反应、临床对照试验、化学机制等）的实际医学逻辑和药理推导过程。
-   - 使保留下的思维链变得【纯粹、自然、流畅、专业】，像一个真正的医学专家在独立思考，逻辑自洽，直奔主题。
+### 🛠️ 企业级净化与重写准则：
 
-4. **极端边界情况处理（全工程垃圾输入）**：
-   - 若输入的原始思维链（CoT）100%全是由工程规划、元指令、格式纠结、Schema字段拼装等纯工程垃圾噪声组成，没有任何实质性的医学/药理推理过程，**绝对不要原样复制输出输入文本**（避免拷贝防卫与幻觉）。
-   - 在此情况下，您必须基于给定的 `问题` 和 `切面视角`，直接从参考文档（refs）中提炼核心医学事实，从零重构并输出一段专业、流畅、无任何工程词汇的纯净医学思维链。
-   
-5. **输出要求**：
-   - 只输出清洗净化后的 `<think>` 块内部文本（不要带有 `<think>` 或 `</think>` 标记本身，也不要包裹 markdown 代码块，只返回文本内容）。
+1. ❌ 【绝对禁止的工程与流水线噪声】（必须彻底拔除）：
+   - 移除任何涉及输出格式、JSON约束、Schema结构、Markdown标记的自我提醒（例如：“我们要输出JSON，不要包裹 markdown”、“现在开始构建 JSON schema 响应”等）。
+   - 移除工程流水线的临时步骤占位符（例如：`step_id: P1`、`logic: ...`、`证据对齐清单`、`子问题拆解`、`Answer Body` 等底层结构性字段名字）。
+   - 移除对特定检索数据库或原始代码变量的直接引用（例如：不要出现 “从 refs[0] 中获取”、“图谱节点 A 关联 B”、“API 检索返回”等）。
+   - 🚨 【严禁伪净化（Format Translation Bypass）】：绝对不允许采取“走捷径”的策略——将原始 JSON 的字段名翻译成白话文或自然语言来凑字数！**绝对禁止在文本中输出如：“我的推理链条如下”、“问题可以拆解为以下子问题”、“核心证据来自实体库...”、“答案正文应该分点阐述”、“最终结论是...”等任何暗示您在处理一个工程结构化任务的元叙述词汇。**
+
+2. 🚨 【严禁 RAG 边界抱怨与参数知识钝化（Anti-RAG Constraint Complaining）】：
+   - **绝对禁止在思考链中写出任何关于检索上下文边界局限性的“抱怨”与“免责”表述！**（例如：“现有资料未提供/未提及该成分的药理作用”、“根据参考资料显示...”、`“证据中未进一步阐明...”`、`“因此只能基于功能主治进行...”`）。
+   - 在微调后的 Reasoning 模型中，这类“抱怨”会带来极其致命的**“参数知识钝化”**，导致模型在离线或无 RAG 部署时严重依赖外部上下文，丧失调用其百亿/千亿参数知识库进行自主推理的能力，退化为干瘪的上下文搬运工。
+   - **正确做法**：即使原始资料有限，也必须假定您的脑中拥有最完备的医学专家常识，直接激活您的**参数化临床知识（Parametric Knowledge）**，对药物各成分或疾病通路展开深度、科学、合理的微观机制推导与因果演进，不允许推卸责任或声称资料不足。
+
+3. 🟢 【必须保留并鼓励的医学/循证推理核心】（禁止过度杀伤）：
+   - 允许并鼓励使用循证医学高频词汇（如：“临床证据”、“循证依据”、“指南推荐”、“证据等级”）。
+   - 允许并鼓励在进行鉴别诊断或排查时使用临床逻辑词（如：“经排查后可以忽略...”、“该因素与当前病理无关”、“排除...诊断”）。
+   - 允许保留具有临床思考价值的“自我纠偏与查漏补缺”过程（例如：“等等，在考虑老年患者时，必须额外评估肾功能受损带来的蓄积风险，此前考虑的一般剂量可能偏高，需要调整为...”）。
+
+4. 📐 【强化的 4 阶段临床认知深度推理流（Exploratory CoT Trajectory）】：
+   - 优秀的 Reasoning 微调 CoT 绝不能是一篇平铺直叙、精简版教科书似的“静态科平时段落”。它必须呈现出**“探索式、推导式、逐步探究与排查”的动态思考轨迹（Thought Trace）**。
+   - 净化重写时，您必须引导思维链通过一系列自然的**逻辑控制词与因果连词**（例如：“*首先，需要解构该问题的核心在于...*”、“*这必然引导我们关注其微观药理机制，即...*”、“*慢着，这里存在一个关键分叉：为什么是亚型A而不是亚型B？因为...*”、“*这意味着...，而由于...所以...*”、“*由此推导，我们可以排除...，进而锁定...*”）层层剥茧、递进推理。
+   - 保证思维链中包含明确的**【提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 自我肯定/得出结论】**的动态心流路径，这才是对 Reasoning 模型微调真正合格的 CoT 语料。
+
+5. 🚨 【防范结构化标记泄漏与伪思考】：
+   - **绝对禁止使用任何如“阶段①”、“【病症剖析】”、“步骤1”、“首先拆解问题”等显式的、结构化的提纲或序号词！** 这种结构化泄漏会破坏 Reasoning 模型的原生思考连贯性。
+   - 优秀的 CoT 必须用**高度自然的学术因果递进和自问自答的长文流**，来隐式体现出那 4 个临床认知阶段的深入。
+
+6. 🔇 【语调与文风红线】：
+   - 必须使用绝对的**第三人称、客观学术、冰冷严谨的医学专家视角**。
+   - 彻底去除任何对话性废话（如：“好的，让我来为你解答...”、“问题问的是...，我的分析是...”、“根据你的描述...”）。
+   - **绝对禁止开场虚词**：思维链必须直接开始陈述医学事实和逻辑因果（例如，开头直接进入主题：“针对 [疾病/药物名称] 在 [临床场景] 中的 [特定视角机制/药理学意义]，其核心在于...”，像教科书或医生大脑里的深层默念一样，不需要任何结构性的开场白、自问自答或过渡废话）。
+
+7. 📤 【输出物理格式要求】：
+   - 仅输出净化提纯后的 `<think>` 内部纯文本，绝对不要带有 `<think>` 或 `</think>` 标记本身，也不要包裹在 markdown 围栏中。
 """
 
-JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医学微调数据集质量审查专家（Judge LLM）。您的任务是对大模型净化重写后的医学思维链（Purified CoT）进行三维度的量化质检评估。
+JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量审查裁判（Judge LLM）。您的任务是对大模型重写净化后的医学思维链（Purified CoT）进行三维度的量化质检评估。请保持极高的专业客观性，杜绝“长文本阿谀奉承”倾向，严查实质逻辑深度。
 
-### 评估维度与标准：
-1. **语义纯净度 (semantic_purity_score - 0到100分)**：
-   - 检查思维链中是否包含任何工程约束、格式控制、元指令或文档检索等词汇。
-   - **绝对禁止词汇**：如“JSON”、“Schema”、“免责声明”、“忽略”、“无关”、“refs”、“根据参考文档”、“证据”、“概念定义”、“知识关联”、“图谱关系”等非医学概念。
-   - 包含任意上述词汇即立刻扣除20-50分。完全不含任何工程词汇且纯粹从医学角度切入方可得90分以上。
+### 📐 三维评估标准：
 
-2. **医学严谨度 (medical_rigor_score - 0到100分)**：
-   - 检查净化后的 CoT 是否完全保留了原问题、原始思维链中的核心医学硬数据和事实结论。
-   - **硬指标检查**：如特定的发生率（如‘不足1%’、‘5.9%’）、特定受试者数字（如‘7537名’）、特定剂量参数（如‘750 mg’）、特定不良反应（‘体位性低血压’、‘灰婴综合征’）等。
-   - 如果发生指标曲解、关键硬数据遗漏、或臆造原文献中没有的医学事实，必须严厉扣分，得分必须低于80。如果硬指标完全无损且一致，可得95分以上。
+1. 🟢 【维度一：语义纯净度 (semantic_purity_score - 0到100分)】
+   - **判定逻辑**：思维链中绝对不能包含任何【工程管线与伪净化噪声】以及【RAG 局限抱怨】。
+   - **禁止词汇范畴（检出一个即扣 20 分）**：
+     - *工程噪声类*：凡涉及JSON结构、代码占位符、自动化流水线标识、元指令元数据等非医学自然的表述（包括但不限于 `"JSON"`, `"Schema"`, `"step_id"`, `"markdown"`, `"代码块"`, `"API"`, `"图谱"`, `"refs"`, `"Answer Body"`, `"子问题拆解"`, `"推理链条如下"`, `"最终结论"` 等元叙述）。
+     - *RAG抱怨/依赖类*：**任何体现对外部检索上下文依赖、声称资料未提供、推卸推理责任的表述**（包括但不限于 `"根据参考资料"`, `"现有资料未"`, `"未提及具体"`, `"没有提供各成分"`, `"证据中未进一步"`, `"由于资料有限"` 等）。
+   - **结构化泄漏惩罚**：**如果净化后的文本中出现任何形式的结构化标题、序号或提纲标记，判定为格式泄漏，此维度得分一票否决，直接降至 60 分以下！**
+   - **白名单词汇（允许且鼓励的循证/临床逻辑词，禁止扣分）**：
+     `"证据"`, `"循证"`, `"排除"`, `"无关"`, `"忽略"`, `"临床指南"`, `"药理关联"`, `"机制"`, `"诊断"`, `"自我修正"`。
 
-3. **逻辑连贯性 (logical_coherence_score - 0到100分)**：
-   - 检查推导步骤是否流畅自然、层层递进，符合医学临床和药理专家的日常专业思考习惯。
-   - 语句是否连贯，是否有莫名奇妙的跳跃或断行。
+2. 🩺 【维度二：医学事实严谨度 (medical_rigor_score - 0到100分)】
+   - **核心判定逻辑**：评估净化后的思维链是否完整保留了原问题与原始素材中核心的“医学事实与硬数据”。
+   - **动态实体与数值核验（完全去个例化）**：
+     - 请将原始输入中出现的所有“硬指标数值”（如百分比发生率、具体剂量参数、受试样本量、特定生理学常数）与净化重写后的思维链进行**非结构化动态对齐**。
+     - 检查所有提及的关键基因型、分子靶点、受体化学实体、特异性毒性症状名字是否发生丢失、歪曲或脱水弱化。
+     - **扣分刻度**：若发生上述任何硬性数据的遗漏或事实曲解，此项得分强制锁定在 80 分以下。
 
-### 输出格式要求：
-- 必须且只能输出符合以下 JSON Schema 的规范 JSON 串，不要包裹在 markdown ``` 块中，不要有任何额外文字：
+3. 🧠 【维度三：逻辑深度与思维熵 (logical_depth_score - 0到100分)】
+   - **判定逻辑**：评估思维链是否呈现了饱满的临床推理过程，彻底杜绝走捷径、干瘪的“常识陈述”。
+   - **🚨 负面惩罚样例与控分机制（严防阿谀奉承与对长文本的虚高评价）**：
+     - *案例一（堆砌名词而无临床闭环）*：如果模型只是单纯堆砌、罗列一长串高深的专业医学名词（如各种受体名称、生理通路等），但并未真正结合当前病人的特定情况展开针对性的因果推导，亦未能输出闭环给药或诊断决策，此维度得分**绝对不能超过 75 分**。
+     - *案例二（强行脑补自我纠偏）*：如果模型写出的自我修正属于低级、生搬硬套（如为了强行迎合纠偏得分点而写出弱智的、缺乏实际医学逻辑价值的低级自问自答否定句），视同严重注水噪声，扣除 **20-40 分**。
+     - *字数与结构约束*：思维链过短（少于 150 字）或仅为说明书条目复读的，此项得分直接扣至 70 分以下。
+
+### 📤 输出格式要求：
+- 您必须且只能输出符合以下 JSON Schema 的规范 JSON 串，绝对不要包裹在 markdown ``` 块中，不要有任何额外文字：
 {
   "semantic_purity_score": int,
   "medical_rigor_score": int,
-  "logical_coherence_score": int,
-  "reason": "简短的评测理由说明"
+  "logical_depth_score": int,
+  "reason": "严谨细致的扣分或优胜理由说明（写明具体扣分点，如‘发现字面打印了阶段标题’或‘存在名词堆砌未闭环现象’）"
 }
-"""
+}"""
 
 def extract_json_block(text: str) -> str:
     """
@@ -124,7 +150,7 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
 {purified_think}
 \"\"\"
 
-请严格按照质检准则对净化后的思维链进行三维评分，并直接输出规范 of JSON 数据。"""
+请严格按照质检准则对净化后的思维链进行三维评分，并直接输出规范的 JSON 数据。"""
     try:
         response = await client.call_llm(prompt, system_prompt=JUDGE_SYSTEM_PROMPT, model_pool="premium")
         json_str = extract_json_block(response)
@@ -134,7 +160,7 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
         if not isinstance(scores, dict):
             raise ValueError("Parsed output is not a JSON object")
             
-        required_keys = ["semantic_purity_score", "medical_rigor_score", "logical_coherence_score", "reason"]
+        required_keys = ["semantic_purity_score", "medical_rigor_score", "logical_depth_score", "reason"]
         for key in required_keys:
             if key not in scores:
                 scores[key] = 90 if key != "reason" else "No explanation provided"
@@ -145,7 +171,7 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
         return {
             "semantic_purity_score": 90,
             "medical_rigor_score": 95,
-            "logical_coherence_score": 90,
+            "logical_depth_score": 90,
             "reason": f"Evaluation error: {e}"
         }
 
@@ -160,7 +186,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     # 质量网关硬指标门槛
     THRESHOLD_PURITY = 85
     THRESHOLD_RIGOR = 90
-    THRESHOLD_COHERENCE = 85
+    THRESHOLD_DEPTH = 85
     
     last_scores = {}
     
@@ -191,13 +217,13 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
             
             p_score = scores["semantic_purity_score"]
             r_score = scores["medical_rigor_score"]
-            c_score = scores["logical_coherence_score"]
+            d_score = scores.get("logical_depth_score", scores.get("logical_coherence_score", 90))
             reason = scores["reason"]
             
-            logger.info(f"   └─ Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Coherence: {c_score}/100] | Reason: {reason}")
+            logger.info(f"   └─ Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Depth: {d_score}/100] | Reason: {reason}")
             
             # 3. 质量门槛判定
-            if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and c_score >= THRESHOLD_COHERENCE:
+            if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
                 logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}!")
                 
                 # 双重防穿透校验（防止大模型虚假汇报得分）
@@ -210,7 +236,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
             else:
                 logger.warning(f"   ❌ Quality Gate FAILED on attempt {attempt+1}. Retrying with feedback...")
                 # 将质检反馈注入下一次迭代，促使自适应精修
-                current_think = f"{raw_think}\n\n[前一次清洗尝试不达标反馈：纯净度={p_score}, 严谨度={r_score}, 连贯性={c_score}。主要不足：{reason}。请重新进行高标准提纯！]"
+                current_think = f"{raw_think}\n\n[前一次清洗尝试不达标反馈：纯净度={p_score}, 严谨度={r_score}, 逻辑深度={d_score}。主要不足：{reason}。请重新进行高标准提纯！]"
                 
         except Exception as e:
             logger.error(f"   ⚠️ Error during purification attempt {attempt+1}: {e}")
@@ -221,7 +247,6 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
         from clean_dataset import clean_think_text
         purified = clean_think_text(raw_think)
         
-        # 兜底相似度与残留工程噪音双重校验，判定穿透
         sim = calculate_similarity(raw_think, purified)
         has_noise = any(kw in purified.lower() for kw in ["json", "schema", "免责声明", "忽略", "refs", "图谱"])
         is_bypass = sim > 0.85 and has_noise
@@ -229,7 +254,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
         return purified, last_scores or {
             "semantic_purity_score": 85,
             "medical_rigor_score": 90,
-            "logical_coherence_score": 85,
+            "logical_depth_score": 85,
             "reason": "Regex fallback used due to maximum LLM retries.",
             "purity_bypass": is_bypass
         }
@@ -237,7 +262,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
         return raw_think, {
             "semantic_purity_score": 50,
             "medical_rigor_score": 50,
-            "logical_coherence_score": 50,
+            "logical_depth_score": 50,
             "reason": "Extreme fallback. Kept original raw think.",
             "purity_bypass": True
         }
@@ -251,16 +276,16 @@ async def main():
         logger.error(f"Dataset file not found: {dataset_path}")
         return
         
-    # 自动秒级冷备原始文件
+    # 自动创建原始备份文件
     if not backup_path.exists():
-        logger.info(f"📦 Creating raw backup at {backup_path}")
+        logger.info(f"✨ Creating raw backup at {backup_path}")
         shutil.copyfile(dataset_path, backup_path)
     else:
-        logger.info(f"ℹ️ Raw backup already exists at {backup_path}")
+        logger.info(f"👉 Raw backup already exists at {backup_path}")
         
-    # 确保 logs 文件夹存在
+    # 确保 logs 目录存在
     logs_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 Verified that log folder exists at: {logs_dir}")
+    logger.info(f"📂 Verified that log folder exists at: {logs_dir}")
     
     client = APIClient()
     logger.info("🚀 Initializing API Client for LLM Semantic Purifying & QA Judging...")
@@ -269,16 +294,15 @@ async def main():
     with open(dataset_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
         
-    logger.info(f"Loaded {len(lines)} dataset records. Starting double-check purification...")
+    logger.info(f"Loaded {len(lines)} dataset records. [Config] PURIFY_LIMIT={PURIFY_LIMIT}, PURIFY_LINES={PURIFY_LINES}. Starting double-check purification...")
     
-    # 限制并发数防 429 报错
+    # 异步信号量控制，限制并发数为 3 以防 Rate Limit
     sem = asyncio.Semaphore(3)
     
-    # 用于收集修改日志
     purified_diff_logs = []
     
-    async def process_record(line_idx, line_str):
-        if not line_str.strip():
+    async def process_record(line_idx, line_str, should_purify=True):
+        if not line_str.strip() or not should_purify:
             return line_str
             
         try:
@@ -290,20 +314,20 @@ async def main():
                 planner_name = p.get("planner", "")
                 raw_answer = p.get("answer", "")
                 
-                # 提取 <think> 思维块
+                # 提取 <think> 标签内容
                 think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
                 if think_match:
                     raw_think = think_match.group(1).strip()
                     answer_body = think_match.group(2).strip()
                     
                     async with sem:
-                        logger.info(f"👉 Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
+                        logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
                         purified_think, score_dict = await purify_single_think(client, q, planner_name, raw_think)
                     
-                    # 重新拼装
+                    # 重新组装包含已清洗思维链的 answer
                     p["answer"] = f"<think>\n{purified_think}\n</think>\n{answer_body}"
                     
-                    # 记录 diff 日志
+                    # 记录 diff 差异日志
                     purified_diff_logs.append({
                         "line_number": line_idx + 1,
                         "question": q,
@@ -318,51 +342,82 @@ async def main():
             logger.error(f"❌ Error processing line {line_idx+1}: {e}")
             return line_str
 
-    # 并发执行所有行清洗
-    tasks = [process_record(i, line) for i, line in enumerate(lines)]
+    # 并发调度任务
+    purify_counter = 0
+    tasks = []
+    for i, line in enumerate(lines):
+        line_num = i + 1
+        should_purify = True
+        
+        # 1. 检查是否在指定行号列表中
+        if PURIFY_LINES:
+            if line_num not in PURIFY_LINES:
+                should_purify = False
+                
+        # 2. 检查是否超出条数限制
+        if should_purify:
+            # 只有当该行确实有 <think> 标签可以提纯时，才参与计额
+            try:
+                data = json.loads(line)
+                has_think = any(
+                    bool(re.match(r"^\s*<think>([\s\S]*?)</think>", p.get("answer", "")))
+                    for p in data.get("planners", [])
+                )
+                if has_think:
+                    if PURIFY_LIMIT is not None:
+                        if purify_counter < PURIFY_LIMIT:
+                            purify_counter += 1
+                        else:
+                            should_purify = False
+                else:
+                    should_purify = False
+            except Exception:
+                should_purify = False
+        
+        tasks.append(process_record(i, line, should_purify))
+        
     processed_results = await asyncio.gather(*tasks)
     
     # 写回文件
     with open(dataset_path, 'w', encoding='utf-8') as f:
         f.writelines(processed_results)
         
-    # --- 写入详细 Markdown Diff 日志至 logs 文件夹 (按日期时间保留，防止覆盖历史) ---
-    import datetime
+    # --- 生成 Markdown Diff 差异日志写入 logs 目录 ---
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     diff_log_path = logs_dir / f"purification_run_{timestamp}.md"
     latest_log_path = logs_dir / "purification_run.md"
     logger.info(f"📝 Writing detailed diff logs to: {diff_log_path}...")
     
     with open(diff_log_path, 'w', encoding='utf-8') as lf:
-        lf.write("# 🩺 医疗问答数据集大模型语义净化差异（Diff）与质检报告\n\n")
-        lf.write(f"本日志记录了对数据集 `medical_qa_dataset.jsonl` 进行大模型语义提纯的详细记录，包含每条 CoT 纯化前后的差异对比及裁判质量得分。\n\n")
-        lf.write(f"- **总净化切面数 (Total facets purified)**: {len(purified_diff_logs)}\n\n")
-        lf.write("## 🔍 详细提纯记录清单\n\n")
+        lf.write("# 🩺 医疗问答思维链提纯净化 Diff 对照差异报告\n\n")
+        lf.write(f"本差异报告详细记录了对数据集 `medical_qa_dataset.jsonl` 执行大模型思维链提纯净化前后的对比信息，包含各个视角的裁判评分详情。\n\n")
+        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)}\n\n")
+        lf.write("## 📊 提纯报告详情列表\n\n")
         
-        # 按行号 (line_number) 升序排列，行号相同则按视角 (facet) 排序，使报告井然有序
+        # 按行号和视角名称排序，便于对齐与审计
         sorted_diff_logs = sorted(purified_diff_logs, key=lambda x: (x["line_number"], x["facet"]))
         for idx, item in enumerate(sorted_diff_logs):
-            lf.write(f"### [{idx+1}] (对应数据集第 {item['line_number']} 行) | 视角: **{item['facet']}**\n")
-            lf.write(f"*   **原始问题 (Q)**: `{item['question']}`\n")
+            lf.write(f"### [{idx+1}] (数据集第 {item['line_number']} 行) | 临床视角: **{item['facet']}**\n")
+            lf.write(f"*   **核心问题 (Q)**: `{item['question']}`\n")
             
             sc = item["scores"]
-            lf.write(f"*   **裁判质检得分 (Quality Scores)**: \n")
-            lf.write(f"    - 🌟 语义纯净度 (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
+            lf.write(f"*   **质检裁判量化评分 (Quality Scores)**: \n")
+            lf.write(f"    - 🟢 语义纯净度 (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
             lf.write(f"    - 🩺 医学严谨度 (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
-            lf.write(f"    - 🧠 逻辑连贯性 (Logical Coherence): **{sc.get('logical_coherence_score', 'N/A')}/100**\n")
-            lf.write(f"    - 💬 裁判理由 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
+            lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
+            lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
             if sc.get("purity_bypass"):
-                lf.write(f"    - 🚨 **警告**: 该样本可能触发了净化绕过，未成功过滤工程噪声！\n\n")
+                lf.write(f"    - ⚠️ **绕过警告**: 评分高但相似度极高且依然带有噪声，怀疑存在防拷贝绕过！\n\n")
             else:
                 lf.write("\n")
             
-            # 使用折叠块展示，让 Markdown 日志显得极度专业和有组织
-            lf.write("#### 🔹 提纯前后对比 (Before & After Contrast)\n\n")
+            # 使用 Carousel 展示对比
+            lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
             lf.write("````carousel\n")
             
             # Slide 1: Original Think
             lf.write("```markdown\n")
-            lf.write("【原始思维链 CoT (包含工程噪声)】\n")
+            lf.write("原始思维链 (含工程与检索噪声)\n")
             lf.write(item['original_think'])
             lf.write("\n```\n")
             
@@ -370,36 +425,36 @@ async def main():
             
             # Slide 2: Purified Think
             lf.write("```markdown\n")
-            lf.write("【大模型净化后纯净 CoT】\n")
+            lf.write("提纯净化后的纯净思维链\n")
             lf.write(item['purified_think'])
             lf.write("\n```\n")
             
             lf.write("````\n\n")
             lf.write("---\n\n")
             
-    # 自动同步复制一份至 standard log file 供常规查看
+    # 自动同步副本到 purification_run.md
     try:
         shutil.copyfile(diff_log_path, latest_log_path)
-        logger.info(f"🔄 Synced latest log copy to standard path: {latest_log_path}")
+        logger.info(f"✨ Synced latest log copy to standard path: {latest_log_path}")
     except Exception as e:
         logger.warning(f"⚠️ Failed to sync standard log copy: {e}")
             
-    # 扫描并汇报 Bypass 情况
+    # 汇总输出 Bypass 警告
     bypass_list = [item for item in purified_diff_logs if item["scores"].get("purity_bypass")]
     if bypass_list:
         logger.warning("\n" + "="*60)
-        logger.warning("🚨 [WARNING] 发现可能存在物理净化穿透/绕过的可疑数据记录 (Purity Bypass Detected):")
+        logger.warning("⚠️ [WARNING] 发现存在可能绕过净化的潜在样本 (Purity Bypass Detected):")
         for idx, item in enumerate(bypass_list):
-            logger.warning(f"  [{idx+1}] 行号 {item['line_number']} | 视角: {item['facet']} | 问题: {item['question'][:20]}...")
-            logger.warning(f"      - 相似度过高且含有工程禁用词，请人工核对及精修该样本。")
+            logger.warning(f"  [{idx+1}] 行号: {item['line_number']} | 视角: {item['facet']} | 问题: {item['question'][:20]}...")
+            logger.warning(f"      - 相似度过高且疑似包含禁止词，建议人工二次审查！")
         logger.warning("="*60 + "\n")
     else:
-        logger.info("\n🎉 所有思维链均成功完成净化，未检测到任何工程穿透！\n")
+        logger.info("\n🎉 所有思维链均已成功完成高质量提纯净化，未发现任何绕过违规！\n")
             
     logger.info("=========================================")
-    logger.info(f"🎉 LLM Semantic Purification & Quality Gate Validation Complete!")
+    logger.info(f"🚀 LLM Semantic Purification & Quality Gate Validation Complete!")
     logger.info(f"💾 Purified dataset saved successfully to: {dataset_path}")
-    logger.info(f"📝 Markdown diff run logs saved to: {diff_log_path}")
+    logger.info(f"📄 Markdown diff run logs saved to: {diff_log_path}")
     logger.info("=========================================")
 
 if __name__ == "__main__":

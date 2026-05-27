@@ -2,17 +2,9 @@ from pydantic import BaseModel, Field
 from typing import List
 from enum import Enum
 
-class MedicalFacet(str, Enum):
-    PHARMACOLOGY = "药理机制"
-    CLINICAL_EFFICACY = "临床疗效"
-    SAFETY = "安全性与副作用"
-    CONTRAINDICATION = "用药方案与配伍禁忌"
-    GUIDELINE = "指南推荐与临床证据"
-    DIAGNOSIS = "诊断与鉴别诊断"
-
 class FacetPlan(BaseModel):
-    facets: List[MedicalFacet] = Field(
-        description="为输入的医疗问题规划学术与临床切面视角，数量必须在 2 到 8 个之间，只能从给定的医学枚举中选择",
+    facets: List[str] = Field(
+        description="为输入的医疗问题规划学术、临床与药理切面视角（数量必须在 2 到 8 个之间），请根据问题本身的专业特性定制化规划，不限制名称（如：分子机制、古籍收采、药代动力学、特殊人群安全等）。",
         min_items=2,
         max_items=8
     )

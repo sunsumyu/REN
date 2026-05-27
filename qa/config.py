@@ -41,3 +41,20 @@ SOFT_DELAY_BEFORE_JUDGE = float(os.getenv("SOFT_DELAY_BEFORE_JUDGE", "3.0"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
 LLM_FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.2"))
+
+# 思维链提纯净化控制配置
+PURIFY_LIMIT_RAW = os.getenv("PURIFY_LIMIT", "").strip()
+PURIFY_LIMIT = int(PURIFY_LIMIT_RAW) if PURIFY_LIMIT_RAW and PURIFY_LIMIT_RAW.isdigit() else None
+
+PURIFY_LINES_RAW = os.getenv("PURIFY_LINES", "").strip()
+if PURIFY_LINES_RAW:
+    import re
+    # 去除中括号及空格，仅保留数字与逗号
+    cleaned_lines = re.sub(r"[^\d,]", "", PURIFY_LINES_RAW)
+    if cleaned_lines:
+        PURIFY_LINES = [int(x) for x in cleaned_lines.split(",") if x]
+    else:
+        PURIFY_LINES = []
+else:
+    PURIFY_LINES = []
+

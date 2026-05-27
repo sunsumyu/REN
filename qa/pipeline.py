@@ -455,48 +455,11 @@ class MedicalQAPipeline:
         num_rounds = int(os.getenv("NUM_ROUNDS", 1))
         logger.info(f"{log_prefix}=== Starting Multi-Round Generation: {num_rounds} Rounds ===")
         
-        # Phase 4 Intention themes and seed structures
-        intents = [
-            {
-                "theme": "愈肝片与慢性迁延性肝炎辅助保肝治疗",
-                "seeds": [
-                    {"name": "愈肝片", "type": "中成药", "description": "由茵陈、板蓝根、五味子等组成的复方保肝中成药，用于慢性迁延性肝炎治疗。"},
-                    {"name": "慢性乙型肝炎", "type": "疾病", "description": "持续6个月以上的乙肝病毒感染引起的慢性肝脏病变。"}
-                ],
-                "rels": [
-                    {"sourceName": "愈肝片", "targetName": "慢性乙型肝炎", "relationship": "辅助保肝抗炎治疗", "relationshipStrength": 9}
-                ]
-            },
-            {
-                "theme": "盐酸二甲双胍片与2型糖尿病临床首选规范",
-                "seeds": [
-                    {"name": "盐酸二甲双胍", "type": "化学药品", "description": "双胍类口服降糖药，首选用于单纯饮食控制及体育锻炼治疗无效的2型糖尿病。"},
-                    {"name": "2型糖尿病", "type": "疾病", "description": "以高血糖、胰岛素抵抗和胰岛β细胞功能进行性受损为特征的代谢性疾病。"}
-                ],
-                "rels": [
-                    {"sourceName": "盐酸二甲双胍", "targetName": "2型糖尿病", "relationship": "首选一线降糖治疗药物", "relationshipStrength": 10}
-                ]
-            },
-            {
-                "theme": "阿司匹林抗血小板聚集与心血管事件二级预防",
-                "seeds": [
-                    {"name": "阿司匹林", "type": "化学药品", "description": "解热镇痛及非甾体抗炎药，不可逆抑制COX-1以发挥抗血小板聚集活性。"},
-                    {"name": "心血管疾病", "type": "疾病", "description": "累及心脏及血管的疾病，常用阿司匹林作为二级预防防止血栓塞事件。"}
-                ],
-                "rels": [
-                    {"sourceName": "阿司匹林", "targetName": "心血管疾病", "relationship": "抗血小板防栓二级预防", "relationshipStrength": 10}
-                ]
-            }
-        ]
-        
-        selected_intent = intent if intent is not None else random.choice(intents)
-        logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Active! Selected Theme: '{selected_intent['theme']}' ---")
-        
-        # 1. Fetch initial graph context and merge with intent seeds
+        # 1. Fetch initial graph context directly from the Graph Database
         try:
             graph_data = await self.api_client.fetch_random_knowledge_graph(count=1)
         except Exception as e:
-            logger.warning(f"{log_prefix}Failed to fetch random KG data: {e}. Reverting entirely to intent seeds.")
+            logger.critical(f"{log_prefix}Failed to fetch random KG data from Graph Database: {e}")
             graph_data = {"entities": [], "relationships": []}
             
         if "entities" not in graph_data or not graph_data["entities"]:
@@ -504,22 +467,39 @@ class MedicalQAPipeline:
         if "relationships" not in graph_data or not graph_data["relationships"]:
             graph_data["relationships"] = []
             
-        # Merge clinical intent entities
-        for seed in selected_intent["seeds"]:
-            if not any(e.get("name") == seed["name"] for e in graph_data["entities"]):
-                graph_data["entities"].append({
-                    "id": random.randint(10000, 99999),
-                    "name": seed["name"],
-                    "type": seed["type"],
-                    "description": seed["description"]
-                })
+        # 2. Determine selected theme dynamically or from passed intent
+        if intent is not None:
+            selected_theme = intent.get("theme", "临床医学研究")
+            # If explicit intent is passed, merge its seeds and rels into graph_data
+            for seed in intent.get("seeds", []):
+                if not any(e.get("name") == seed["name"] for e in graph_data["entities"]):
+                    graph_data["entities"].append({
+                        "id": random.randint(10000, 99999),
+                        "name": seed["name"],
+                        "type": seed["type"],
+                        "description": seed["description"]
+                    })
+            for rel in intent.get("rels", []):
+                if not any(r.get("sourceName") == rel["sourceName"] and r.get("targetName") == rel["targetName"] for r in graph_data["relationships"]):
+                    graph_data["relationships"].append(rel)
+        else:
+            # Dynamically formulate the clinical theme directly from the fetched graph database
+            if graph_data.get("relationships"):
+                import random
+                rel = random.choice(graph_data["relationships"])
+                src = rel.get("sourceName", "")
+                tgt = rel.get("targetName", "")
+                relation = rel.get("relationship", "")
+                selected_theme = f"{src}与{tgt}的{relation}临床诊疗规范与医学循证"
+            elif graph_data.get("entities"):
+                names = [e.get("name") for e in graph_data["entities"][:2]]
+                selected_theme = "与".join(names) + "的临床应用研究与用药指南"
+            else:
+                selected_theme = "常见疾病的循证医学用药指南"
                 
-        # Merge clinical intent relationships
-        for rel in selected_intent["rels"]:
-            if not any(r.get("sourceName") == rel["sourceName"] and r.get("targetName") == rel["targetName"] for r in graph_data["relationships"]):
-                graph_data["relationships"].append(rel)
-                
-        context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_intent["theme"])
+        logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Active! Selected Theme: '{selected_theme}' ---")
+        
+        context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
         
         # 2. Generate first question
         q1 = await self.generate_initial_question(context_list)
