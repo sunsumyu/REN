@@ -13,8 +13,8 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 from api_client import APIClient
 from pipeline import MedicalQAPipeline
-from run_evals import JUDGE_COMPREHENSIVE_PROMPT
-from eval_models import ComprehensiveJudgeMetrics
+from tests.run_evals import JUDGE_COMPREHENSIVE_PROMPT
+from tests.eval_models import ComprehensiveJudgeMetrics
 from dataset_db import save_dataset_record
 import config
 

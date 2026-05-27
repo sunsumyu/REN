@@ -16,8 +16,11 @@ import shutil
 from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
-# 将当前目录加入系统路径以确保 import 正常
-sys.path.append(str(Path(__file__).resolve().parent))
+# 将当前目录与项目根目录加入系统路径以确保 import 正常
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
+sys.path.append(str(current_dir))
+sys.path.append(str(parent_dir))
 
 from config import LLM_MODEL
 from api_client import APIClient
