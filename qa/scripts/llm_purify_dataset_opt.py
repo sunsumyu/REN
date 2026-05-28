@@ -29,7 +29,21 @@ from api_client import APIClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
-PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型（如 DeepSeek-R1、OpenAI o1）微调的冷启动标准。
+def get_system_directive(planner: str) -> str:
+    """根据视角（Planner）动态生成特异性引导，杜绝硬编码偏置"""
+    directives = {
+        "药理机制": "the biological, molecular, and pharmacological mechanisms of the drug or treatment",
+        "用药方案与配伍禁忌": "the clinical dosing regimens, safety boundaries, and drug-drug/disease contraindications",
+        "临床表现": "the clinical signs, symptoms, and disease progression features",
+        "诊断与鉴别诊断": "the diagnostic criteria, laboratory/imaging findings, and differential diagnosis logic",
+        "临床疗效": "the clinical efficacy, therapeutic outcomes, and patient response parameters",
+        "不良反应": "the side effects, adverse events, toxicological mechanisms, and safety monitoring"
+    }
+    return directives.get(planner, f"the clinical rationale, evidence synthesis, and medical logic related to {planner}")
+
+def get_purify_system_prompt(planner: str) -> str:
+    """动态生成系统提示词，注入特异性视角红线拦截"""
+    return f"""您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型（如 DeepSeek-R1、OpenAI o1）微调的冷启动标准。
 
 ### 🚨 提纯与重写的核心目标：
 当前 `<think>` 块是工程 Pipeline 自动生成的，混杂了大量【工程指令垃圾】（如 JSON 结构、Refs 引用、RAG 抱怨、格式避让）。如果直接用于模型微调，会导致模型在推理时频繁产生格式泄漏和系统幻觉。您需要将静态的 RAG 段落升华为一个**人类医学专家大脑里真实、高熵、流畅且无污染的“动态临床认知推理心流”**。
@@ -43,17 +57,18 @@ PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思
 2. 🚨 【严禁伪净化与做题家元描述（Format Translation Bypass）】：
    - 绝对禁止采取“将 JSON 字段名翻译成自然语言来凑字数”的走捷径策略！
    - **绝对禁止在文本中输出任何暗示您在处理一个工程结构化任务的元叙述词汇**。包括但不限于：“我的推理链条如下”、“问题可以拆解为以下子问题”、“核心证据来自实体库...”、“答案正文应该分点阐述”、“最终结论是...”等。
+   - **🚨 绝对禁止在文本的任何地方吐出“切面”、“视角”、“角度”等字眼，也绝对禁止直接提及或复读当前的视角名称‘{planner}’！** 严禁出现“从{planner}视角分析”、“根据{planner}角度来看”等任何向用户宣告或暗示你正在以何种视角解题的元叙述句式。
 
 3. 🚨 【严禁 RAG 边界抱怨与参数知识钝化（Anti-RAG Complaining & Parametric Activation）】：
-   - **绝对禁止在思考链中写出任何关于检索上下文边界局限性的“抱怨”与“免责”表述！**（如：“现有资料未提供该成分的药理作用”、“根据参考资料显示...”、“由于资料有限无法...”）。这类“抱怨”会导致微调后的 Reasoning 模型发生致命的“参数知识钝化”，丧失调用自身庞大参数库独立推理的能力。
-   - **机制补偿重构**：即使原始检索资料极其有限，也必须假定您的脑中拥有最完备的医学专家常识，直接激活您的**参数化临床知识（Parametric Knowledge）**，对药物各成分或疾病通路展开深度、科学、合理的微观机制推导与因果演绎，决不允许推卸推理责任。
+   - **绝对禁止在思考链中写出任何关于检索上下文边界局限性的“抱怨”与“免责”表述！**（如：“现有资料未提供...”、“根据参考资料显示...”、“由于资料有限无法...”）。这类“抱怨”会导致微调后的 Reasoning 模型发生致命的“参数知识钝化”，丧失调用自身庞大参数库独立推理的能力。
+   - **机制补偿重构**：即使原始检索资料极其有限，也必须假定您的脑中拥有最完备的医学专家常识，直接激活您的**参数化临床知识（Parametric Knowledge）**，对药物/治疗/疾病相关信息展开深度、科学、合理的机制推导与因果演绎，决不允许推卸推理责任。
 
 4. 📐 【强化的 5 阶段临床认知深度推理流（Exploratory CoT Trajectory）】：
-   优秀的 Reasoning 微调 CoT 必须呈现出**“提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 自我肯定/得出结论”**的动态心流轨迹（Thought Trace）。您必须引导思维链通过以下 5 个自然的认知阶段隐式递进：
-   - **阶段一：核心临床矛盾解构** —— 开头直切临床或药理矛盾核心（例如：“针对 [疾病/药物名称] 在 [临床场景] 中的 [特定视角机制/药理学意义]，其核心切入点在于...”）。
-   - **阶段二：微观病生理/药理推演** —— 对分子靶点、受体结合、体内代动学参数等进行深度因果链条解析，呈现动态心流。
-   - **阶段三：逻辑分叉与禁忌症排查** —— 加入自我提问和临床假说排查，增加思维链的“逻辑熵”（例如：“慢着，在此处必须评估：这一抑制作用在特定生理状态下是否会持续...”）。
-   - **阶段四：特殊生理极限与查漏补缺** —— 引入对于年龄、肝肾功能受损等特殊情况的核验，展示高价值的“自我纠正与查漏补缺”过程。
+   优秀的 Reasoning 微调 CoT 必须呈现出**“提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 自自我肯定/得出结论”**的动态心流轨迹（Thought Trace）。您必须引导思维链通过以下 5 个自然的认知阶段隐式递进：
+   - **阶段一：核心临床矛盾解构** —— 开头直切临床/医学矛盾核心（例如，直接以物理/医学事实切入主题：“针对 [疾病/药物/治疗名称]，其核心机制/生理本质/临床逻辑在于...”，不需要任何结构性的开场白、自问自答或过渡废话）。
+   - **阶段二：微观病生理/临床逻辑推演** —— 对分子靶点、受体结合、体内代动学参数或临床指南要点等进行深度因果链条解析，呈现动态心流。
+   - **阶段三：逻辑分叉与特殊情况排查** —— 加入自我提问和临床假说排查，增加思维链的“逻辑熵”（例如：“慢着，在此处必须评估：这一情况在特定生理状态下是否会持续...”）。
+   - **阶段四：生理/安全极限与查漏补缺** —— 引入对于年龄、肝肾功能受损等特殊情况或安全边界的核验，展示高价值的“自我纠正与查漏补缺”过程。
    - **阶段五：决策自然合拢** —— 以高度学术的口吻，自然推演出最合理的临床或机制结论，禁止出现“综上所述”、“因此最终结论是”等做题套话。
 
 5. 🚨 【防范序号结构泄漏】：
@@ -66,6 +81,48 @@ PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思
 7. 📤 【输出物理格式要求】：
    - 仅输出净化提纯后的 `<think>` 内部纯文本，绝对不要带有 `<think>` 或 `</think>` 标记本身，也不要包裹在 markdown 围栏中。
 """
+
+# 🟢 切面自适应少样本（Dynamic Few-Shot）映射库，阻断“模型套用偏置”。
+FEW_SHOT_PHARMACOLOGY = """
+### 🟢 提纯重构黄金少样本示范 (Few-Shot Gold Standard Example)：
+* **输入原始思维链 (包含JSON规划与RAG噪声)**：
+\"\"\"
+我们被要求输出一个JSON对象，符合指定的schema...分析问题：“复方酮康唑乳膏的包装形式有哪两种？...”
+\"\"\"
+* **输出提纯重构后的完美思维链**：
+\"\"\"
+复方酮康唑乳膏为皮肤外用复方制剂，活性成分包含酮康唑、丙酸氯倍他索和硫酸新霉素。从药效方式看，三者通过不同途径发挥作用：酮康唑抑制真菌细胞色素P-450依赖性14α-去甲基酶，阻断麦角固醇合成，破坏真菌细胞膜结构...从药剂学与包装规范考量，该乳膏的包装形式主要有两种：塑料瓶装以及塑料软管或铝管装...工程化包装保障了该乳膏在临床使用中的安全性与有效性。
+\"\"\"
+"""
+
+FEW_SHOT_CONTRAINDICATION = """
+### 🟢 提纯重构黄金少样本示范 (Few-Shot Gold Standard Example)：
+* **输入原始思维链 (包含JSON规划与RAG噪声)**：
+\"\"\"
+我们被要求输出一个结构化的JSON，回答“联环笑定-非洛地平缓释胶囊的禁忌症包括哪些？”，并基于提供的refs...
+\"\"\"
+* **输出提纯重构后的完美思维链**：
+\"\"\"
+非洛地平是一种二氢吡啶类钙通道阻断药，通过阻滞血管平滑肌和心肌细胞的L型钙通道，抑制钙离子内流...从血管扩张和心肌抑制的角度，急性心肌梗塞患者常伴血流动力学紊乱...因此，该制剂的禁忌症具体包括：对非洛地平或本品任何成分过敏者、急性心肌梗塞患者、不稳定型心绞痛患者、非代偿性心衰患者、孕妇及哺乳期妇女。这些禁忌症类别直接由药物的钙通道阻断特性与相应疾病的病理生理基础相互作用所决定。
+\"\"\"
+"""
+
+FEW_SHOT_GENERAL = """
+### 🟢 提纯重构黄金少样本示范 (Few-Shot Gold Standard Example)：
+* **输入原始思维链 (包含JSON规划与RAG噪声)**：
+\"\"\"
+我们被要求以结构化的JSON格式回答关于“白头翁的功效主治是什么”的问题...
+\"\"\"
+* **输出提纯重构后的完美思维链**：
+\"\"\"
+白头翁作为传统清热凉血类中药，其功效核心在于清热解毒、凉血止痢。在临床应用中，该药主要主治热毒血痢以及阴痒带下等病症...临床治疗以清热解毒、凉血止痢为核心应用靶向。
+\"\"\"
+"""
+
+FACET_FEW_SHOTS = {
+    "药理机制": FEW_SHOT_PHARMACOLOGY,
+    "用药方案与配伍禁忌": FEW_SHOT_CONTRAINDICATION
+}
 
 JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量审查裁判（Judge LLM）。您的任务是对大模型重写净化后的医学思维链（Purified CoT）进行三维度的量化质检评估。请保持极高的专业客观性，杜绝“长文本阿谀奉承”倾向，严查实质逻辑深度。
 
@@ -173,28 +230,50 @@ def pre_strip_engineering_noise(raw_text: str) -> str:
     return cleaned.strip()
 
 def post_strip_meta_openings(text: str) -> str:
-    """后置微创手术：精准切除大模型生成的‘伪指令/开场白’元叙述废话"""
+    """
+    后置微创手术（升级版）：
+    1. 精准切除开头的元指令宣告废话。
+    2. 全局物理切割中途逃逸的“从XX视角分析/来看”等系统性切面宣告噪音。
+    """
+    cleaned = text.strip()
+    
+    # 1. 拦截并切除位于文本开头的元描述
     meta_patterns = [
         r"^(我们(需|需要|将)?[^\n，。：]*?从[^\n，。：]*?视角[^\n，。：]*?[。，：])",
         r"^(针对(上述|这个|这一)?[^\n，。：]*?问题，?(我们)?[^\n，。：]*?[。，：])",
         r"^(为(了)?(解答|回答|探讨)[^\n，。：]*?问题，?(我们)?[^\n，。：]*?[。，：])",
         r"^(首先，?(我们)?(需要)?(来)?(分析|探讨|明确|了解)[^\n，。：]*?[。，：])"
     ]
-    cleaned = text.strip()
     for pattern in meta_patterns:
         cleaned = re.sub(pattern, '', cleaned, count=1).strip()
+        
+    # 2. 全局拦截并切除中途逃逸的“从XX视角/角度分析（或来看）”
+    global_facet_pattern = r"(从[^。，：]*?(视角|角度)(分析|来看)?，?)"
+    cleaned = re.sub(global_facet_pattern, '', cleaned, flags=re.IGNORECASE).strip()
+    
+    # 3. 容错首字符标点清理
+    if cleaned and cleaned[0] in ['，', '。', '、', '：']:
+        cleaned = cleaned[1:].strip()
+        
     return cleaned
 
 def is_catastrophic_format_collapse(text: str) -> bool:
-    """后置硬性网关：检测是否残留 JSON 语法废墟或元描述穿透"""
+    """后置硬性网关：检测是否残留 JSON 语法废墟或元描述穿透，使用精确正则以阻断误判"""
     invalid_chars = ['{', '}', '[', ']', '",', '我决定构建', '步骤1', '阶段一']
-    leakage_keywords = [
-        '不同资料中一致', '来源资料一致', '一致确认', '来源可靠', 
-        '不同来源', '资料中未提及', '参考资料显示', '根据资料'
-    ]
     if any(char in text for char in invalid_chars):
         return True
-    if any(kw in text for kw in leakage_keywords):
+    
+    # 精确匹配 RAG 泄露抱怨与做题家元叙述，而非泛化的医学词汇（如单纯的‘不同来源’）
+    leakage_patterns = [
+        r'根据(参考|提供|现有)?资料(显示|指出|表明)',
+        r'(现有|参考)?资料(未提供|没有明确|未提及|未进一步)',
+        r'在(不同来源|文献记录|参考资料)中(一致确认|得到证实|完全一致)',
+        r'问题(可以)?拆解为',
+        r'我的推理链',
+        r'核心证据来自',
+        r'最终结论是'
+    ]
+    if any(re.search(pat, text) for pat in leakage_patterns):
         return True
     return False
 
@@ -247,9 +326,16 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     
     stripped_think = pre_strip_engineering_noise(raw_think)
     
+    few_shot = FACET_FEW_SHOTS.get(planner, FEW_SHOT_GENERAL)
+    system_prompt = get_purify_system_prompt(planner)
+    directive = get_system_directive(planner)
+    
     for attempt in range(max_retries):
-        prompt = f"""问题: {q}
-切面视角: {planner}
+        prompt = f"""{few_shot}
+
+[System Directive: Please write a pure, raw clinical thought chain focusing on {directive}. Do NOT output the word 'facet', the word 'mechanism', or the facet name '{planner}' in the text. Output ONLY the purified, direct thought chain without any markdown block formatting or meta-narrative declarations.]
+
+问题: {q}
 原始思维链 (CoT) 内容:
 \"\"\"
 {stripped_think}
@@ -257,7 +343,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
 
 请严格按照清洗净化准则进行处理，并只输出清洗净化后的纯净思维链文本。"""
         try:
-            purified = await client.call_llm(prompt, system_prompt=PURIFY_SYSTEM_PROMPT, model_pool="premium")
+            purified = await client.call_llm(prompt, system_prompt=system_prompt, model_pool="premium")
             purified = purified.replace("<think>", "").replace("</think>", "").strip()
             
             if purified.startswith("```"):
