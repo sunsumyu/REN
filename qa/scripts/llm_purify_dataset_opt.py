@@ -462,37 +462,53 @@ async def main():
     purified_diff_logs = []
     
     async def process_record(line_idx, line_str, should_purify=True):
-        if not line_str.strip() or not should_purify:
+        if not line_str.strip():
             return line_str
             
         try:
             data = json.loads(line_str)
-            q = data.get("Q", "")
-            planners = data.get("planners", [])
             
-            for p in planners:
-                planner_name = p.get("planner", "")
-                raw_answer = p.get("answer", "")
+            # 🔴 强制剥离 history 与 refs 字段以对齐微调冷启动规范（全量数据对齐防线）
+            data.pop("history", None)
+            data.pop("refs", None)
+            
+            if should_purify:
+                q = data.get("Q", "")
+                planners = data.get("planners", [])
                 
-                think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
-                if think_match:
-                    raw_think = think_match.group(1).strip()
-                    answer_body = think_match.group(2).strip()
+                for p in planners:
+                    planner_name = p.get("planner", "")
+                    raw_answer = p.get("answer", "")
                     
-                    async with sem:
-                        logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
-                        purified_think, score_dict = await purify_single_think(client, q, planner_name, raw_think)
-                    
-                    p["answer"] = f"<think>\n{purified_think}\n</think>\n{answer_body}"
-                    
-                    purified_diff_logs.append({
-                        "line_number": line_idx + 1,
-                        "question": q,
-                        "facet": planner_name,
-                        "original_think": raw_think,
-                        "purified_think": purified_think,
-                        "scores": score_dict
-                    })
+                    think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
+                    if think_match:
+                        raw_think = think_match.group(1).strip()
+                        answer_body = think_match.group(2).strip()
+                        
+                        # 🧠 提取并分离 <facet = xxx> 标签，避免其作为系统噪声干扰 LLM 的提纯和裁判的评估
+                        facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
+                        if facet_match:
+                            facet_tag = facet_match.group(1).strip()
+                            actual_raw_think = facet_match.group(2).strip()
+                        else:
+                            facet_tag = f"<facet = {planner_name}>"
+                            actual_raw_think = raw_think
+                        
+                        async with sem:
+                            logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
+                            purified_think, score_dict = await purify_single_think(client, q, planner_name, actual_raw_think)
+                        
+                        # 🟢 清洗完成后，将提取 of <facet = xxx> 标签重新拼接保留在 think 块的最前部，确保数据集格式的完整性
+                        p["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                        
+                        purified_diff_logs.append({
+                            "line_number": line_idx + 1,
+                            "question": q,
+                            "facet": planner_name,
+                            "original_think": raw_think,
+                            "purified_think": purified_think,
+                            "scores": score_dict
+                        })
             
             return json.dumps(data, ensure_ascii=False) + "\n"
         except Exception as e:
