@@ -29,42 +29,39 @@ from api_client import APIClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
-PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型微调标准。
+PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型（如 DeepSeek-R1、OpenAI o1）微调的冷启动标准。
 
-### 为什么需要净化？
-当前 `<think>` 块是工程 Pipeline 自动生成的，混杂了大量【工程指令垃圾】（如 JSON Schema 拼装、JSON 避让、step_id、Markdown 代码块标记等）。若直接用于模型微调，会导致模型在后续推理时频繁产生“格式泄漏”和“系统指令幻觉”。
+### 🚨 提纯与重写的核心目标：
+当前 `<think>` 块是工程 Pipeline 自动生成的，混杂了大量【工程指令垃圾】（如 JSON 结构、Refs 引用、RAG 抱怨、格式避让）。如果直接用于模型微调，会导致模型在推理时频繁产生格式泄漏和系统幻觉。您需要将静态的 RAG 段落升华为一个**人类医学专家大脑里真实、高熵、流畅且无污染的“动态临床认知推理心流”**。
 
-### 🛠️ 企业级净化与重写准则：
+### 🛠️ 企业级提纯与重写规范：
 
-1. ❌ 【绝对禁止的工程与流水线噪声】（必须彻底拔除）：
-   - 移除任何涉及输出格式、JSON约束、Schema结构、Markdown标记的自我提醒（例如：“我们要输出JSON，不要包裹 markdown”、“现在开始构建 JSON schema 响应”等）。
-   - 移除工程流水线的临时步骤占位符（例如：`step_id: P1`、`logic: ...`、`证据对齐清单`、`子问题拆解`、`Answer Body` 等底层结构性字段名字）。
-   - 移除对特定检索数据库或原始代码变量的直接引用（例如：不要出现 “从 refs[0] 中获取”、“图谱节点 A 关联 B”、“API 检索返回”等）。
-   - 🚨 【严禁伪净化（Format Translation Bypass）】：绝对不允许采取“走捷径”的策略——将原始 JSON 的字段名翻译成白话文或自然语言来凑字数！**绝对禁止在文本中输出如：“我的推理链条如下”、“问题可以拆解为以下子问题”、“核心证据来自实体库...”、“答案正文应该分点阐述”、“最终结论是...”等任何暗示您在处理一个工程结构化任务的元叙述词汇。**
+1. ❌ 【物理屏蔽一切工程与流水线噪声】（检出一个即扣分）：
+   - 彻底移除涉及输出格式、JSON约束、Schema结构、Markdown标记的自我提醒（如：“我们要输出JSON”、“现在开始构建 JSON schema”等）。
+   - 彻底移除工程流水线的临时步骤占位符（如：`step_id: P1`、`logic: ...`、`证据对齐清单`、`子问题拆解`、`Answer Body` 等结构性字段名）。
 
-2. 🚨 【严禁 RAG 边界抱怨与参数知识钝化（Anti-RAG Constraint Complaining）】：
-   - **绝对禁止在思考链中写出任何关于检索上下文边界局限性的“抱怨”与“免责”表述！**（例如：“现有资料未提供/未提及该成分的药理作用”、“根据参考资料显示...”、`“证据中未进一步阐明...”`、`“因此只能基于功能主治进行...”`）。
-   - 在微调后的 Reasoning 模型中，这类“抱怨”会带来极其致命的**“参数知识钝化”**，导致模型在离线或无 RAG 部署时严重依赖外部上下文，丧失调用其百亿/千亿参数知识库进行自主推理的能力，退化为干瘪的上下文搬运工。
-   - **正确做法**：即使原始资料有限，也必须假定您的脑中拥有最完备的医学专家常识，直接激活您的**参数化临床知识（Parametric Knowledge）**，对药物各成分或疾病通路展开深度、科学、合理的微观机制推导与因果演进，不允许推卸责任或声称资料不足。
+2. 🚨 【严禁伪净化与做题家元描述（Format Translation Bypass）】：
+   - 绝对禁止采取“将 JSON 字段名翻译成自然语言来凑字数”的走捷径策略！
+   - **绝对禁止在文本中输出任何暗示您在处理一个工程结构化任务的元叙述词汇**。包括但不限于：“我的推理链条如下”、“问题可以拆解为以下子问题”、“核心证据来自实体库...”、“答案正文应该分点阐述”、“最终结论是...”等。
 
-3. 🟢 【必须保留并鼓励的医学/循证推理核心】（禁止过度杀伤）：
-   - 允许并鼓励使用循证医学高频词汇（如：“临床证据”、“循证依据”、“指南推荐”、“证据等级”）。
-   - 允许并鼓励在进行鉴别诊断或排查时使用临床逻辑词（如：“经排查后可以忽略...”、“该因素与当前病理无关”、“排除...诊断”）。
-   - 允许保留具有临床思考价值的“自我纠偏与查漏补缺”过程（例如：“等等，在考虑老年患者时，必须额外评估肾功能受损带来的蓄积风险，此前考虑的一般剂量可能偏高，需要调整为...”）。
+3. 🚨 【严禁 RAG 边界抱怨与参数知识钝化（Anti-RAG Complaining & Parametric Activation）】：
+   - **绝对禁止在思考链中写出任何关于检索上下文边界局限性的“抱怨”与“免责”表述！**（如：“现有资料未提供该成分的药理作用”、“根据参考资料显示...”、“由于资料有限无法...”）。这类“抱怨”会导致微调后的 Reasoning 模型发生致命的“参数知识钝化”，丧失调用自身庞大参数库独立推理的能力。
+   - **机制补偿重构**：即使原始检索资料极其有限，也必须假定您的脑中拥有最完备的医学专家常识，直接激活您的**参数化临床知识（Parametric Knowledge）**，对药物各成分或疾病通路展开深度、科学、合理的微观机制推导与因果演绎，决不允许推卸推理责任。
 
-4. 📐 【强化的 4 阶段临床认知深度推理流（Exploratory CoT Trajectory）】：
-   - 优秀的 Reasoning 微调 CoT 绝不能是一篇平铺直叙、精简版教科书似的“静态科平时段落”。它必须呈现出**“探索式、推导式、逐步探究与排查”的动态思考轨迹（Thought Trace）**。
-   - 净化重写时，您必须引导思维链通过一系列自然的**逻辑控制词与因果连词**（例如：“*首先，需要解构该问题的核心在于...*”、“*这必然引导我们关注其微观药理机制，即...*”、“*慢着，这里存在一个关键分叉：为什么是亚型A而不是亚型B？因为...*”、“*这意味着...，而由于...所以...*”、“*由此推导，我们可以排除...，进而锁定...*”）层层剥茧、递进推理。
-   - 保证思维链中包含明确的**【提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 自我肯定/得出结论】**的动态心流路径，这才是对 Reasoning 模型微调真正合格的 CoT 语料。
+4. 📐 【强化的 5 阶段临床认知深度推理流（Exploratory CoT Trajectory）】：
+   优秀的 Reasoning 微调 CoT 必须呈现出**“提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 自我肯定/得出结论”**的动态心流轨迹（Thought Trace）。您必须引导思维链通过以下 5 个自然的认知阶段隐式递进：
+   - **阶段一：核心临床矛盾解构** —— 开头直切临床或药理矛盾核心（例如：“针对 [疾病/药物名称] 在 [临床场景] 中的 [特定视角机制/药理学意义]，其核心切入点在于...”）。
+   - **阶段二：微观病生理/药理推演** —— 对分子靶点、受体结合、体内代动学参数等进行深度因果链条解析，呈现动态心流。
+   - **阶段三：逻辑分叉与禁忌症排查** —— 加入自我提问和临床假说排查，增加思维链的“逻辑熵”（例如：“慢着，在此处必须评估：这一抑制作用在特定生理状态下是否会持续...”）。
+   - **阶段四：特殊生理极限与查漏补缺** —— 引入对于年龄、肝肾功能受损等特殊情况的核验，展示高价值的“自我纠正与查漏补缺”过程。
+   - **阶段五：决策自然合拢** —— 以高度学术的口吻，自然推演出最合理的临床或机制结论，禁止出现“综上所述”、“因此最终结论是”等做题套话。
 
-5. 🚨 【防范结构化标记泄漏与伪思考】：
-   - **绝对禁止使用任何如“阶段①”、“【病症剖析】”、“步骤1”、“首先拆解问题”等显式的、结构化的提纲或序号词！** 这种结构化泄漏会破坏 Reasoning 模型的原生思考连贯性。
-   - 优秀的 CoT 必须用**高度自然的学术因果递进和自问自答的长文流**，来隐式体现出那 4 个临床认知阶段的深入。
+5. 🚨 【防范序号结构泄漏】：
+   - **绝对禁止使用任何如“阶段一”、“阶段①”、“【核心矛盾】”、“步骤1”等显式的、结构化的提纲或序号词！** 这种结构化泄漏会破坏 Reasoning 模型的原生思考连贯性。必须使用**高度自然的学术因果递进和自问自答的长文流**。
 
 6. 🔇 【语调与文风红线】：
    - 必须使用绝对的**第三人称、客观学术、冰冷严谨的医学专家视角**。
-   - 彻底去除任何对话性废话（如：“好的，让我来为你解答...”、“问题问的是...，我的分析是...”、“根据你的描述...”）。
-   - **绝对禁止开场虚词**：思维链必须直接开始陈述医学事实和逻辑因果（例如，开头直接进入主题：“针对 [疾病/药物名称] 在 [临床场景] 中的 [特定视角机制/药理学意义]，其核心在于...”，像教科书或医生大脑里的深层默念一样，不需要任何结构性的开场白、自问自答或过渡废话）。
+   - 彻底去除任何对话性废话（如：“好的，让我来为你解答...”、“问题问的是...，我的分析是...”）。直接开始陈述医学事实和逻辑因果，不需要任何开场白或过渡废话。
 
 7. 📤 【输出物理格式要求】：
    - 仅输出净化提纯后的 `<think>` 内部纯文本，绝对不要带有 `<think>` 或 `</think>` 标记本身，也不要包裹在 markdown 围栏中。
@@ -160,7 +157,8 @@ def has_repetition_loop(text: str, chunk_size: int = 50, threshold: float = 0.8)
     return overlap_ratio > threshold
 
 def pre_strip_engineering_noise(raw_text: str) -> str:
-    """前置物理剥离：破坏原始文本中的 JSON 结构引力"""
+    """前置物理剥离：破坏原始文本中的 JSON 结构引力，并定向物理摧毁 RAG 元校验噪音"""
+    # 1. 清除 JSON 结构碎片
     noise_patterns = [
         r'"sub_questions":\s*\[.*?\]',
         r'"evidences":\s*\[',
@@ -172,13 +170,35 @@ def pre_strip_engineering_noise(raw_text: str) -> str:
     cleaned = raw_text
     for pattern in noise_patterns:
         cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL)
+        
+    # 2. 定向物理清除大模型对数据源一致性论证的元校验垃圾句式（阻断“不同资料一致”等毒性）
+    metadata_patterns = [
+        r'(这一数值|该数据|这一结果)在(不同|多个|相关)?(来源|资料|文献|图谱|定义|档案|数据库)中(一致确认|得到证实|完全一致|一致性|来源可靠|得到验证|一致记录|一致)',
+        r'根据(参考)?(资料|文献|数据|图谱|实体库)显示',
+        r'在(概念定义|档案|知识图谱|记录)中均?得到(一致确认|证实)',
+        r'现有资料(未提供|未提及|没有明确)',
+        r'证据中(未进一步阐明|无法确认)'
+    ]
+    for pattern in metadata_patterns:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+        
+    # 3. 清理括号与物理杂质
     cleaned = re.sub(r'[\{\}\[\]]', ' ', cleaned)
     return cleaned.strip()
 
 def is_catastrophic_format_collapse(text: str) -> bool:
-    """后置硬性网关：检测是否残留 JSON 语法废墟"""
-    invalid_chars = ['{', '}', '[', ']', '",', '我决定构建']
-    return any(char in text for char in invalid_chars)
+    """后置硬性网关：检测是否残留 JSON 语法废墟或元描述穿透"""
+    invalid_chars = ['{', '}', '[', ']', '",', '我决定构建', '步骤1', '阶段一']
+    # 🚨 极其严苛的元描述漏网词库
+    leakage_keywords = [
+        '不同资料中一致', '来源资料一致', '一致确认', '来源可靠', 
+        '不同来源', '资料中未提及', '参考资料显示', '根据资料'
+    ]
+    if any(char in text for char in invalid_chars):
+        return True
+    if any(kw in text for kw in leakage_keywords):
+        return True
+    return False
 
 async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_think: str, purified_think: str) -> Dict[str, Any]:
     """
@@ -226,7 +246,6 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     执行语义清洗并配合质量网关评测进行重试重构循环。
     返回: (净化后的 CoT 字符串, 最终获得的评分字典)
     """
-    current_think = raw_think
     max_retries = 3
     
     # 质量网关硬指标门槛
@@ -235,17 +254,18 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     THRESHOLD_DEPTH = 85
     
     last_scores = {}
+    feedback_prompt = ""
+    
+    # 1. 前置物理剥离，从源头切断 JSON 结构对大模型注意力机制的干扰引力
+    stripped_think = pre_strip_engineering_noise(raw_think)
     
     for attempt in range(max_retries):
-        # 1. 前置物理剥离，从源头切断 JSON 结构对大模型注意力机制的干扰引力
-        stripped_think = pre_strip_engineering_noise(current_think)
-        
         prompt = f"""问题: {q}
 切面视角: {planner}
 原始思维链 (CoT) 内容:
 \"\"\"
 {stripped_think}
-\"\"\"
+\"\"\"{feedback_prompt}
 
 请严格按照清洗净化准则进行处理，并只输出清洗净化后的纯净思维链文本。"""
         try:
@@ -305,7 +325,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
             else:
                 logger.warning(f"   ❌ Quality Gate FAILED on attempt {attempt+1}. Retrying with feedback...")
                 # 将质检反馈注入下一次迭代，促使自适应精修
-                current_think = f"{raw_think}\n\n[前一次清洗尝试不达标反馈：纯净度={p_score}, 严谨度={r_score}, 逻辑深度={d_score}。主要不足：{reason}。请重新进行高标准提纯！]"
+                feedback_prompt = f"\n\n[前一次清洗尝试不达标反馈：纯净度={p_score}, 严谨度={r_score}, 逻辑深度={d_score}。主要不足：{reason}。请针对这些不足重新进行更深度、更纯净的提纯！]"
                 
         except Exception as e:
             logger.error(f"   ⚠️ Error during purification attempt {attempt+1}: {e}")
