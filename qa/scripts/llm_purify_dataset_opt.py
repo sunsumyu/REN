@@ -571,45 +571,67 @@ async def main():
     with open(dataset_path, 'w', encoding='utf-8') as f:
         f.writelines(processed_results)
         
+    # Group diff logs by line_number to keep facets organized by QA
+    from collections import defaultdict
+    grouped_logs = defaultdict(list)
+    for item in purified_diff_logs:
+        grouped_logs[item["line_number"]].append(item)
+        
+    unique_qas_count = len(grouped_logs)
+    
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    diff_log_path = logs_dir / f"purification_run_{timestamp}.md"
+    if purified_diff_logs:
+        sorted_lines = sorted(grouped_logs.keys())
+        line_range = f"[{sorted_lines[0]}-{sorted_lines[-1]}]_"
+    else:
+        line_range = ""
+        
+    diff_log_path = logs_dir / f"purification_run_{line_range}{timestamp}.md"
     latest_log_path = logs_dir / "purification_run.md"
     logger.info(f"📝 Writing detailed diff logs to: {diff_log_path}...")
     
     with open(diff_log_path, 'w', encoding='utf-8') as lf:
         lf.write("# 🩺 医疗问答思维链提纯净化 Diff 对照差异报告\n\n")
         lf.write("本差异报告详细记录了对数据集 `medical_qa_dataset.jsonl` 执行大模型思维链提纯净化前后的对比信息，包含各个视角的裁判评分详情。\n\n")
-        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)}\n\n")
+        lf.write(f"- **已提纯净化主问题总数 (Total QAs purified)**: {unique_qas_count} 个\n")
+        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)} 个\n\n")
         lf.write("## 📊 提纯报告详情列表\n\n")
         
-        sorted_diff_logs = sorted(purified_diff_logs, key=lambda x: (x["line_number"], x["facet"]))
-        for idx, item in enumerate(sorted_diff_logs):
-            lf.write(f"### [{idx+1}] (数据集第 {item['line_number']} 行) | 临床视角: **{item['facet']}**\n")
-            lf.write(f"*   **核心问题 (Q)**: `{item['question']}`\n")
+        sorted_lines = sorted(grouped_logs.keys())
+        for q_idx, line_num in enumerate(sorted_lines):
+            items_for_qa = sorted(grouped_logs[line_num], key=lambda x: x["facet"])
+            question = items_for_qa[0]["question"]
             
-            sc = item["scores"]
-            lf.write(f"*   **质检裁判量化评分 (Quality Scores)**: \n")
-            lf.write(f"    - 🟢 语义纯净度 (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
-            lf.write(f"    - 🩺 医学严谨度 (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
-            lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
-            lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
-            if sc.get("purity_bypass"):
-                lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
-            else:
+            lf.write(f"## 📌 [QA-{q_idx+1}] (数据集第 {line_num} 行) | 主问题: `{question}`\n")
+            lf.write(f"*   **该问题完成提纯净化视角总数 (Total facets purified for this QA)**: **{len(items_for_qa)}** 个\n\n")
+            
+            for f_idx, item in enumerate(items_for_qa):
+                lf.write(f"### 🔍 视角 [{f_idx+1}]: 临床视角: **{item['facet']}**\n")
+                
+                sc = item["scores"]
+                lf.write(f"*   **质检裁判量化评分 (Quality Scores)**: \n")
+                lf.write(f"    - 🟢 语义纯净度 (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
+                lf.write(f"    - 🩺 医学严谨度 (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
+                lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
+                lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
+                if sc.get("purity_bypass"):
+                    lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
+                else:
+                    lf.write("\n")
+                
+                lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
+                lf.write("````carousel\n")
+                lf.write("```markdown\n")
+                lf.write("原始思维链 (含工程与检索噪声)\n")
+                lf.write(item['original_think'])
+                lf.write("\n```\n")
                 lf.write("\n")
-            
-            lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
-            lf.write("````carousel\n")
-            lf.write("```markdown\n")
-            lf.write("原始思维链 (含工程与检索噪声)\n")
-            lf.write(item['original_think'])
-            lf.write("\n```\n")
-            lf.write("\n")
-            lf.write("```markdown\n")
-            lf.write("提纯净化后的纯净思维链\n")
-            lf.write(item['purified_think'])
-            lf.write("\n```\n")
-            lf.write("````\n\n")
+                lf.write("```markdown\n")
+                lf.write("提纯净化后的纯净思维链\n")
+                lf.write(item['purified_think'])
+                lf.write("\n```\n")
+                lf.write("````\n\n")
+                
             lf.write("---\n\n")
             
     try:

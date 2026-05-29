@@ -93,6 +93,11 @@ def get_purify_system_prompt(planner: str) -> str:
 
 7. 📤 【输出物理格式要求】：
    - 仅输出净化提纯后的 `<think>` 内部纯文本，绝对不要带有 `<think>` 或 `</think>` 标记本身，也不要包裹在 markdown 围栏中。
+
+8. 🚨 【循证事实红线与防过度科幻推演约束】：
+   - **严禁捏造任何子虚乌有的受体、转运体、基因或蛋白质的英文缩写代号**。所有学术专有名词（例如：PBP, OAT-1, TLR-2）必须源自原始参考文献（Refs）或者是国际医学界公认的药理学/病理生理学核心常识。
+   - **严禁编写跨度过大的科幻化或假想化分子传导机制与转化路径**（例如：臆造“某些沉默转运蛋白发生异位表达将代谢中间体当作信号肽进行胞吞并导致不可逆纤维化”等非共识、过拟合假说）。
+   - **回归主流病理与药理共识**。在推演不良反应或用药安全时，必须紧扣主流临床共识（如：青霉素类肾毒性应合理解释为急性间质性肾炎(AIN)或肾小管蓄积毒性；肝损害应合理解释为药物直接毒性或特异质超敏反应等），多用“主要与……相关”、“可能通过……通路”等稳健的循证学术表述。
 """
 
 # 🟢 切面自适应少样本（Dynamic Few-Shot）映射库，引入反思自省与强制问号（?）示范，完美阻断“静态文章”倾向。
@@ -331,6 +336,68 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
             "reason": f"Evaluation error: {e}"
         }
 
+async def verify_and_repair_academic_entities(client: APIClient, purified_text: str, q: str, facet: str) -> str:
+    """
+    对提纯后的CoT思维链进行 PubMed/NCBI 实体验证，并利用医学常识对高熵幻觉进行自愈修复。
+    """
+    # 提取类似 OER-1, OAT-3, TLR-2 的学术缩写实体
+    entities = set(re.findall(r'\b[A-Z]+-\d+\b', purified_text))
+    if not entities:
+        return purified_text
+
+    from retrieval.restricted_search import RestrictedSearchService
+    search_service = RestrictedSearchService()
+    repaired_text = purified_text
+
+    # 建立常见脏数据/幻觉映射自愈字典（作为本地静态知识与图谱映射的缓冲防线）
+    HEURISTIC_REPAIR_MAP = {
+        "OER-1": "OAT-1",  # 肾脏Penicillin转运体纠错
+        "OER-3": "OAT-3",
+        "OER": "OAT",
+    }
+
+    for entity in entities:
+        # 1. 快速启发式映射自愈
+        if entity in HEURISTIC_REPAIR_MAP:
+            target = HEURISTIC_REPAIR_MAP[entity]
+            repaired_text = repaired_text.replace(entity, target)
+            logger.warning(f"🔧 [启发式自愈] 检测到高危幻觉实体 '{entity}'，自动替换为正确药理靶点 '{target}'")
+            continue
+
+        # 2. 针对未知实体，发起 PubMed/NCBI 权威检索校验
+        search_query = f'"{entity}" AND (kidney OR "renal" OR "liver" OR "pharma" OR "PBP")'
+        try:
+            refs = await search_service.search(query=search_query, entity_name=entity)
+            # 统计 PubMed 来源的权威文献频次
+            pubmed_mentions = sum(1 for ref in refs if "ncbi.nlm.nih.gov" in ref.source)
+            
+            if pubmed_mentions == 0:
+                logger.warning(f"🚨 [PubMed 警报] 学术名词 '{entity}' 在 NCBI 权威文献中提及数为 0！判定为高熵学术幻觉。")
+                
+                # 利用 LLM 结合问题与上下文自动寻找更佳的权威平替词（如 OAT-1/PBP）
+                repair_prompt = f"""你是一位资深的临床药理学与毒理学审评科学家。
+在以下医学思维链中，提取到了一个疑似被大模型捏造/幻觉化出的假蛋白/假受体代号: "{entity}"。
+请基于临床病理生理常识，将其纠正并替换为真实存在、且最符合当前上下文语境的国际公认医学实体（例如：青霉素肾排泄转运体应纠正为 "OAT-1" 或 "OAT-3"；靶点结合应纠正为 "PBP"；巨噬细胞激活受体应纠正为 "TLR-2"）。
+
+【问题】: {q}
+【当前切面】: {facet}
+【当前CoT文本】: 
+\"\"\"
+{purified_text}
+\"\"\"
+
+请直接给出纠错替换后的完整CoT文本，不需要任何多余的解释、开场白或 markdown 标记："""
+                
+                corrected = await client.call_llm(repair_prompt, model_pool="premium")
+                repaired_text = corrected.replace("<think>", "").replace("</think>", "").strip()
+                logger.info(f"✨ [AI 动态自愈] 已通过药理学共识层将 '{entity}' 及其科幻推演部分动态修正。")
+                break # 动态纠偏已重写全文，跳出单实体循环
+                
+        except Exception as e:
+            logger.error(f"⚠️ 校验实体 '{entity}' 联网失败: {e}. 跳过校验。")
+            
+    return repaired_text
+
 async def purify_single_think(client: APIClient, q: str, planner: str, raw_think: str) -> Tuple[str, Dict[str, Any]]:
     max_retries = 3
     
@@ -405,7 +472,8 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
             logger.info(f"   └─ Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Depth: {d_score}/100] | Reason: {reason}")
             
             if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
-                logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}!")
+                logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}! Starting academic entity verification & self-healing...")
+                purified = await verify_and_repair_academic_entities(client, purified, q, planner)
                 
                 sim = calculate_similarity(raw_think, purified)
                 has_noise = any(kw in purified.lower() for kw in ["json", "schema", "免责声明", "忽略", "refs", "图谱"])
@@ -478,7 +546,10 @@ async def main():
     
     if purify_start_line is None:
         logger.info("🔍 PURIFY_START_LINE is not set in .env. Checking latest log to auto-detect starting position...")
-        run_files = sorted(list(logs_dir.glob("purification_run_[0-9]*_[0-9]*.md")))
+        run_files = sorted([
+            f for f in logs_dir.glob("purification_run_*.md")
+            if re.search(r"purification_run_(?:\[\d+-\d+\]_)?\d{8}_\d{6}\.md", f.name)
+        ])
         if run_files:
             latest_file = run_files[-1]
             logger.info(f"📄 Found latest purification run log: {latest_file.name}")
@@ -686,45 +757,67 @@ async def main():
     with open(dataset_path, 'w', encoding='utf-8') as f:
         f.writelines(processed_results)
         
+    # Group diff logs by line_number to keep facets organized by QA
+    from collections import defaultdict
+    grouped_logs = defaultdict(list)
+    for item in purified_diff_logs:
+        grouped_logs[item["line_number"]].append(item)
+        
+    unique_qas_count = len(grouped_logs)
+    
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    diff_log_path = logs_dir / f"purification_run_{timestamp}.md"
+    if purified_diff_logs:
+        sorted_lines = sorted(grouped_logs.keys())
+        line_range = f"[{sorted_lines[0]}-{sorted_lines[-1]}]_"
+    else:
+        line_range = ""
+        
+    diff_log_path = logs_dir / f"purification_run_{line_range}{timestamp}.md"
     latest_log_path = logs_dir / "purification_run.md"
     logger.info(f"📝 Writing detailed diff logs to: {diff_log_path}...")
     
     with open(diff_log_path, 'w', encoding='utf-8') as lf:
         lf.write("# 🩺 医疗问答思维链提纯净化 Diff 对照差异报告\n\n")
         lf.write("本差异报告详细记录了对数据集 `medical_qa_dataset.jsonl` 执行大模型思维链提纯净化前后的对比信息，包含各个视角的裁判评分详情。\n\n")
-        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)}\n\n")
+        lf.write(f"- **已提纯净化主问题总数 (Total QAs purified)**: {unique_qas_count} 个\n")
+        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)} 个\n\n")
         lf.write("## 📊 提纯报告详情列表\n\n")
         
-        sorted_diff_logs = sorted(purified_diff_logs, key=lambda x: (x["line_number"], x["facet"]))
-        for idx, item in enumerate(sorted_diff_logs):
-            lf.write(f"### [{idx+1}] (数据集第 {item['line_number']} 行) | 临床视角: **{item['facet']}**\n")
-            lf.write(f"*   **核心问题 (Q)**: `{item['question']}`\n")
+        sorted_lines = sorted(grouped_logs.keys())
+        for q_idx, line_num in enumerate(sorted_lines):
+            items_for_qa = sorted(grouped_logs[line_num], key=lambda x: x["facet"])
+            question = items_for_qa[0]["question"]
             
-            sc = item["scores"]
-            lf.write(f"*   **质检裁判量化评分 (Quality Scores)**: \n")
-            lf.write(f"    - 🟢 语义纯净度 (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
-            lf.write(f"    - 🩺 医学严谨度 (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
-            lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
-            lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
-            if sc.get("purity_bypass"):
-                lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
-            else:
+            lf.write(f"## 📌 [QA-{q_idx+1}] (数据集第 {line_num} 行) | 主问题: `{question}`\n")
+            lf.write(f"*   **该问题完成提纯净化视角总数 (Total facets purified for this QA)**: **{len(items_for_qa)}** 个\n\n")
+            
+            for f_idx, item in enumerate(items_for_qa):
+                lf.write(f"### 🔍 视角 [{f_idx+1}]: 临床视角: **{item['facet']}**\n")
+                
+                sc = item["scores"]
+                lf.write(f"*   **质检裁判量化评分 (Quality Scores)**: \n")
+                lf.write(f"    - 🟢 语义纯净度 (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
+                lf.write(f"    - 🩺 医学严谨度 (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
+                lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
+                lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
+                if sc.get("purity_bypass"):
+                    lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
+                else:
+                    lf.write("\n")
+                
+                lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
+                lf.write("````carousel\n")
+                lf.write("```markdown\n")
+                lf.write("原始思维链 (含工程与检索噪声)\n")
+                lf.write(item['original_think'])
+                lf.write("\n```\n")
                 lf.write("\n")
-            
-            lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
-            lf.write("````carousel\n")
-            lf.write("```markdown\n")
-            lf.write("原始思维链 (含工程与检索噪声)\n")
-            lf.write(item['original_think'])
-            lf.write("\n```\n")
-            lf.write("\n")
-            lf.write("```markdown\n")
-            lf.write("提纯净化后的纯净思维链\n")
-            lf.write(item['purified_think'])
-            lf.write("\n```\n")
-            lf.write("````\n\n")
+                lf.write("```markdown\n")
+                lf.write("提纯净化后的纯净思维链\n")
+                lf.write(item['purified_think'])
+                lf.write("\n```\n")
+                lf.write("````\n\n")
+                
             lf.write("---\n\n")
             
     try:
