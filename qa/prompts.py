@@ -69,10 +69,21 @@ _BOOTSTRAP_FACET_PLANNER_TEMPLATE = """<role>
 </format>
 
 <strategy>
-- 必须要能形成完整叙述的“回答框架”，例如：技术实现、应用落地、决策建议、对比评估、风险治理、方法论抽象、产品化视角、成本收益等。
-- 如果 query 很简单：给 1-2 个 facet。
-- If query 很复杂：给 2-8 个 facet。
-- 不要提出反问或澄清问题，直接给 facets。
+- 必须要能形成完整叙述的“医疗/药理回答框架”。针对医学与药物问题，应避免使用过于泛化的“技术实现”、“产品化视角”、“应用落地”等泛IT词汇，而应精准规划符合临床医疗特色的高价值特异性切面。
+- 🌟 **强烈推荐的专业临床与药理学切面包括（不仅限于此，应根据问题本身灵活定制）**：
+  - `病理生理机制` (Pathophysiological Mechanisms - 解析疾病微观机制或作用靶点)
+  - `用药方案与滴定` (Dosing Regimens & Titration - 讨论剂量递增、维持量及给药间隔等)
+  - `特殊人群安全边界` (Special Population Safety Boundaries - 针对孕妇、儿童、老年人、肝肾功能不全者等)
+  - `药代动力学与清除途径` (Pharmacokinetics & Elimination - 涉及吸收、分布、代谢、排泄与清除率)
+  - `药物毒理与过量救治` (Toxicology & Overdose Treatment - 关注药物中毒临床表现与解毒/血液透析等措施)
+  - `药物相互作用与配伍禁忌` (Drug Interactions & Contraindications - 联合用药风险、交叉过敏与绝对禁忌)
+  - `不良反应预防与管理` (ADR Prevention & Management - 临床表现监测、食物/防晒非药物干预等)
+  - `诊断标准与鉴别诊断` (Diagnostic Criteria & Differential Diagnosis - 疾病筛查、指标异常与鉴别逻辑)
+  - `循证临床疗效评价` (Evidence-based Efficacy Evaluation - 临床试验终点、多中心对比与临床效益)
+- 角度规划规则：
+  - 如果 query 很简单且事实较为局限：直接给出 2 个最核心的特异性切面（例如 `用药方案与滴定` 与 `不良反应预防与管理`）。
+  - 如果 query 复杂且信息面广：必须给出 3-8 个高度互斥、角度极为合理多样的专业切面，确保从机制到临床的全生命周期覆盖。
+- 不要提出反问或澄清问题，直接给出 facets 的 JSON 数组。
 </strategy>
 
 ## 输入

@@ -25,7 +25,7 @@ MODEL_POOL_PREMIUM = os.getenv("MODEL_POOL_PREMIUM", "deepseek-v4-pro")
 MODEL_POOL_JUDGE = os.getenv("MODEL_POOL_JUDGE", "deepseek-v4-pro")
 
 # 流程控制配置
-MAX_RETRIES = 5  # 提升重试次数提升鲁棒性
+MAX_RETRIES = 3  # 根据用户要求，大模型请求与网络重试次数严格限制在 3 次以内
 RETRY_BACKOFF_FACTOR = 2.0  # 增加退避斜率以充分应对网关滑动窗口
 CONCURRENT_QA_LIMIT = 4     # 并行解答的并发度限制
 
@@ -45,6 +45,10 @@ LLM_FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.2"))
 # 思维链提纯净化控制配置
 PURIFY_LIMIT_RAW = os.getenv("PURIFY_LIMIT", "").strip()
 PURIFY_LIMIT = int(PURIFY_LIMIT_RAW) if PURIFY_LIMIT_RAW and PURIFY_LIMIT_RAW.isdigit() else None
+
+# 净化起始行号 (1-based index)
+PURIFY_START_LINE_RAW = os.getenv("PURIFY_START_LINE", "").strip()
+PURIFY_START_LINE = int(PURIFY_START_LINE_RAW) if PURIFY_START_LINE_RAW and PURIFY_START_LINE_RAW.isdigit() else None
 
 PURIFY_LINES_RAW = os.getenv("PURIFY_LINES", "").strip()
 if PURIFY_LINES_RAW:

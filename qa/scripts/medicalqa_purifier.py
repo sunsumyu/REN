@@ -22,7 +22,7 @@ parent_dir = current_dir.parent
 sys.path.append(str(current_dir))
 sys.path.append(str(parent_dir))
 
-from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES
+from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE
 from api_client import APIClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -449,10 +449,66 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
         "purity_bypass": is_bypass
     }
 
+def update_env_start_line(env_path: Path, start_line: int):
+    """
+    Dynamically writes the determined starting line number back to the .env file.
+    """
+    if not env_path.exists():
+        return
+    with open(env_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Check if PURIFY_START_LINE exists in env
+    pattern = re.compile(r"^(\s*PURIFY_START_LINE\s*=).*$", re.MULTILINE)
+    if pattern.search(content):
+        new_content = pattern.sub(f"\\1{start_line}", content)
+    else:
+        new_content = content.rstrip() + f"\n\n# 自动设置的净化起始行号\nPURIFY_START_LINE={start_line}\n"
+        
+    with open(env_path, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+
 async def main():
     dataset_path = Path("d:/REN/qa/medical_qa_dataset.jsonl")
     backup_path = Path("d:/REN/qa/medical_qa_dataset_raw.jsonl")
     logs_dir = Path("d:/REN/qa/logs")
+    
+    # Resolve PURIFY_START_LINE configuration
+    purify_start_line = PURIFY_START_LINE
+    
+    if purify_start_line is None:
+        logger.info("🔍 PURIFY_START_LINE is not set in .env. Checking latest log to auto-detect starting position...")
+        run_files = sorted(list(logs_dir.glob("purification_run_[0-9]*_[0-9]*.md")))
+        if run_files:
+            latest_file = run_files[-1]
+            logger.info(f"📄 Found latest purification run log: {latest_file.name}")
+            try:
+                with open(latest_file, 'r', encoding='utf-8') as lf:
+                    log_content = lf.read()
+                processed_lines = [int(num) for num in re.findall(r"数据集第\s*(\d+)\s*行", log_content)]
+                if processed_lines:
+                    max_line = max(processed_lines)
+                    purify_start_line = max_line + 1
+                    logger.info(f"🎯 Auto-detected latest processed line: {max_line}. Setting PURIFY_START_LINE to: {purify_start_line}")
+                else:
+                    purify_start_line = 1
+                    logger.info("⚠️ No processed line numbers found in the latest log. Setting PURIFY_START_LINE to: 1")
+            except Exception as e:
+                logger.error(f"❌ Failed to parse latest log: {e}. Defaulting PURIFY_START_LINE to: 1")
+                purify_start_line = 1
+        else:
+            purify_start_line = 1
+            logger.info("📂 No previous run logs found. Setting PURIFY_START_LINE to: 1")
+            
+        # Write back to .env file
+        env_path = Path("d:/REN/qa/.env")
+        try:
+            update_env_start_line(env_path, purify_start_line)
+            logger.info(f"💾 Dynamically updated PURIFY_START_LINE={purify_start_line} in .env file.")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to write back to .env: {e}")
+    else:
+        logger.info(f"🎯 Using manually configured PURIFY_START_LINE={purify_start_line} from .env")
     
     if not dataset_path.exists():
         logger.error(f"Dataset file not found: {dataset_path}")
@@ -509,9 +565,47 @@ async def main():
                 q = data.get("Q", "")
                 planners = data.get("planners", [])
                 
+                valid_planners = []
                 for p in planners:
                     planner_name = p.get("planner", "")
                     raw_answer = p.get("answer", "")
+                    
+                    # 3a & 3b. 前置检测：系统兜底模板及安全废话模板
+                    TEMPLATE_SIGNATURES = [
+                        "触发高可用防拒答",
+                        "安全防御质量策略",
+                        "临床指南兜底模板",
+                        "安全拦截",
+                    ]
+                    SAFE_BODY_SIGNATURES = [
+                        "须严格依据专科医师指导",
+                        "严格规避用药配伍禁忌及潜在的毒副反应",
+                        "关于该健康咨询中涉及的",
+                    ]
+                    
+                    if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
+                        logger.warning(f"🚨 检测到行 {line_idx+1} 切面 '{planner_name}' 包含系统兜底模板，已从数据集中剔除！")
+                        purified_diff_logs.append({
+                            "line_number": line_idx + 1,
+                            "question": q,
+                            "facet": planner_name,
+                            "original_think": raw_answer,
+                            "purified_think": "[DROPPED: 系统兜底模板，已剔除]",
+                            "scores": {"semantic_purity_score": 0, "medical_rigor_score": 0, "logical_depth_score": 0, "reason": "系统兜底模板，非模型推理。已剔除。"}
+                        })
+                        continue
+                        
+                    if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
+                        logger.warning(f"🚨 检测到行 {line_idx+1} 切面 '{planner_name}' 包含安全废话模板，已从数据集中剔除！")
+                        purified_diff_logs.append({
+                            "line_number": line_idx + 1,
+                            "question": q,
+                            "facet": planner_name,
+                            "original_think": raw_answer,
+                            "purified_think": "[DROPPED: 安全废话模板，已剔除]",
+                            "scores": {"semantic_purity_score": 0, "medical_rigor_score": 0, "logical_depth_score": 0, "reason": "安全废话模板。已剔除。"}
+                        })
+                        continue
                     
                     think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
                     if think_match:
@@ -542,6 +636,10 @@ async def main():
                             "purified_think": purified_think,
                             "scores": score_dict
                         })
+                        valid_planners.append(p)
+                    else:
+                        valid_planners.append(p)
+                data["planners"] = valid_planners
             
             return json.dumps(data, ensure_ascii=False) + "\n"
         except Exception as e:
@@ -556,6 +654,11 @@ async def main():
         
         if PURIFY_LINES:
             if line_num not in PURIFY_LINES:
+                should_purify = False
+                
+        # Apply starting line filter
+        if purify_start_line is not None:
+            if line_num < purify_start_line:
                 should_purify = False
                 
         if should_purify:

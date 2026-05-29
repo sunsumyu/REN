@@ -413,8 +413,31 @@ class APIClient:
                 content = message["content"]
                 reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
                 
+                # Robustly extract JSON block if wrapped in markdown fences or containing conversational prefaces
+                import re
+                clean_content = content.strip()
+                # Remove markdown fences if present
+                match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', clean_content, re.IGNORECASE)
+                if match:
+                    clean_content = match.group(1).strip()
+                
+                # Locate the outer boundaries of the JSON block
+                first_brace = clean_content.find('{')
+                first_bracket = clean_content.find('[')
+                start = -1
+                end = -1
+                if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+                    start = first_brace
+                    end = clean_content.rfind('}')
+                elif first_bracket != -1:
+                    start = first_bracket
+                    end = clean_content.rfind(']')
+                
+                if start != -1 and end != -1 and end > start:
+                    clean_content = clean_content[start:end+1]
+
                 # Validate and parse directly into the Pydantic model
-                obj = response_model.model_validate_json(content)
+                obj = response_model.model_validate_json(clean_content)
                 # Dynamically attach reasoning_content to the object
                 object.__setattr__(obj, "_reasoning_content", reasoning_content.strip())
                 return obj

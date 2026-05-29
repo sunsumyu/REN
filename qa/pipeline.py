@@ -152,7 +152,7 @@ class MedicalQAPipeline:
             # Enforce dynamic structured output using FacetPlan Pydantic model
             result: FacetPlan = await self.api_client.call_llm_structured(messages, FacetPlan, model_pool="lightweight")
             # Extract list of facet values (strings) from Pydantic Enum list
-            facets = [f.value for f in result.facets]
+            facets = [f for f in result.facets]
             logger.info(f"Planned initial facets strictly via Pydantic: {facets}")
             return facets
         except Exception as e:
@@ -233,7 +233,7 @@ class MedicalQAPipeline:
                     # Enforce structural decoding using FacetQAOutput model
                     result: FacetQAOutput = await self.api_client.call_llm_structured(messages, FacetQAOutput, model_pool="premium")
                     
-                    is_passed, reason = self._check_answer_quality(result.answer_body)
+                    is_passed, reason = self._check_answer_quality(result.answer_body, getattr(result, "_reasoning_content", ""))
                     if is_passed:
                         break
                     
@@ -294,28 +294,19 @@ class MedicalQAPipeline:
                     check_body = raw_response
                     if "</think>" in raw_response:
                         check_body = raw_response.split("</think>")[-1].strip()
+                        if not reasoning_content and "<think>" in raw_response:
+                            parts = raw_response.split("</think>")[0].split("<think>")
+                            if len(parts) > 1:
+                                reasoning_content = parts[1].strip()
                         
-                    is_passed, reason = self._check_answer_quality(check_body)
+                    is_passed, reason = self._check_answer_quality(check_body, reasoning_content)
                     if is_passed:
                         break
                     logger.warning(f"Quality Guardrail FAILED on fallback QA attempt {fb_attempt} for facet '{facet}': {reason}. Retrying...")
                 
                 if not is_passed:
-                    logger.critical(f"Quality guard failed repeatedly in fallback for facet '{facet}'. Applying high-availability safe medical template.")
-                    safe_body = (
-                        f"关于该健康咨询中涉及的【{facet}】切面分析：\n"
-                        f"临床研究与循证医学事实表明，该用药或诊断方案的制订须严格依据专科医师指导。在开展临床干预时，"
-                        f"需对患者的生化指标及既往病史进行全面筛查，严格规避用药配伍禁忌及潜在的毒副反应，确保用药安全。"
-                    )
-                    raw_response = (
-                        f"<think><facet = {facet}>\n"
-                        f"问题拆解：\n- S1: 触发高可用防拒答与去污染兜底方案\n"
-                        f"证据清单：\n[证据R1：来源=refs:《临床指南兜底模板》，定位=全篇，要点=系统激活安全防御质量策略]\n"
-                        f"推理链：\n- P1: 基于安全拦截 -> 自动装配学术合规兜底叙事 -> 输出正文。\n"
-                        f"最终结论摘要：\n- 输出100%纯净、无任何拒答或提示词污染的科学事实陈述。\n"
-                        f"</think>\n"
-                        f"{safe_body}"
-                    )
+                    logger.critical(f"Quality guard failed repeatedly for facet '{facet}'. DROPPING this facet (not injecting template).")
+                    return facet, None
                 
                 # Format check the raw response
                 if "<think>" in raw_response and f"facet =" not in raw_response:
@@ -325,7 +316,7 @@ class MedicalQAPipeline:
                         cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
                         response = f"<think><facet = {facet}>\n{cleaned_reasoning}\n</think>\n" + raw_response
                     else:
-                        mock_think = f"<think><facet = {facet}>\n问题拆解：\n- S1: 针对{facet}进行多视角切入回答。\n证据清单：\n[证据R1：来源=refs:《实体库汇总》，定位=全面，要点=结合图谱背景信息]\n推理链：\n- P1: 基于背景知识 -> 归纳总结 -> 输出正文。\n最终结论摘要：\n- 形成多视角{facet}高质量医学分析。\n</think>\n"
+                        mock_think = f"<think><facet = {facet}>\n{facet}切面推理过程\n</think>\n"
                         response = mock_think + raw_response
                 else:
                     response = raw_response
@@ -342,6 +333,9 @@ class MedicalQAPipeline:
         
         planners = []
         for facet, answer in results:
+            if answer is None:
+                logger.warning(f"Facet '{facet}' was dropped due to quality guard failure. Excluding from dataset.")
+                continue
             planners.append({
                 "planner": facet,
                 "answer": answer
@@ -536,19 +530,28 @@ class MedicalQAPipeline:
         history[-1]["refs"] = refs
         return history[-1]
 
-    def _check_answer_quality(self, answer_body: str) -> Tuple[bool, str]:
+    def _check_answer_quality(self, answer_body: str, reasoning_content: str = "") -> Tuple[bool, str]:
         """
-        Runs quality guardrails on the generated answer body to filter out refusals and few-shot pollution.
+        Runs quality guardrails on the generated answer body and optional reasoning content
+        to filter out refusals, few-shot pollution, and lazy thought blocks.
         Returns (is_passed, error_reason).
         """
-        # 1. Check for Safety Refusal
+        # 1. Check for Safety Refusal in body
         refusal_pattern = re.compile(r"(抱歉|无法协助|不符合安全规定|作为一个AI|不能回答|作为AI|未获得授权)")
         if refusal_pattern.search(answer_body):
             return False, "safety refusal"
             
-        # 2. Check for Prompt Pollution / Meta leakage
+        # 2. Check for Prompt Pollution / Meta leakage in body
         pollution_pattern = re.compile(r"(Step A|推理链|证据清单|法律合规|供应链|财务审计|few-shot|提示词|模型生成)")
         if pollution_pattern.search(answer_body):
             return False, "prompt pollution"
+            
+        # 3. Check for lazy reasoning content (think block)
+        if reasoning_content:
+            cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
+            
+            # If think block is too short, it's likely a lazy model shortcut
+            if len(cleaned_reasoning) < 120:
+                return False, f"lazy reasoning (too short: {len(cleaned_reasoning)} chars)"
             
         return True, ""
