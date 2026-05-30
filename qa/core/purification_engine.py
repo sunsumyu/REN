@@ -59,7 +59,7 @@ class PurificationEngine:
 Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
 CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
 In corporate with counterfactual checks, you should naturally integrate clinical self-questioning markers with a question mark at points of uncertainty or divergence (在遇到逻辑分叉或极限情况时，应自然融入探究性的自我提问，展现真实的解题反思与假说排查，例如以以“？”结尾的疑问句进行内部推演，但绝对禁止在文本尾部生硬塞入无意义的问号占位符).
-Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. Output ONLY the purified thought chain.
+Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. You are strictly FORBIDDEN from using any meta-narrative terms indicating data sources or retrieval processes, such as 'refs', '参考资料', '检索', '图谱', '根据资料', '说明书显示', '数据源' or '背景信息'. Output ONLY the purified thought chain.
 
 问题: {q}
 原始思维链 (CoT) 内容:
@@ -154,7 +154,7 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
                 
         logger.warning("   ⚠️ Quality Gate Max Retries exceeded. Gracefully falling back to safety fallback.")
         try:
-            from clean_dataset import clean_think_text
+            from scripts.clean_dataset import clean_think_text
             purified = clean_think_text(raw_think)
         except ImportError:
             purified = purifier_module.post_strip_meta_openings(purifier_module.pre_strip_engineering_noise(raw_think))

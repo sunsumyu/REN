@@ -266,9 +266,9 @@ def pre_strip_engineering_noise(raw_text: str) -> str:
     for pattern in noise_patterns:
         cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL)
         
-    # 2. 【高泛化 RAG 结构剥离】
-    # 匹配 "根据《...》的描述/显示/可知" 并完全剔除，只保留核心陈述
-    cleaned = re.sub(r'根据《[^》]+》的?(描述|记载|显示|数据|图谱|关系|档案|文献|实体库)?(显示|可知|指出|表明|提供)?，?', '', cleaned)
+    # 2. 【高泛化 RAG 结构与 refs 强制剥离】
+    # 匹配 "根据 (refs/RAG)《...》的描述/显示/可知" 并完全剔除，只保留核心陈述
+    cleaned = re.sub(r'根据\s*(?:refs|rag)?\s*《[^》]+》的?(描述|记载|显示|数据|图谱|关系|档案|文献|实体库)?(显示|可知|指出|表明|提供)?，?', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'《[^》]+》', '', cleaned)
     
     # 3. 【高泛化文献索引剥离】
@@ -277,7 +277,16 @@ def pre_strip_engineering_noise(raw_text: str) -> str:
     cleaned = re.sub(r'PMID:\s*\d+', '', cleaned)
     cleaned = re.sub(r'PubMed\s*\([^)]+\)', '', cleaned, flags=re.IGNORECASE)
     
-    # 4. 清理残留括号与物理杂质
+    # 4. 强力阻断工程元叙述词汇，彻底拦截 RAG 泄漏进入输入端
+    forbidden_input_patterns = [
+        r'\b(?:refs|rag|pmid|pubmed)\b',
+        r'根据(?:参考)?(?:资料|文献|数据库|实体库|数据源|背景信息)?(?:显示|指出|表明|提供|记载)?，?',
+        r'检索(?:结果|图谱|关系|facts)?(?:显示|指出|表明|提供|记载)?，?'
+    ]
+    for pattern in forbidden_input_patterns:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+        
+    # 5. 清理残留括号与物理杂质
     cleaned = re.sub(r'[\{\}\[\]]', ' ', cleaned)
     return cleaned.strip()
 
