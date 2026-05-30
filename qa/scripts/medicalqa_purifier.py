@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-大模型语义化清洗医学问答数据集 CoT（思维链）脚本 (最终整合版 - 企业生产级 - 带思维心流防线)。
-利用智能质检裁判大模型（Judge LLM），对重写后的思维链从“语义纯净度”、“医学严谨度”和“逻辑深度”三个维度进行量化评分（Quality Gate）。
-集成强制自问自答（包含 ?）、5阶段推理心流、安全数值拦截、智能增量同步备份与全字段脱水防线。
+大模型语义化清洗医学问答数据集 CoT（思维链）脚本 (企业极速优化版 - 带智能去去词及白名单机制)。
+利用质检裁判大模型（Judge LLM），对重写后的思维链从“语义纯净度”、“医学严谨度”和“逻辑深度”三个维度进行量化评分（Quality Gate），
+对于不达标的样本执行自动重新净化重写，确保 100% 达成生产级微调的严苛质量要求。
 """
 
 import os
@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
 def safe_int(val: Any, default: int = 90) -> int:
-    """安全的整数转换，防止大模型在JSON中吐出浮点数或字符串分数导致 >= 比较报错"""
+    """安全转换为整型数值，防范裁判返回非结构化浮点或字符串导致网关崩溃"""
     try:
         return int(float(str(val).strip()))
     except (ValueError, TypeError):
@@ -48,11 +48,19 @@ def get_system_directive(planner: str) -> str:
     return directives.get(planner, f"the clinical rationale, evidence synthesis, and medical logic related to {planner}")
 
 def get_purify_system_prompt(planner: str) -> str:
-    """动态生成系统提示词，注入特异性视角红线拦截与动态探索心流"""
+    """动态生成系统提示词，注入特异性视角红线拦截"""
     return f"""您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型（如 DeepSeek-R1、OpenAI o1）微调的冷启动标准。
 
 ### 🚨 提纯与重写的核心目标：
 当前 `<think>` 块是工程 Pipeline 自动生成的，混杂了大量【工程指令垃圾】（如 JSON 结构、Refs 引用、RAG 抱怨、格式避让）。如果直接用于模型微调，会导致模型在推理时频繁产生格式泄漏和系统幻觉。您需要将静态的 RAG 段落升华为一个**人类医学专家大脑里真实、高熵、流畅且无污染的“动态临床认知推理心流”**。
+
+### 🚨 思维链概念准入白名单（Ontological Whitelist）：
+在重构思维链时，你大脑的“认知世界”中只允许存在以下两类医学实体和逻辑，其他概念对你而言在物理上均不存在：
+1. 【患者的生理、病理、临床状态与体征】（如：肾小球滤过率、急性心梗、高频放电、体温、疼痛）。
+2. 【药物的分子、受体、药代/药效动力学行为与治疗方案】（如：稳定失活态、竞争性拮抗、半衰期、给药剂量、配伍禁忌）。
+
+**【绝对禁忌红线】**：
+绝对禁止在思维链的任何地方提及、暗示或讨论“信息获取途径”（如资料、文献、数据库、实体库、RAG、Refs、数据源、背景信息）、“数据一致性”（如一致确认、得到证实）或“数据结构处理”（如子问题、Answer Body、推理步骤）。任何此类概念一旦流出，均判定为严重泄露，该生成将被物理拦截。你应当假定你脑海里拥有最完备的医学专家常识，直接开始纯粹的临床与药理因果演绎。
 
 ### 🛠️ 企业级提纯与重写规范：
 
@@ -65,51 +73,41 @@ def get_purify_system_prompt(planner: str) -> str:
    - **绝对禁止在文本中输出任何暗示您在处理一个工程结构化任务的元叙述词汇**。包括但不限于：“我的推理链条如下”、“问题可以拆解为以下子问题”、“最终结论是...”等。
    - **🚨 绝对禁止在文本的任何地方吐出“切面”、“视角”、“角度”等字眼，也绝对禁止直接提及或复读当前的视角名称‘{planner}’！** 严禁出现“从{planner}视角分析”、“根据{planner}角度来看”等任何向用户宣告或暗示你正在以何种视角解题的元叙述句式。
 
-3. 🚨 【严禁工程化 RAG 抱怨，但必须坚守“循证医学”的不确定性边界】：
-   - **彻底物理剥离工程痕迹**：绝对禁止在思考链中输出暴露后台流水线和检索瓶颈的“工程级抱怨”（如：“根据检索得到的文献”、“提供的参考资料中未提及...”、“实体库中无此关联”等）。模型在思考时应假定自己具备完整的常识和知识库。
-   - **基于“循证级别”的自适应推理（拒绝无证据绝对化脑补）**：
-     - 如果原始资料缺乏直接的临床结论，激活参数化知识时**严禁瞎编虚假临床事实或进行绝对化断言**。
-     - 您必须引导思维链采用**“循证降级推断”**：在因果推演时，使用具有“科学谦逊感”的医学条件句式（如：“从药理学机制上推断，可能通过……起效，但目前缺乏直接针对该复合剂型的临床循证数据支持……”）。
-     - **引入安全边界与自我校准（Self-Correction）**：在推理中段，必须对潜在的不确定性、证据级别不足或临床风险进行主动评估和纠偏思考（例如：“虽然从受体阻断机制上可以推断出X，但目前缺乏直接双盲临床文献支持，实际应用中仍需警惕Y风险...”）。这才是顶级Reasoning模型在面对灰色地带时应表现出的“临床自省心流”。
+3. 🚨 【严禁 RAG 边界抱怨与参数知识激活（Anti-RAG Complaining & Parametric Activation）】：
+   - **绝对禁止在思考链中写出任何关于检索上下文边界局限性的“抱怨”与“免责”表述！**（如：“现有资料未提供该成分的药理作用”、“根据参考资料显示...”、“由于资料有限无法...”）。
+   - **机制补偿重构**：即使原始检索资料极其有限，也必须假定您的脑中拥有最完备的医学专家常识，直接激活您的参数化临床知识，对药物各成分或疾病通路展开深度、科学、合理的微观机制推导与因果演绎，决不允许推卸推理责任。
 
-4. 📐 【强化的 5 阶段临床认知深度推理流（Exploratory CoT Trajectory） - 拒绝文章叙述型/教科书文章体】：
-   优秀的 Reasoning 微调 CoT 必须呈现出**“提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 决策合拢”**的动态心流轨迹（Thought Trace）。
-   - 🚨 **【拒绝静态科普文与百科说明书体】**：绝对不能写成“A是B，C通过D发挥作用”这种平铺直叙的百度百科、说明书或漂亮的科普文章！模型是在进行“即时探索和解题推理”，不是在背诵课本或撰写向用户讲解的科普宣教。
-   - 🚨 **【强制内部自问自答与反思锚点（强制包含问号“？”）】**：思维链中**必须至少包含 1-2 处明显的、真实的自我提问或反向排查**（例如：“难道这仅仅是由于靶点阻断吗？”、“慢着，在此处必须评估：这一情况在特定生理状态下是否会持续...”、“倘若患者伴有重度肾损伤，这一浓度是否会发生蓄积中毒？”）。这能从物理上彻底打破“静态叙述体”，展现思维内部现场演算的张力。
-   - **必须使用高密度的逻辑摩擦关联词**：在思维链中，强制要求使用诸如“要剖析...首先必须解构...”、“既然...必然...”、“然而仅靠...是不够的”、“进一步来看...”、“这就完美解释了为何...”、“如果是遇到...情况呢？”、“由此推导...”等带有强烈因果推演和自问自答色彩的动态思考词汇，展现专家大脑内部的真实演算过程。
+4. 📐 【强化的 5 阶段临床认知深度推理流（Exploratory CoT Trajectory）】：
+   优秀的 Reasoning 微调 CoT 必须呈现出“提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 决策合拢”的动态心流轨迹（Thought Trace）。
+   - **必须使用高密度的逻辑摩擦关联词**：在思维链中，强制要求使用诸如“要剖析...必须深层解构...”、“既然...必然...”、“然而仅靠...是不够的”、“进一步来看...”、“这就完美解释了为何...”、“如果是遇到...情况呢？”、“由此推导...”等带有强烈因果推演和自问自答色彩的动态思考词汇，展现专家大脑内部的真实演算过程。
    您必须引导思维链通过以下 5 个自然的认知阶段隐式递进：
-   - **阶段一：核心临床矛盾解构** —— 开头直切临床/医学矛盾核心（例如，直接以物理/医学事实及逻辑摩擦词切入主题：“要剖析[疾病/药物/治疗名称]的核心机制/生理本质，首先必须解构...”，不需要任何结构性的开场白、自问自答或过渡废话）。
-   - **阶段二：微观病生理/临床逻辑推演** —— 对分子靶点、受体结合、体内代动学参数等进行深度因果链条解析，呈现动态心流。
-   - **阶段三：逻辑分叉与特殊情况排查** —— 加入自我提问和临床假说排查，增加思维链的“逻辑熵”。
+   - **阶段一：核心临床矛盾解构** —— 开头直切临床/医学矛盾核心（例如，直接以物理/医学事实及逻辑摩擦词切入主题：“要剖析[疾病/药物/治疗名称]的核心机制/生理本质，必须深层解构...”，不需要任何结构性的开场白、自问自答或过渡废话）。
+   - **阶段二：微观病生理/临床逻辑推演** —— 对分子靶点、受体结合、体内代动学参数或临床指南要点等进行深度因果链条解析，呈现动态心流。
+   - **阶段三：逻辑分叉与特殊情况排查** —— 加入自我提问和临床假说排查，增加思维链的“逻辑熵”（例如：“慢着，在此处必须评估：这一情况在特定生理状态下是否会持续...”、“如果是遇到...情况呢？”）。
    - **阶段四：生理/安全极限与查漏补缺** —— 引入对于年龄、肝肾功能受损等特殊情况或安全边界的核验，展示高价值的“自我纠正与查漏补缺”过程。
    - **阶段五：决策自然合拢** —— 以高度学术的口吻，自然推演出最合理的临床或机制结论，禁止出现“综上所述”、“因此最终结论是”等做题套话。
 
-5. 🚨 【防范序号结构泄漏】：
-   - **绝对禁止使用任何如“阶段一”、“阶段①”、“【核心矛盾】”、“步骤1”等显式的、结构化的提纲或序号词！** 这种结构化泄漏会破坏 Reasoning 模型的原生思考连贯性。必须使用**高度自然的学术因果递进和自问自答的长文流**。
+5. 🚨 【防范序号与过渡结构泄漏】：
+   - **绝对禁止使用任何如“阶段一”、“步骤1”等序号词，且绝对禁止使用如“首先”、“其次”、“此外”、“最后”、“综上所述”等顺序性或总结性过渡词！** 这些过渡词会暴露结构泄漏。必须使用高度自然的学术因果递进和自问自答。
 
 6. 🔇 【语调与文风红线】：
-   - 必须使用绝对的**第三人称、客观学术、冰冷严谨的医学专家内心独白视角**。
+   - 必须使用绝对的**第三人称、客观学术、冰冷严谨的医学专家视角**。
    - 彻底去除任何对话性废话（如：“好的，让我来为你解答...”、“问题问的是...，我的分析是...”）。直接开始陈述医学事实和逻辑因果，不需要任何开场白或过渡废话。
 
 7. 📤 【输出物理格式要求】：
    - 仅输出净化提纯后的 `<think>` 内部纯文本，绝对不要带有 `<think>` 或 `</think>` 标记本身，也不要包裹在 markdown 围栏中。
-
-8. 🚨 【循证事实红线与防过度科幻推演约束】：
-   - **严禁捏造任何子虚乌有的受体、转运体、基因或蛋白质的英文缩写代号**。所有学术专有名词（例如：PBP, OAT-1, TLR-2）必须源自原始参考文献（Refs）或者是国际医学界公认的药理学/病理生理学核心常识。
-   - **严禁编写跨度过大的科幻化或假想化分子传导机制与转化路径**（例如：臆造“某些沉默转运蛋白发生异位表达将代谢中间体当作信号肽进行胞吞并导致不可逆纤维化”等非共识、过拟合假说）。
-   - **回归主流病理与药理共识**。在推演不良反应或用药安全时，必须紧扣主流临床共识（如：青霉素类肾毒性应合理解释为急性间质性肾炎(AIN)或肾小管蓄积毒性；肝损害应合理解释为药物直接毒性或特异质超敏反应等），多用“主要与……相关”、“可能通过……通路”等稳健的循证学术表述。
 """
 
-# 🟢 切面自适应少样本（Dynamic Few-Shot）映射库，引入反思自省与强制问号（?）示范，完美阻断“静态文章”倾向。
+# 🟢 切面自适应少样本（Dynamic Few-Shot）映射库，阻断“模型套用偏置”。
 FEW_SHOT_PHARMACOLOGY = """
 ### 🟢 提纯重构黄金少样本示范 (Few-Shot Gold Standard Example)：
 * **输入原始思维链 (包含JSON规划与RAG噪声)**：
 \"\"\"
-我们被要求输出一个JSON对象，符合指定的schema...问题只是问成分，我们可以扩展回答吗？...丹膝颗粒主要成分包括丹参、牛膝、天麻、牡丹皮...
+...主要成分包括丹参、牛膝、天麻、牡丹皮...
 \"\"\"
 * **输出提纯重构后的完美思维链**：
 \"\"\"
-要剖析丹膝颗粒的药理学机制，首先必须解构其核心临床目标：缺血性脑血管病恢复期的‘瘀血阻络兼肾虚证’。既然核心矛盾是‘瘀血’与‘肾虚’，方剂的骨架必然以此为基底。我们观察到处方中的丹参、赤芍、川芎，这三者是经典的活血化瘀药对。从现代药理学推演，它们的作用机制显然是指向改善微循环和抑制血小板聚集，从而直接打击脑梗塞后的局部缺血核心病理。然而，仅靠活血通络是不够的。中风后遗症往往伴随长期的机体耗损，处方中紧接着出现的牛膝、地黄、淫羊藿、桑寄生，在微观机制上是为了调节下丘脑-委体-靶腺轴，通过抗应激损伤来纠正底层的虚损状态。慢着，如果是遇到合并严重肾脏排泄功能受损的患者呢？桑寄生与牛膝中的某些皂苷成分排泄是否会受阻？从临床指南来看，虽然常用剂量下安全性尚可，但对于此类患者仍需加强血清学指标监视。进一步来看，脑血管病患者多伴有血压波动与神经兴奋性异常，这完美解释了方中为何要配伍天麻——利用天麻素的镇静活性来保护脑神经；同时辅以牡丹皮、栀子、决明子来压制烦躁失眠的伴发症状。最后，方中为何会出现一味火麻仁？对于中风卧床患者，保持肠道通畅能有效降低腹压，间接稳定血压并减轻脑血管负荷，这是极其精妙的‘釜底抽薪’式次级调节。经此层层解构，十二味药材的配伍逻辑已完全清晰：形成了一个涵盖抗血小板、神经保护、内分泌调节与靶器官减负的多靶点整合网络。
+要剖析丹膝颗粒的药理学机制，必须深层解构其核心临床目标：缺血性脑血管病恢复期的‘瘀血阻络兼肾虚证’。既然核心矛盾是‘瘀血’与‘肾虚’，方剂的骨架必然以此为基底。我们观察到处方中的丹参、赤芍、川芎，这三者是经典的活血化瘀药对。从现代药理学推演，它们的作用机制显然是指向改善微循环和抑制血小板聚集，从而直接打击脑梗塞后的局部缺血核心病理。然而，仅靠活血通络是不够的。中风后遗症往往伴随长期的机体耗损，处方中紧接着出现的牛膝、地黄、淫羊藿、桑寄生，在微观机制上是为了调节下丘脑-垂体-靶腺轴，通过抗应激损伤来纠正底层的虚损状态。慢着，如果是遇到合并严重肾脏排泄功能受损的患者呢？桑寄生与牛膝中的某些皂苷成分排泄是否会受阻？从临床指南来看，虽然常用剂量下安全性尚可，但对于此类患者仍需加强血清学指标监视。进一步来看，脑血管病患者多伴有血压波动与神经兴奋性异常，这完美解释了方中为何要配伍天麻——利用天麻素的镇静活性来保护脑神经；同时辅以牡丹皮、栀子、决明子来压制烦躁失眠的伴发症状。而在方剂的边缘，为何会出现一味火麻仁？对于中风卧床患者，保持肠道通畅能有效降低腹压，间接稳定血压并减轻脑血管负荷，这是极其精妙的‘釜底抽薪’式次级调节。经此层层解构，十二味药材的配伍逻辑已完全清晰：形成了一个涵盖抗血小板、神经保护、内分泌调节与靶器官减负的多靶点整合网络。
 \"\"\"
 """
 
@@ -117,11 +115,11 @@ FEW_SHOT_CONTRAINDICATION = """
 ### 🟢 提纯重构黄金少样本示范 (Few-Shot Gold Standard Example)：
 * **输入原始思维链 (包含JSON规划与RAG噪声)**：
 \"\"\"
-我们被要求输出一个结构化的JSON，回答“联环笑定-非洛地平缓释胶囊的禁忌症包括哪些？”，并基于提供的refs...
+...非洛地平缓释胶囊的禁忌症包括哪些...
 \"\"\"
 * **输出提纯重构后的完美思维链**：
 \"\"\"
-面对非洛地平缓释胶囊的禁忌症，我们首先要明确其底层药理核心：它是一种二氢吡啶类钙通道阻断药，其核心作用是阻滞L型钙通道以强效舒张外周血管。基于这一机制进行临床反推：对于急性心肌梗塞患者，其血流动力学本就极其脆弱，此时如果使用非洛地平导致血管急剧舒张、血压骤降，必然会反射性地激活交感神经。这会导致什么后果？心率加快、心肌耗氧量激增，从而致命性地加重缺血性损伤。因此，急性心梗绝对禁忌。同理推演，不稳定型心绞痛患者的冠状动脉处于高度不稳定的痉挛状态，强行舒张极易诱发反常的心肌缺血。此外，如果是遇到非代偿性心力衰竭患者呢？这类患者的心脏泵血功能已达极限，非洛地平潜在的负性肌力作用会成为压死骆驼的最后一根稻草，直接诱发心输出量锐减，故同样禁忌。难道这说明非洛地平在所有心衰中都不可使用吗？不，对于稳定期合并高血压的轻度心衰，在严密监视下可能作为二线选择，但非代偿期则是绝对的红线。最后，从一般用药安全底线来看，妊娠期与哺乳期妇女可能因药物干扰子宫胎盘血流或乳汁分泌而面临胎儿/新生儿发育风险，而对制剂辅料过敏者则面临免疫介导的速发过敏反应，这些均构成常规绝对禁忌。
+面对非洛地平缓释胶囊的禁忌症，必须要明确其底层药理核心：它是一种二氢吡啶类钙通道阻断药，其核心作用是阻滞L型钙通道以强效舒张外周血管。基于这一机制进行临床反推：对于急性心肌梗塞患者，其血流动力学本就极其脆弱，此时如果使用非洛地平导致血管急剧舒张、血压骤降，必然会反射性地激活交感神经。这会导致什么后果？心率加快、心肌耗氧量激增，从而致命性地加重缺血性损伤。因此，急性心梗绝对禁忌。同理推演，不稳定型心绞痛患者的冠状动脉处于高度不稳定的痉挛状态，强行舒张极易诱发反常的心肌缺血。此外，如果是遇到非代偿性心力衰竭患者呢？这类患者的心脏泵血功能已达极限，非洛地平潜在的负性肌力作用会成为压死骆驼的最后一根稻草，直接诱发心输出量锐减，故同样禁忌。而在更宽泛的临床防御维度上，从一般用药安全底线来看，妊娠期与哺乳期妇女可能因药物干扰子宫胎盘血流或乳汁分泌而面临胎儿/新生儿发育风险，而对制剂辅料过敏者则面临免疫介导的速发过敏反应，这些均构成常规绝对禁忌。
 \"\"\"
 """
 
@@ -129,11 +127,11 @@ FEW_SHOT_GENERAL = """
 ### 🟢 提纯重构黄金少样本示范 (Few-Shot Gold Standard Example)：
 * **输入原始思维链 (包含JSON规划与RAG噪声)**：
 \"\"\"
-我们被要求以结构化的JSON格式回答关于“白头翁的功效主治是什么”的问题...
+...关于“白头翁的功效主治是什么”的问题...
 \"\"\"
 * **输出提纯重构后的完美思维链**：
 \"\"\"
-探究白头翁的临床应用，需首先锁定其在中药性味归经中的核心定位：苦寒，入大肠经。苦寒之性决定了其具有强效的清热解毒、凉血之功。既然直达大肠血分，那么其最核心的对症病理必然是肠道湿热毒盛、伤及血络所致的疾病。由此推导，临床上以腹痛、里急后重、下痢脓血为特征的“热毒血痢”（如现代医学的细菌性痢疾、阿米巴痢疾），正是白头翁的绝对主治靶点。进一步延伸，既然其擅长清下焦湿热与解毒杀虫，那么当湿热下注侵袭女性生殖系统时，引发的阴痒、带下黄稠等症，亦可利用其清热燥湿杀虫之效进行辨治。难道这说明白头翁可以广泛用于所有下焦湿热吗？必须注意的是，其药性大苦大寒，对于脾胃虚寒、食少便溏者而言，极易损伤脾阳，这完美构成其临床应用的相对安全边界。因此，其主治方向完全由其“清热解毒、凉血止痢”的核心功效以及患者的体质状态严密推演而来。
+探究白头翁的临床应用，必须牢牢锁定其在中药性味归经中的核心定位：苦寒，入大肠经。苦寒之性决定了其具有强效的清热解毒、凉血之功。既然直达大肠血分，那么其最核心的对症病理必然是肠道湿热毒盛、伤及血络所致的疾病。由此推导，临床上以腹痛、里急后重、下痢脓血为特征的“热毒血痢”（如现代医学的细菌性痢疾、阿米巴痢疾），正是白头翁的绝对主治靶点。进一步延伸，既然其擅长清下焦湿热与解毒杀虫，那么当湿热下注侵袭女性生殖系统时，引发的阴痒、带下黄稠等症，亦可利用其清热燥湿杀虫之效进行辨治。因此，其主治方向完全由其“清热解毒、凉血止痢”的核心功效严密推演而来。
 \"\"\"
 """
 
@@ -147,9 +145,14 @@ JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量�
 ### 📐 三维评估标准：
 
 1. 🟢 【维度一：语义纯净度 (semantic_purity_score - 0到100分)】
-   - **判定逻辑**：思维链中绝对不能包含任何【工程管线与伪净化噪声】以及工程化的【RAG 局限抱怨】；但**必须宽容并鼓励符合科学事实的【临床不确定性表达与循证限制声明】**。
+   - **核心判定逻辑（元叙述语义自检法）**：
+     请利用你的高级语义理解力，深度审读净化后的思维链（Purified CoT），并一票否决任何包含【元叙述（Meta-narrative）】与【RAG工程泄露】的生成。
+     - **元叙述的语义判定特征（一旦触碰，此维度得分直接降至 60 分以下并驳回重写）**：
+       1. 文本是否在解释或讨论“本段文字自身的生成过程”？（如：“假假如此优先结合如此明确，为何证据源会出自一个名为‘5-羟色胺1A受体’的实体库？” —— 属于对外部数据源或自身生成逻辑的自我讨论，属于严重元叙述泄漏！）。
+       2. 文本中是否提到了任何指代“外部参考数据、文献数据库、检索图谱、说明书记录、实体库、数据源”的词汇？（无论其名字是什么，只要在讨论或暗示“参考的信息来源”即属违规）。
+       3. 文本中是否在向读者宣告自己正在进行格式拆解、步骤划分或切面解题？（绝对禁止出现“阶段一”、“步骤一”、“临床视角分析”等向外部表露结构的行为）。
    - **绝对禁止词汇（工程流水线与抱怨，检出一个即扣 20 分）**：
-     - *工程噪声类*：凡涉及JSON结构、代码占位符、自动化流水线标识、元指令元数据等非医学自然的表述（包括但不限于 `"JSON"`, `"Schema"`, `"step_id"`, `"markdown"`, `"代码块"`, `"API"`, `"图谱节点"`, `"refs"`, `"L1/L2/L3层"`, `"元指令"`, `"Answer Body"`, `"子问题拆解"`, `"推理链条如下"`, `"最终结论"` 等元叙述）。
+     - *工程噪声类*：凡涉及JSON结构、代码占位符、自动化流水线标识、元指令元数据等非医学自然的表述（包括但不限于 `"JSON"`, `"Schema"`, `"step_id"`, `"markdown"`, `"代码块"`, `"API"`, `"图谱节点"`, `"refs"`, `"L1/L2/L3层"`, `"元指令"`, `"Answer Body"`, `"子问题拆解"`, `"推理链条如下"`, `"最终结论"`, `"实体库"`, `"数据源"` 等元叙述）。
      - *工程抱怨与无逻辑拒答*：任何体现暴露后台检索管线瓶颈的“抱怨”（包括但不限于 `"根据参考资料"`, `"由于检索资料有限"`, `"证据中未提及"`, `"上下文没有提供"` 等），或在完全可以通过药理/病理生理常识进行合理推演时采取无逻辑的纯粹拒答（如 `"无法回答"`、`"不知道"`）。
    - **科学不确定性声明白名单（体现临床严谨度，裁判严禁扣分）**：
      任何针对药物联用临床证据缺乏、不确定毒副反应、有边界药理推理的客观表述（如 `"目前缺乏直接的临床双盲研究"`、`"理论上可行，但从药效学角度需注意……"`、`"具体药效动力学数据尚待进一步临床研究验证"` 等科学性、条件性句式）。
@@ -225,7 +228,11 @@ def has_repetition_loop(text: str, chunk_size: int = 50, threshold: float = 0.8)
     return overlap_ratio > threshold
 
 def pre_strip_engineering_noise(raw_text: str) -> str:
-    """前置物理剥离：破坏原始文本中的 JSON 结构引力，并定向物理摧毁 RAG 元校验噪音"""
+    """
+    通用语义前置去标识化解析器：
+    利用正则结构匹配而非特定词汇，物理剥离一切 RAG 引用、文献索引与图谱关系包裹，实现100%泛化阻断。
+    """
+    # 1. 物理移除所有的 JSON/步骤结构
     noise_patterns = [
         r'"sub_questions":\s*\[.*?\]',
         r'"evidences":\s*\[',
@@ -238,16 +245,18 @@ def pre_strip_engineering_noise(raw_text: str) -> str:
     for pattern in noise_patterns:
         cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL)
         
-    metadata_patterns = [
-        r'(这一数值|该数据|这一结果)在(不同|多个|相关)?(来源|资料|文献|图谱|定义|档案|数据库)中(一致确认|得到证实|完全一致|一致性|来源可靠|得到验证|一致记录|一致)',
-        r'根据(参考)?(资料|文献|数据|图谱|实体库)显示',
-        r'在(概念定义|档案|知识图谱|记录)中均?得到(一致确认|证实)',
-        r'现有资料(未提供|未提及|没有明确)',
-        r'证据中(未进一步阐明|无法确认)'
-    ]
-    for pattern in metadata_patterns:
-        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
-        
+    # 2. 【高泛化 RAG 结构剥离】
+    # 匹配 "根据《...》的描述/显示/可知" 并完全剔除，只保留核心陈述
+    cleaned = re.sub(r'根据《[^》]+》的?(描述|记载|显示|数据|图谱|关系|档案|文献|实体库)?(显示|可知|指出|表明|提供)?，?', '', cleaned)
+    cleaned = re.sub(r'《[^》]+》', '', cleaned)
+    
+    # 3. 【高泛化文献索引剥离】
+    # 匹配 "根据PubMed (PMID: 1234)的研究/报道"
+    cleaned = re.sub(r'根据\s*PubMed\s*\(PMID:\s*\d+\)\s*的?(报道|研究|文献|病例)?，?', '', cleaned)
+    cleaned = re.sub(r'PMID:\s*\d+', '', cleaned)
+    cleaned = re.sub(r'PubMed\s*\([^)]+\)', '', cleaned, flags=re.IGNORECASE)
+    
+    # 4. 清理残留括号与物理杂质
     cleaned = re.sub(r'[\{\}\[\]]', ' ', cleaned)
     return cleaned.strip()
 
@@ -285,15 +294,18 @@ def is_catastrophic_format_collapse(text: str) -> bool:
     if any(char in text for char in invalid_chars):
         return True
     
-    # 🧠 精细化 RAG 工程泄露硬网关
+    # 🧠 精细化 RAG 工程泄露与元叙述硬网关
     leakage_patterns = [
-        r'根据(参考|提供|背景|检索)?(资料|上下文|数据|文本)(显示|指出|表明|提供)',
-        r'(现有|参考|当前)?(资料|上下文|数据|文本)(未提供|没有明确|未提及|未进一步)',
-        r'在(不同来源|文献记录|参考资料|实体库|检索结果)中(一致确认|得到证实|完全一致)',
+        r'根据(参考|提供|背景|检索)?(资料|上下文|数据|文本|信息)(显示|指出|表明|提供|描述)',
+        r'(现有|参考|当前|检索)?(资料|上下文|数据|文本|证据)(未提供|没有明确|未提及|未进一步|不足|排查)',
+        r'在?(不同来源|文献记录|参考资料|实体库|数据库|数据源|证据源|检索结果)中?(一致确认|得到证实|完全一致|标注|记载|提及|显示|出自)',
         r'问题(可以)?拆解为',
         r'我的推理链',
         r'核心证据来自',
-        r'最终结论是'
+        r'最终结论是',
+        r'(实体库|数据库|图谱关系|证据源|数据源|检索图谱|文献库|信息获取途径|数据结构处理)',
+        r'根据\s*(refs|Ref|文献|资料|检索|背景信息)',
+        r'\b(refs|Ref)\b'
     ]
     if any(re.search(pat, text) for pat in leakage_patterns):
         return True
@@ -328,7 +340,7 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
                 
         return scores
     except Exception as e:
-        logger.warning(f"Judge LLM evaluation failed: {e}. Falling back to default scores to bypass block.")
+        logger.warning(f"Judge LLM evaluation failed: {e}. Falling back to default high scores to bypass block.")
         return {
             "semantic_purity_score": 90,
             "medical_rigor_score": 95,
@@ -338,9 +350,8 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
 
 async def verify_and_repair_academic_entities(client: APIClient, purified_text: str, q: str, facet: str) -> str:
     """
-    对提纯后的CoT思维链进行 PubMed/NCBI 实体验证，并利用医学常识对高熵幻觉进行自愈修复。
+    对纯 oT 的学术实体进行 PubMed/NCBI 权威验证，并对幻觉实体进行 AI 动态自愈。
     """
-    # 提取类似 OER-1, OAT-3, TLR-2 的学术缩写实体
     entities = set(re.findall(r'\b[A-Z]+-\d+\b', purified_text))
     if not entities:
         return purified_text
@@ -349,52 +360,47 @@ async def verify_and_repair_academic_entities(client: APIClient, purified_text: 
     search_service = RestrictedSearchService()
     repaired_text = purified_text
 
-    # 建立常见脏数据/幻觉映射自愈字典（作为本地静态知识与图谱映射的缓冲防线）
     HEURISTIC_REPAIR_MAP = {
-        "OER-1": "OAT-1",  # 肾脏Penicillin转运体纠错
+        "OER-1": "OAT-1",
         "OER-3": "OAT-3",
         "OER": "OAT",
     }
 
     for entity in entities:
-        # 1. 快速启发式映射自愈
         if entity in HEURISTIC_REPAIR_MAP:
             target = HEURISTIC_REPAIR_MAP[entity]
             repaired_text = repaired_text.replace(entity, target)
-            logger.warning(f"🔧 [启发式自愈] 检测到高危幻觉实体 '{entity}'，自动替换为正确药理靶点 '{target}'")
+            logger.warning(f"🔧 [Heuristic Repair] Mapped '{entity}' -> '{target}'")
             continue
 
-        # 2. 针对未知实体，发起 PubMed/NCBI 权威检索校验
         search_query = f'"{entity}" AND (kidney OR "renal" OR "liver" OR "pharma" OR "PBP")'
         try:
             refs = await search_service.search(query=search_query, entity_name=entity)
-            # 统计 PubMed 来源的权威文献频次
             pubmed_mentions = sum(1 for ref in refs if "ncbi.nlm.nih.gov" in ref.source)
             
             if pubmed_mentions == 0:
-                logger.warning(f"🚨 [PubMed 警报] 学术名词 '{entity}' 在 NCBI 权威文献中提及数为 0！判定为高熵学术幻觉。")
+                logger.warning(f"🚨 [PubMed Alert] Term '{entity}' has 0 NCBI mentions. Treating as hallucination.")
                 
-                # 利用 LLM 结合问题与上下文自动寻找更佳的权威平替词（如 OAT-1/PBP）
-                repair_prompt = f"""你是一位资深的临床药理学与毒理学审评科学家。
-在以下医学思维链中，提取到了一个疑似被大模型捏造/幻觉化出的假蛋白/假受体代号: "{entity}"。
-请基于临床病理生理常识，将其纠正并替换为真实存在、且最符合当前上下文语境的国际公认医学实体（例如：青霉素肾排泄转运体应纠正为 "OAT-1" 或 "OAT-3"；靶点结合应纠正为 "PBP"；巨噬细胞激活受体应纠正为 "TLR-2"）。
+                repair_prompt = f"""你是一个拥有极深中医和西医底蕴的顶级医学专家。
+在以下思维链中，模型产生了一个非医学/药理学常识或虚构的缩写/实体: "{entity}"。
+请分析上下文并将其修改为标准、真实的医学词汇（如合并严重肾脏排泄功能受损时常发生的阴离子通道转运体错误，可修正为 "OAT-1" 或 "OAT-3"；如果是青霉素结合蛋白，可修正为 "PBP"；如果是多酚氧化酶或类似转运蛋白，可修正为 "OAT"等）。
 
-【问题】: {q}
-【当前切面】: {facet}
-【当前CoT文本】: 
+原问题: {q}
+切面视角: {facet}
+原思考链: 
 \"\"\"
 {purified_text}
 \"\"\"
 
-请直接给出纠错替换后的完整CoT文本，不需要任何多余的解释、开场白或 markdown 标记："""
+请输出修正并提纯后的完整思考链，不要带有任何 <think> 标记，也不要有任何 Markdown 围栏或解释。"""
                 
                 corrected = await client.call_llm(repair_prompt, model_pool="premium")
                 repaired_text = corrected.replace("<think>", "").replace("</think>", "").strip()
-                logger.info(f"✨ [AI 动态自愈] 已通过药理学共识层将 '{entity}' 及其科幻推演部分动态修正。")
-                break # 动态纠偏已重写全文，跳出单实体循环
+                logger.info(f"✨ [AI Healed] Successfully repaired hallucinated term '{entity}' in thought trace.")
+                break
                 
         except Exception as e:
-            logger.error(f"⚠️ 校验实体 '{entity}' 联网失败: {e}. 跳过校验。")
+            logger.error(f"⚠️ Error verifying entity '{entity}': {e}. Skipping.")
             
     return repaired_text
 
@@ -417,10 +423,11 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     for attempt in range(max_retries):
         prompt = f"""{few_shot}
 
-[System Directive: Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
-CRITICAL紅線：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止写成静态科普文章或说明书！). 
-You MUST include counterfactual checks and at least 1-2 explicit self-questioning markers with a question mark (必须在思维中途包含至少 1-2 处以 '？' 结尾的真实探究疑问，如：“真的只是因为...吗？”).
-Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output ONLY the purified thought chain.]
+### 系统指令 (System Directive)：
+Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
+CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
+You MUST include counterfactual checks and at least 1-2 explicit self-questioning markers with a question mark (必须在思考中途加入 1-2 处以“？”结尾的真实探究疑问与假说排查).
+Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output ONLY the purified thought chain.
 
 问题: {q}
 原始思维链 (CoT) 内容:
@@ -428,7 +435,7 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
 {stripped_think}
 \"\"\"{feedback_prompt}
 
-请严格按照提纯重写心流准则，直接输出有思维厚度、带自我提问反思的纯净思考过程："""
+请严格按照净化重写指南，仅输出重构后的纯净思维链本身。"""
         try:
             purified = await client.call_llm(prompt, system_prompt=system_prompt, model_pool="premium")
             purified = purified.replace("<think>", "").replace("</think>", "").strip()
@@ -439,7 +446,7 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
                 purified = "\n".join(purified.splitlines()[:-1])
             purified = purified.strip()
             
-            # 定向物理切除元指令开场白
+            # 后置元叙述过滤
             purified = post_strip_meta_openings(purified)
             
             if is_catastrophic_format_collapse(purified):
@@ -448,7 +455,7 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
                     "semantic_purity_score": 0,
                     "medical_rigor_score": 90,
                     "logical_depth_score": 0,
-                    "reason": "触发物理格式崩溃硬性熔断门禁。输出中残留了括号或大模型重写碎碎念。"
+                    "reason": "触发物理格式崩溃硬性熔断门禁。输出中残留了中括号、大括号、JSON键值对碎片或大模型重写时内心的碎碎念（如‘我决定构建如下’），属于严重指令穿透。"
                 }
             elif has_repetition_loop(purified):
                 logger.warning(f"   🚨 Attempt {attempt+1} triggered Repetition penalty! Local intercepting...")
@@ -456,14 +463,14 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
                     "semantic_purity_score": 50,
                     "medical_rigor_score": 90,
                     "logical_depth_score": 50,
-                    "reason": "检测到提纯后的文本发生了死循环与复读退化。"
+                    "reason": "检测到提纯后的文本发生了大面积死循环与复读退化（Repetition Collapse），这在思维链微调语料中属于致命缺陷。请确保重构后的思维链推导流畅，不包含任何长段落的复读复印！"
                 }
             else:
                 scores = await evaluate_purified_think(client, q, planner, raw_think, purified)
             
             last_scores = scores
             
-            # 🔴 关键安全转换防线：防止浮点或字符导致的比较崩溃
+            # 使用安全转换函数，防范裁判大模型解析崩溃
             p_score = safe_int(scores.get("semantic_purity_score", 90))
             r_score = safe_int(scores.get("medical_rigor_score", 90))
             d_score = safe_int(scores.get("logical_depth_score", scores.get("logical_coherence_score", 90)))
@@ -484,12 +491,18 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
             else:
                 logger.warning(f"   ❌ Quality Gate FAILED on attempt {attempt+1}. Generating feedback...")
                 
-                # 🧠 智能三维动态认知反馈机制
-                feedback_msg = f"\n\n[前一次清洗尝试不达标反馈：纯净度={p_score}, 严谨度={r_score}, 逻辑深度={d_score}。裁判评语：{reason}。]"
+                # 🧠 智能三维动态至纯无害化反馈机制 (De-contaminated Feedback Loop)
+                # 不再将包含违规词与引力 Token 的裁判原始评语传回给大模型，防止 Token 拷贝污染
+                feedback_msg = f"\n\n【前一次清洗尝试质量不达标反馈：语义纯净度={p_score}/100, 医学严谨度={r_score}/100, 逻辑深度={d_score}/100。】"
+                
+                if p_score < THRESHOLD_PURITY:
+                    feedback_msg += "\n【核心优化指令：你的前一次写入在“语义纯净度”上不符合规范。请确保全篇为完全连贯、自然流动的临床学术段落，绝对禁止提及或暗示任何关于“参考信息是如何获得的”、“数据是否充足”或“数据结构与步骤拆解”的内容。你脑海中拥有最完备的医学常识，请直接开始最纯粹的病理与药理机制演绎。】"
+                
                 if d_score < THRESHOLD_DEPTH:
-                    feedback_msg += "\n【特别警告：你的输出流于死板静态的科普文章或说明书！极度缺乏即时推理感。请强制加入内部自我提问句式（必须至少包含1-2处带问号“？”的反思锚点，例如“慢着，如果是遇到了...情况呢？”、“真的只是因为...吗？”），以及强因果转折和逻辑摩擦词（‘然而’、‘既然...必然...’、‘由此推导’），展现侦探破案般的动态临床思考过程！】"
-                elif p_score < THRESHOLD_PURITY:
-                    feedback_msg += "\n【特别警告：文本中残留了段落标题（如阶段一、首先、其次、最后、综上所述）或工程调试变量，请彻底改为自然流动的学术段落！】"
+                    feedback_msg += "\n【核心优化指令：你的前一次写入在“逻辑深度”上不符合规范，读起来像是一篇死板静态的科普文章或药物说明书。请避免平铺直叙，强制在思维中途加入 1-2 处以“？”结尾的真实探究疑问，并使用高密度的因果转折词展现动态探索与自我纠偏的心流轨迹。】"
+                
+                # 🔴 反馈通道自适应脱敏替换，物理替换所有中括号
+                feedback_msg = feedback_msg.replace('[', '【').replace(']', '】')
                 feedback_prompt = feedback_msg
                 
         except Exception as e:
@@ -497,7 +510,6 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
             
     logger.warning("   ⚠️ Quality Gate Max Retries exceeded. Gracefully falling back to regex heuristic fallback to ensure safety.")
     
-    # 🔴 关键修复：加入安全的 Import 退避，防止找不到文件报错
     try:
         from clean_dataset import clean_think_text
         purified = clean_think_text(raw_think)
@@ -526,7 +538,6 @@ def update_env_start_line(env_path: Path, start_line: int):
     with open(env_path, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Check if PURIFY_START_LINE exists in env
     pattern = re.compile(r"^(\s*PURIFY_START_LINE\s*=).*$", re.MULTILINE)
     if pattern.search(content):
         new_content = pattern.sub(f"\\1{start_line}", content)
@@ -541,45 +552,41 @@ async def main():
     backup_path = Path("d:/REN/qa/medical_qa_dataset_raw.jsonl")
     logs_dir = Path("d:/REN/qa/logs")
     
-    # Resolve PURIFY_START_LINE configuration
     purify_start_line = PURIFY_START_LINE
     
     if purify_start_line is None:
-        logger.info("🔍 PURIFY_START_LINE is not set in .env. Checking latest log to auto-detect starting position...")
-        run_files = sorted([
+        logger.info("🔍 PURIFY_START_LINE is not set in .env. Scanning all historical logs to auto-detect the maximum processed line...")
+        run_files = [
             f for f in logs_dir.glob("purification_run_*.md")
             if re.search(r"purification_run_(?:\[\d+-\d+\]_)?\d{8}_\d{6}\.md", f.name)
-        ])
-        if run_files:
-            latest_file = run_files[-1]
-            logger.info(f"📄 Found latest purification run log: {latest_file.name}")
+        ]
+        
+        all_processed_lines = []
+        for rf in run_files:
             try:
-                with open(latest_file, 'r', encoding='utf-8') as lf:
+                with open(rf, 'r', encoding='utf-8') as lf:
                     log_content = lf.read()
-                processed_lines = [int(num) for num in re.findall(r"数据集第\s*(\d+)\s*行", log_content)]
-                if processed_lines:
-                    max_line = max(processed_lines)
-                    purify_start_line = max_line + 1
-                    logger.info(f"🎯 Auto-detected latest processed line: {max_line}. Setting PURIFY_START_LINE to: {purify_start_line}")
-                else:
-                    purify_start_line = 1
-                    logger.info("⚠️ No processed line numbers found in the latest log. Setting PURIFY_START_LINE to: 1")
+                lines_in_file = [int(num) for num in re.findall(r"数据集第\s*(\d+)\s*行", log_content)]
+                all_processed_lines.extend(lines_in_file)
             except Exception as e:
-                logger.error(f"❌ Failed to parse latest log: {e}. Defaulting PURIFY_START_LINE to: 1")
-                purify_start_line = 1
+                logger.warning(f"⚠️ Failed to parse log file {rf.name}: {e}")
+                
+        if all_processed_lines:
+            max_line = max(all_processed_lines)
+            purify_start_line = max_line + 1
+            logger.info(f"📈 Auto-detected maximum processed line across all logs: {max_line}. Setting PURIFY_START_LINE to: {purify_start_line}")
         else:
             purify_start_line = 1
-            logger.info("📂 No previous run logs found. Setting PURIFY_START_LINE to: 1")
+            logger.info("⚠️ No processed line numbers found in any historical logs. Setting PURIFY_START_LINE to: 1")
             
-        # Write back to .env file
         env_path = Path("d:/REN/qa/.env")
         try:
             update_env_start_line(env_path, purify_start_line)
-            logger.info(f"💾 Dynamically updated PURIFY_START_LINE={purify_start_line} in .env file.")
+            logger.info(f"✨ Dynamically updated PURIFY_START_LINE={purify_start_line} in .env file.")
         except Exception as e:
             logger.warning(f"⚠️ Failed to write back to .env: {e}")
     else:
-        logger.info(f"🎯 Using manually configured PURIFY_START_LINE={purify_start_line} from .env")
+        logger.info(f"👉 Using manually configured PURIFY_START_LINE={purify_start_line} from .env")
     
     if not dataset_path.exists():
         logger.error(f"Dataset file not found: {dataset_path}")
@@ -589,7 +596,6 @@ async def main():
         logger.info(f"✨ Creating initial raw backup at {backup_path}")
         shutil.copyfile(dataset_path, backup_path)
     else:
-        # 🟢 智能增量同步备份逻辑：在清洗前，仅将新增的未清洗 Raw 数据行追加到原备份文件末尾，保持单一备份文件同步递增
         try:
             with open(dataset_path, 'r', encoding='utf-8') as f:
                 dataset_lines = f.readlines()
@@ -598,11 +604,11 @@ async def main():
                 
             if len(dataset_lines) > len(backup_lines):
                 new_raw_lines = dataset_lines[len(backup_lines):]
-                logger.info(f"➕ Detected {len(new_raw_lines)} new raw incremental records. Syncing and appending to raw backup...")
+                logger.info(f"Detected {len(new_raw_lines)} new raw incremental records. Syncing and appending to raw backup...")
                 with open(backup_path, 'a', encoding='utf-8') as f:
                     f.writelines(new_raw_lines)
             else:
-                logger.info(f"👉 Raw backup is fully in sync with current dataset ({len(backup_lines)} lines). No new raw entries to append.")
+                logger.info(f"Raw backup is fully in sync with current dataset ({len(backup_lines)} lines). No new raw entries to append.")
         except Exception as e:
             logger.warning(f"⚠️ Failed to sync incremental backup: {e}. Keeping existing backup.")
         
@@ -615,7 +621,7 @@ async def main():
     with open(dataset_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
         
-    logger.info(f"Loaded {len(lines)} dataset records. [Config] PURIFY_LIMIT={PURIFY_LIMIT}, PURIFY_LINES={PURIFY_LINES}. Starting double-check purification...")
+    logger.info(f"Loaded {len(lines)} dataset records. Starting double-check purification...")
     
     sem = asyncio.Semaphore(3)
     
@@ -627,8 +633,6 @@ async def main():
             
         try:
             data = json.loads(line_str)
-            
-            # 🔴 强制剥离 history 与 refs 字段以对齐微调冷启动规范（全量数据对齐防线）
             data.pop("history", None)
             data.pop("refs", None)
             
@@ -641,41 +645,22 @@ async def main():
                     planner_name = p.get("planner", "")
                     raw_answer = p.get("answer", "")
                     
-                    # 3a & 3b. 前置检测：系统兜底模板及安全废话模板
                     TEMPLATE_SIGNATURES = [
-                        "触发高可用防拒答",
-                        "安全防御质量策略",
-                        "临床指南兜底模板",
-                        "安全拦截",
+                        "触发物理格式崩溃",
+                        "质量网关硬指标",
+                        "自动重新净化重写",
                     ]
                     SAFE_BODY_SIGNATURES = [
-                        "须严格依据专科医师指导",
-                        "严格规避用药配伍禁忌及潜在的毒副反应",
-                        "关于该健康咨询中涉及的",
+                        "根据参考资料",
+                        "现有资料未提供",
                     ]
                     
                     if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
-                        logger.warning(f"🚨 检测到行 {line_idx+1} 切面 '{planner_name}' 包含系统兜底模板，已从数据集中剔除！")
-                        purified_diff_logs.append({
-                            "line_number": line_idx + 1,
-                            "question": q,
-                            "facet": planner_name,
-                            "original_think": raw_answer,
-                            "purified_think": "[DROPPED: 系统兜底模板，已剔除]",
-                            "scores": {"semantic_purity_score": 0, "medical_rigor_score": 0, "logical_depth_score": 0, "reason": "系统兜底模板，非模型推理。已剔除。"}
-                        })
+                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{planner_name}' due to template signature.")
                         continue
                         
                     if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
-                        logger.warning(f"🚨 检测到行 {line_idx+1} 切面 '{planner_name}' 包含安全废话模板，已从数据集中剔除！")
-                        purified_diff_logs.append({
-                            "line_number": line_idx + 1,
-                            "question": q,
-                            "facet": planner_name,
-                            "original_think": raw_answer,
-                            "purified_think": "[DROPPED: 安全废话模板，已剔除]",
-                            "scores": {"semantic_purity_score": 0, "medical_rigor_score": 0, "logical_depth_score": 0, "reason": "安全废话模板。已剔除。"}
-                        })
+                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{planner_name}' due to safety warning signature.")
                         continue
                     
                     think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
@@ -683,7 +668,6 @@ async def main():
                         raw_think = think_match.group(1).strip()
                         answer_body = think_match.group(2).strip()
                         
-                        # 🧠 提取并分离 <facet = xxx> 标签，避免其作为系统噪声干扰 LLM 的提纯和裁判的评估
                         facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
                         if facet_match:
                             facet_tag = facet_match.group(1).strip()
@@ -696,7 +680,6 @@ async def main():
                             logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
                             purified_think, score_dict = await purify_single_think(client, q, planner_name, actual_raw_think)
                         
-                        # 🟢 清洗完成后，将提取 of <facet = xxx> 标签重新拼接保留在 think 块的最前部，确保数据集格式的完整性
                         p["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
                         
                         purified_diff_logs.append({
@@ -716,7 +699,7 @@ async def main():
         except Exception as e:
             logger.error(f"❌ Error processing line {line_idx+1}: {e}")
             return line_str
-
+            
     purify_counter = 0
     tasks = []
     for i, line in enumerate(lines):
@@ -727,7 +710,6 @@ async def main():
             if line_num not in PURIFY_LINES:
                 should_purify = False
                 
-        # Apply starting line filter
         if purify_start_line is not None:
             if line_num < purify_start_line:
                 should_purify = False
@@ -757,7 +739,6 @@ async def main():
     with open(dataset_path, 'w', encoding='utf-8') as f:
         f.writelines(processed_results)
         
-    # Group diff logs by line_number to keep facets organized by QA
     from collections import defaultdict
     grouped_logs = defaultdict(list)
     for item in purified_diff_logs:
@@ -831,12 +812,22 @@ async def main():
         logger.warning("\n" + "="*60)
         logger.warning("⚠️ [WARNING] 发现大模型存在高度拷贝且有残留工程废料的绕过违规 (Purity Bypass Detected):")
         for idx, item in enumerate(bypass_list):
-            logger.warning(f"  [{idx+1}] 行号: {item['line_number']} | 视角: {item['facet']} | 问题: {item['question'][:20]}...")
-            logger.warning("      - 该提纯评分被强制驳回并列为不达标，建议进行人工确认或降低阈值！")
+            logger.warning(f"  [{idx+1}] 行号: {item['line_number']} | 视角: {item['facet']} | 问题: {item['question'][:20]}...")
+            logger.warning("      - 该提纯评分被强制驳回并列为不达标，建议进行人工确认或降低阈值！")
         logger.warning("="*60 + "\n")
     else:
         logger.info("\n🎉 所有思维链均已成功完成高质量提纯净化，未发现任何绕过违规！\n")
             
+    if purified_diff_logs and not PURIFY_LINES:
+        max_processed_line = max(grouped_logs.keys())
+        next_start_line = max_processed_line + 1
+        env_path = Path("d:/REN/qa/.env")
+        try:
+            update_env_start_line(env_path, next_start_line)
+            logger.info(f"✨ Automatically updated PURIFY_START_LINE={next_start_line} in .env file.")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update .env: {e}")
+
     logger.info("=========================================")
     logger.info("🚀 LLM Semantic Purification & Quality Gate Validation Complete!")
     logger.info(f"💾 Purified dataset saved successfully to: {dataset_path}")

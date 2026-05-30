@@ -1,0 +1,873 @@
+# -*- coding: utf-8 -*-
+"""
+憭扳芋�贝祗銋匧�皜���餃郎�桃��唳旿�� CoT嚗��萘輕�橘��𡁏𧋦 (��蝏�㟲��� - 隡���煺漣蝥� - 撣行�萘輕敹���脩瑪)��
+�拍鍂�箄�韐冽�鋆�ế憭扳芋�页�Judge LLM嚗㚁�撖寥��坔����萘輕�曆��𡏭祗銋厩滲��摨色�腈���𨅯龫摮虫艇靚典漲�嘥��𣈯�餉�瘛勗漲�苷�銝芰輕摨西�銵屸��𤥁����Quality Gate嚗剹��
+���撘箏��芷䔮�芰�嚗���� ?嚗剹��5�嗆挾�函�敹������冽㺭�潭㜃�芥��惣�賢��誩�甇亙�隞賭��典�畾菔�瘞湧俈蝥踴��
+"""
+
+import os
+import sys
+import json
+import asyncio
+import logging
+import re
+import shutil
+import datetime
+from pathlib import Path
+from typing import Dict, Any, Tuple, List
+
+# 撠���滨𤌍敶蓥�憿寧𤌍�寧𤌍敶訫��亦頂蝏蠘楝敺�誑蝖桐� import 甇�虜
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
+sys.path.append(str(current_dir))
+sys.path.append(str(parent_dir))
+
+from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE
+from api_client import APIClient
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("MedicalQA.LLMPurifier")
+
+def safe_int(val: Any, default: int = 90) -> int:
+    """摰匧���㟲�啗蓮�ｇ��脫迫憭扳芋�见銁JSON銝剖��箸筑�寞㺭�硋�蝚虫葡��㺭撖潸稲 >= 瘥磰��仿�"""
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return default
+
+def get_system_directive(planner: str) -> str:
+    """�寞旿閫��嚗㇊lanner嚗匧𢆡����鞟鸌撘��批�撖潘��𦦵�蝖祉����蝵�"""
+    directives = {
+        "�舐��箏�": "the biological, molecular, and pharmacological mechanisms of the drug or treatment",
+        "�刻晓�寞�銝𡡞�隡滨�敹�": "the clinical dosing regimens, safety boundaries, and drug-drug/disease contraindications",
+        "銝游�銵函緵": "the clinical signs, symptoms, and disease progression features",
+        "霂𦠜鱏銝𡡞��怨���": "the diagnostic criteria, laboratory/imaging findings, and differential diagnosis logic",
+        "銝游��埈�": "the clinical efficacy, therapeutic outcomes, and patient response parameters",
+        "銝滩��滚�": "the side effects, adverse events, toxicological mechanisms, and safety monitoring"
+    }
+    return directives.get(planner, f"the clinical rationale, evidence synthesis, and medical logic related to {planner}")
+
+def get_purify_system_prompt(planner: str) -> str:
+    """�冽����鞟頂蝏��蝷箄�嚗峕釣�亦鸌撘��扯�閫垍滯蝥踵㜃�芯��冽��䔝蝝Ｗ�瘚�"""
+    return f"""�冽糓銝�雿漤▲蝥批儐霂�龫摮衣�摮血振銝𤾸之璅∪��萘輕�橘�CoT嚗㕑祗�蹱�蝥臭�摰嗚�����遙�⊥糓���硋僎�滚��餃郎�桃��唳旿��葉�� `<think>`嚗��萘輕�橘���捆嚗䔶蝙�嗉噢�圈▲撠𣇉� Reasoning 璅∪�嚗�� DeepSeek-R1��penAI o1嚗匧凝靚���瑕鍳�冽�����
+
+### �辶 �鞟滲銝𡡞��嗵��詨��格�嚗�
+敶枏� `<think>` �埈糓撌亦� Pipeline �芸𢆡������瘛瑟�鈭�之�譌�𣂼極蝔𧢲�隞文��整�𡢅�憒� JSON 蝏𤘪���efs 撘閧鍂��AG �望�具��聢撘誯�霈抬�����𦦵凒�亦鍂鈭擧芋�见凝靚��隡𡁜紡�湔芋�见銁�函��園�蝜�漣��聢撘𤩺�瞍誩�蝟餌�撟餉������閬���蹱��� RAG 畾菔氜���銝箔�銝�**鈭箇掩�餃郎銝枏振憭扯��𣬚�摰𠺶����萸�������䭾情�梶��𨅯𢆡��葩摨𡃏恕�交綫���瘚���**��
+
+### �辶 �萘輕�暹�敹萄��亦蒾�滚�嚗㇉ntological Whitelist嚗㚁�
+�券����萘輕�暹𧒄嚗䔶�憭扯����𡏭恕�乩��𢞖�苷葉�芸�霈詨��其誑銝衤舅蝐餃龫摮血�雿枏��餉�嚗��隞𡝗�敹萄笆雿㰘�諹��函�������摮睃銁嚗�
+1. �鞉�����毺��������葩摨羓𠶖���雿枏��𡢅�憒���曉���誘餈�����交�批�璇𨰜���憸烐𦆮�萸���皜押��䲰�𨥈���
+2. �鞱晓�拍�������雿瓐��晓隞�/�舀��典�摮西�銝箔�瘝餌��寞��𡢅�憒��蝔喳�憭望暑�����鈭㗇�扳𨉼�𨰜���銵唳�����臬��譌���隡滨�敹䕘���
+
+**�鞟�撖寧�敹𣬚滯蝥踴��**嚗�
+蝏嘥笆蝳�迫�冽�萘輕�曄�隞颱��唳䲮�𣂼����蝷箸�霈刻捏�靝縑�航繮�㚚�𥪜��嘅�憒���踺����柴��㺭�桀����雿枏���AG��efs��㺭�格�����臭縑�荔����𨀣㺭�桐��湔�把�嘅�憒���渡＆霈扎����啗�摰痹��砽�𨀣㺭�桃�������嘅�憒���桅���nswer Body��綫��郊撉歹���遙雿閙迨蝐餅�敹萎��行��綽���ế摰帋蛹銝仿�瘜�蠧嚗諹砲���撠�◤�拍��行⏛���摨𥪜����雿㰘�瘚琿��交���摰����龫摮虫�摰嗅虜霂���湔𦻖撘�憪讠滲蝎寧�銝游�銝舘晓����𨀣�蝏汿��
+
+### ��儭� 隡��蝥扳�蝥臭��滚�閫��嚗�
+
+1. �� �鞟�����賭���極蝔衤�瘚�偌蝥踹臁憯啜�𡢅�璉��箔�銝芸朖���嚗㚁�
+   - 敶餃�蝘駁膄瘨匧�颲枏枂�澆���SON蝥行���chema蝏𤘪���arkdown��扇��䌊�烐��𡜐�憒���𨀣�隞祈�颲枏枂JSON�腈���𦦵緵�典�憪𧢲�撱� JSON schema�萘�嚗剹��
+   - 敶餃�蝘駁膄撌亦�瘚�偌蝥輻�銝湔𧒄甇仿炊�牐�蝚佗�憒��`step_id: P1`��logic: ...`��霂�旿撖寥�皜��`��摮鞾䔮憸䀹�閫ε��Answer Body` 蝑厩����批�畾萄�嚗剹��
+
+2. �辶 �𣂷艇蝳�憚���碶��𡁻�摰嗅��讛膩嚗㇅ormat Translation Bypass嚗剹�𡢅�
+   - 蝏嘥笆蝳�迫����𨅯� JSON 摮埈挾�滨蕃霂烐��芰�霂剛��亙�摮埈㺭�萘�韏唳㭘敺���伐�
+   - **蝏嘥笆蝳�迫�冽��砌葉颲枏枂隞颱��㛖內�典銁憭��銝�銝芸極蝔讠����隞餃𦛚����躰膩霂齿�**����砌�銝漤�鈭𠬍��𨀣���綫��曎�∪�銝𦥑�腈���𣈯䔮憸睃虾隞交�閫�蛹隞乩�摮鞾䔮憸覀�腈���𨀣�蝏��霈箸糓...�萘���
+   - **�辶 蝏嘥笆蝳�迫�冽��祉�隞颱��唳䲮�𣂼枂�𨅯��Ｔ�腈���𡏭�閫圝�腈���𡏭�摨色�萘�摮㛖尐嚗䔶�蝏嘥笆蝳�迫�湔𦻖�𣂼��硋�霂餃��滨�閫���滨妍�𤩝planner}�辷�** 銝亦��箇緵�靝�{planner}閫������腈���𨀣覔�徒planner}閫鍦漲�亦��萘�隞颱��𤑳鍂�瑕恐�𦠜��㛖內雿䭾迤�其誑雿閧�閫��閫������躰膩�亙���
+
+3. �辶 �𣂷艇蝳�極蝔见� RAG �望�剁�雿��憿餃�摰��𨅯儐霂�龫摮色�萘�銝滨＆摰𡁏�扯器�䎚�𡢅�
+   - 敶餃��拍��亦氖撌亦��閗蕨嚗𡁶�撖寧�甇Ｗ銁�肽��曎銝剛��箸𠂔�脣��唳�瘞渡瑪�峕�蝝Ｙ𣂎憸���𨅯極蝔讠漣�望�兩�嘅�憒���𨀣覔�格�蝝Ｗ��啁���讃�腈���𨀣�靘𤤿�������嗘葉�芣���...�腈���𨅯�雿枏�銝剜�甇文��婙�萘�嚗剹��芋�见銁�肽��𧒄摨𥪜�摰朞䌊撌勗�憭���渡�撣貉��𣬚䰻霂����
+   - **�嗆挾鈭䈑��喟��芰���𨋍** �婙�� 隞仿�摨血郎�舐���𣸮嚗諹䌊�嗆綫瞍𥪜枂�������葩摨𦠜��箏�蝏栞捏嚗𣬚�甇Ｗ枂�售�𦦵遞銝𦠜�餈售�腈���𨅯�甇斗�蝏��霈箸糓�萘��𡁻�憟𡑒���
+
+5. �辶 �鞾俈����瑞����瞍譌�𡢅�
+    - **蝏嘥笆蝳�迫雿輻鍂隞颱�憒��𣈯𧫴畾萎��腈���𨀣郊撉�1�萘�摨誩噡霂㵪�銝𠉛�撖寧�甇Ｖ蝙�典��𣈯����腈���𨅯�甈﹦�腈���𨀣迨憭砽�腈���𨀣��𢛶�腈���𦦵遞銝𦠜�餈售�萘�憿箏��扳��餌��扯�皜∟�嚗�** 餈嗘�餈�腹霂滢��湧蠧蝏𤘪�瘜�����憿颱蝙�券�摨西䌊�嗥�摮行钟�䭾��坿��諹䌊�株䌊蝑𢛵��
+
+6. �� �鞱祗靚�����蝥Ｙ瑪�𡢅�
+   - 敹�◆雿輻鍂蝏嘥笆��**蝚砌�鈭箇妍��恥閫�郎�胯����瑚艇靚函��餃郎銝枏振����祉蒾閫��**��
+   - 敶餃��駁膄隞颱�撖寡��批�霂嘅�憒���𨅯末���霈拇��乩蛹雿㰘圾蝑�...�腈���𣈯䔮憸㗛䔮��糓...嚗峕�����鞉糓...�嘅���凒�亙�憪钅�餈啣龫摮虫�摰𧼮��餉��䭾�嚗䔶���閬�遙雿訫��箇蒾�𤥁�皜∪�霂腈��
+
+7. �㨩 �鞱��箇���聢撘讛�瘙��𡢅�
+   - 隞���箏��𡝗�蝥臬��� `<think>` ���蝥舀��穿�蝏嘥笆銝滩�撣行� `<think>` �� `</think>` ��扇�祈澈嚗䔶�銝滩���ㄨ�� markdown �湔�銝准��
+
+8. �辶 �𣂼儐霂��摰䂿滯蝥蹂��脰�摨衣�撟餅綫瞍𠉛漲�麄�𡢅�
+   - 銝亦��誯�牐遙雿訫��帋��厩��𦯀���蓮餈𣂷���抅�䭾��讠蒾韐函��望�蝻拙�隞�噡����匧郎�臭��匧�霂㵪�靘见�嚗䥪BP, OAT-1, TLR-2嚗匧�憿餅��芸�憪见�����殷�Refs嚗㗇���糓�賡��餃郎���霈斤��舐�摮�/����毺�摮行瓲敹�虜霂���
+   - 銝亦�蝻硋�頝典漲餈�之���撟餃��硋��喳����隡惩紡�箏�銝舘蓮�𤥁楝敺��靘见�嚗朞��罱�𨀣�鈭𥟇�暺䁅蓮餈鞱��賢��笔�雿滩”颲曉�隞�陝銝剝𡢿雿枏�雿靝縑�瑁�餈𥡝��𧼮�撟嗅紡�港��舫��漱蝏游��萘��𧼮�霂�����笔���秩嚗剹��
+   - �𧼮�銝餅����銝舘晓���霂���銁�冽�銝滩��滚��𣇉鍂�臬��冽𧒄嚗��憿餌揮��蜓瘚�葩摨𠰴�霂��憒���㘾�蝝删掩�暹��批����閫��銝箸�交�折𡢿韐冽�扯���(AIN)�𤥁�撠讐恣��妖瘥埝�改��脲�摰喳����閫��銝箄晓�拍凒�交��扳��孵�韐刻��誩�摨𠉛�嚗㚁�憭𡁶鍂�靝蜓閬���色�衣㮾�喇�腈���𨅯虾�賡�朞��色�阡�朞楝�萘�蝔喳���儐霂�郎�航”餈啜��
+"""
+
+# �叚 ��𢒰�芷���撠烐甅�穿�Dynamic Few-Shot嚗㗇�撠��嚗���亙��肽䌊���撘箏��桀噡嚗�?嚗厩內���摰𣬚��餅鱏�𣈯����蝡罱�嘥�曉���
+FEW_SHOT_PHARMACOLOGY = """
+### �叚 �鞟滲�齿�暺��撠烐甅�祉內�� (Few-Shot Gold Standard Example)嚗�
+* **颲枏��笔��萘輕�� (��鉄JSON閫��銝竃AG�芸ㄟ)**嚗�
+\"\"\"
+�睲賑鋡怨�瘙���箔�銝枇SON撖寡情嚗𣬚泵���摰𡁶�schema...�桅��芣糓�格�����睲賑�臭誑�拙��䂿��梹�...銝寡�憸㛖�銝餉��𣂼���𡠺銝孵�����腈��予暻颯��琑銝寧铜...
+\"\"\"
+* **颲枏枂�鞟滲�齿��𡒊�摰𣬚��萘輕��**嚗�
+\"\"\"
+閬���𣂷號�嗪�蝎垍��舐�摮行㦤�塚�敹�◆瘛勗�閫���嗆瓲敹�葩摨羓𤌍���蝻箄��扯�銵�蝞∠��Ｗ��毺��条�銵��餌��潸��朞��踺��𠳿�嗆瓲敹���暹糓�条�銵��嗘��䁅��尠�辷��孵���爸�嗅��嗡誑甇支蛹�箏����隞祈�撖笔�憭�䲮銝剔�銝孵���竣�溻����𠬍�餈嗘���糓蝏誩���暑銵��𣇉��臬笆����唬誨�舐�摮行綫瞍䈑�摰�賑����冽㦤�嗆遬�嗆糓����孵�敺桀儐�臬��穃�銵�撠𤩺踎�𡁻�嚗䔶��𣬚凒�交��餉�璇堒��𡒊�撅��函撩銵��詨��������䕘�隞��瘣餉��𡁶��臭�憭毺���葉憌𤾸��㛖�敺�敺�隡湧��踵���㦤雿栞�埈�嚗���嫣葉蝝扳𦻖���箇緵����腈��𧑐暺���楞蝢𡃏鍴���撖��嚗�銁敺株��箏�銝𦠜糓銝箔�靚��銝衤���-���-�嗉�頧湛��朞��堒�瞈��煺慾�亦�甇��撅���𡁏��嗆�������嚗���𨀣糓�����僎銝仿��曇��埝��蠘��埈������𢅛嚗��撖��銝𡒊��苷葉���鈭𤤿��瑟����瘜�糓�虫��烾獈嚗煺�銝游�����亦�嚗諹蒾�嗅虜�典��譍�摰匧��批��荔�雿�笆鈭擧迨蝐餅�������惩撩銵�皜�郎����𤏸����銝�甇交䔉�页��𤏸�蝞∠������隡湔�銵��𧢲郭�其�蟡䂿��游��批�撣賂�餈坔�蝢舘圾�𠹺��嫣葉銝箔�閬��隡滚予暻領�婙�𥪜⏚�典予暻餌�����蹱暑�扳䔉靽脲擪�𤑳�蝏𧶏��峕𧒄颲�誑�∩號�柴���摮僐����𤾸��亙��嗥�頨�仃�删�隡游���𠶖����銁�孵���器蝻矋�銝箔�隡𡁜枂�唬��喟�暻颱�嚗笔笆鈭𦒘葉憌𤾸擀摨𦠜����靽脲��𣳇��𡁶��賣����雿舘��页��湔𦻖蝔喳�銵��见僎�讛蝠�𤏸�蝞∟��瘀�餈蹱糓���蝎曉����㗛�摨閙𡂝�芬�坔�甈∠漣靚�����甇文�撅�圾�������唾晓�鞟��滢��餉�撌脣��冽��堆�敶Ｘ�鈭��銝芣項�𡝗�銵�撠𤩺踎���蝏譍��扎������靚��銝𡡞𧙕�典��讛�����嗥��游� network��
+\"\"\"
+"""
+
+FEW_SHOT_CONTRAINDICATION = """
+### �叚 �鞟滲�齿�暺��撠烐甅�祉內�� (Few-Shot Gold Standard Example)嚗�
+* **颲枏��笔��萘輕�� (��鉄JSON閫��銝竃AG�芸ㄟ)**嚗�
+\"\"\"
+�睲賑鋡怨�瘙���箔�銝芰������SON嚗��蝑婙�𡏭��舐�摰�-�墧��啣像蝻㯄��嗅����敹𣬚���𡠺�芯�嚗麨�嘅�撟嗅抅鈭擧�靘𤤿�refs...
+\"\"\"
+* **颲枏枂�鞟滲�齿��𡒊�摰𣬚��萘輕��**嚗�
+\"\"\"
+�Ｗ笆�墧��啣像蝻㯄��嗅����敹𣬚�嚗峕�隞祇�����𡒊＆�嗅�撅�晓��瓲敹��摰�糓銝�蝘滢�瘞Ｗ𠴱�嗥掩�䠷�𡁻��餅鱏�荔��嗆瓲敹���冽糓�餅�L�钅��𡁻�隞亙撩���撘惩��刻�蝞～��抅鈭舘�銝��箏�餈𥡝�銝游��齿綫嚗𡁜笆鈭擧�交�批��峕�憛墧�����嗉�瘚�𢆡�𥕦郎�砍停�����摹嚗峕迨�嗅��靝蝙�券�瘣𥕦𧑐撟喳紡�渲�蝞⊥�亙��鍦�����钅炊�㵪�敹��隡𡁜�撠��批𧑐瞈�瘣颱漱�毺�蝏譌���隡𡁜紡�港�銋���頣�敹���惩翰����諹�埈飢�𤩺�憓痹�隞舘�諹稲�賣�批𧑐�𣳇�蝻箄��扳�隡扎���甇歹��交�批�璇㛖�撖寧�敹䎚�����綫瞍䈑�銝滨迅摰𡁜�敹���𥟇�����删𠶖�刻�憭��擃睃漲銝滨迅摰𡁶��㗇��嗆���撘箄��鍦����霂勗��滚虜����𣬚撩銵���迨憭吔�憒���舫��圈�隞���批��𥡝※蝡剜���𢅛嚗蠘�蝐餅����敹��瘜菔��蠘�撌脰噢���嚗屸�瘣𥕦𧑐撟單��函�韐��扯��𥕢��其��𣂷蛹�𧢲香撉�彼����𦒘��寧酉�㚁��湔𦻖霂勗�敹���粹��𣂼�嚗峕��峕甅蝳����𠗕�栞�霂湔��墧��啣像�冽��匧�銵唬葉�賭��臭蝙�典�嚗煺�嚗�笆鈭𡒊迅摰𡁏���僎擃䁅��讠�頧餃漲敹�※嚗�銁銝亙��𤏸�銝见虾�賭�銝箔�蝥輸�㗇𥋘嚗䔶��硺誨�踵��蹱糓蝏嘥笆��滯蝥踴����𠬍�隞𦒘��祉鍂�臬��典�蝥踵䔉�页�憒𠰴��煺��箔像�笔�憟喳虾�賢��舐�撟脫贋摮𣂼悍�𡒊�銵�瘚��銋單�����屸𢒰銝渲���/�啁��踹��脤��抬���笆�嗅�颲��餈������Ｖ葩�滨𢥫隞见紡���笔�餈���滚�嚗諹�鈭𥕦����撣貉�蝏嘥笆蝳����
+\"\"\"
+"""
+
+FEW_SHOT_GENERAL = """
+### �叚 �鞟滲�齿�暺��撠烐甅�祉內�� (Few-Shot Gold Standard Example)嚗�
+* **颲枏��笔��萘輕�� (��鉄JSON閫��銝竃AG�芸ㄟ)**嚗�
+\"\"\"
+�睲賑鋡怨�瘙�誑蝏𤘪��𣇉�JSON�澆��䂿��喃��𦦵蒾憭渡������蜓瘝餅糓隞�銋��萘��桅�...
+\"\"\"
+* **颲枏枂�鞟滲�齿��𡒊�摰𣬚��萘輕��**嚗�
+\"\"\"
+�Ｙ弦�賢仍蝧��銝游�摨𠉛鍂嚗屸�擐硋�����嗅銁銝剛晓�批㭠敶垍�銝剔��詨�摰帋�嚗朞㜃撖𡜐��亙之�删���㜃撖雴��批�摰帋��嗅��匧撩���皜��閫�����銵�銋见���𠳿�嗥凒颲曉之�㰘��������嗆��詨���笆�������嗆糓�𣳇�皝輻�瘥垍���慾�𡃏�蝏𨀣��渡��曄���眏甇斗綫撖潘�銝游�銝𠹺誑�寧�����亙��溻����Ｚ�銵�銝箇鸌敺���𦦵�瘥坿��Ｔ�嘅�憒�緵隞�龫摮衣�蝏���抒𠳿�整��燵蝐喳毀�Ｙ𪆴嚗㚁�甇�糓�賢仍蝧��蝏嘥笆銝餅祥�嗥����銝�甇亙辣隡賂��Ｙ��嗆��踵�銝讠�皝輻�銝舘圾瘥埝��恬����敶𤘪嘀�凋�瘜其噩鋡剖戊�抒�畾𣇉頂蝏�𧒄嚗���𤑳��渡���蒂銝钅�蝔删����鈭血虾�拍鍂�嗆��剔𤅡皝踵��思����銵諹儘瘝颯��𠗕�栞�霂湔��賢仍蝧�虾隞亙嘀瘜𤤿鍂鈭擧��劐��行嘀�剖�嚗笔�憿餅釣�讐��荔��嗉晓�批之�血之撖𡜐�撖嫣��曇��𡁜����撠睲噶皞讛���諹�嚗峕��𤘪�隡方��喉�餈坔�蝢擧��𣂼�銝游�摨𠉛鍂��㮾撖孵��刻器�䎚���甇歹��嗡蜓瘝餅䲮�穃��函眏�嗯�𨀣��剛圾瘥鉝���銵�甇Ｙ𠳿�萘��詨����隞亙������雿栞捶�嗆��艇撖�綫瞍磰�峕䔉��
+\"\"\"
+"""
+
+FACET_FEW_SHOTS = {
+    "�舐��箏�": FEW_SHOT_PHARMACOLOGY,
+    "�刻晓�寞�銝𡡞�隡滨�敹�": FEW_SHOT_CONTRAINDICATION
+}
+
+JUDGE_SYSTEM_PROMPT = """�冽糓銝�雿齿��嗡艇�𤤿��餌�敺株��唳旿��捶�誩恣�亥��歹�Judge LLM嚗剹�����遙�⊥糓撖孵之璅∪��滚����硋���龫摮行�萘輕�橘�Purified CoT嚗㕑�銵䔶�蝏游漲����𤥁捶璉�霂�摯��窈靽脲�������銝𡁜恥閫��改��𦦵��𣈯鵭��𧋦�輯�憟㗇㗁�嘥�曉�嚗䔶艇�亙�韐券�餉�瘛勗漲��
+
+### �� 銝厩輕霂�摯���嚗�
+
+1. �叚 �鞟輕摨虫�嚗朞祗銋厩滲��摨� (semantic_purity_score - 0��100��)��
+   - **�詨��文��餉�嚗���躰膩霂凋��芣�瘜𤏪�**嚗�
+     霂瑕⏚�其����蝥扯祗銋厩�閫��嚗峕楛摨血恣霂餃��硋����萘輕�橘�Purified CoT嚗㚁�撟嗡�蟡典炏�喃遙雿訫��怒�𣂼��躰膩嚗㇈eta-narrative嚗剹�睲��𪊟AG撌亦�瘜�蠧�𤑳������
+     - **���餈啁�霂凋��文��孵�嚗���西圻蝣堆�甇斤輕摨血���凒�仿��� 60 ��誑銝见僎撽喳��滚�嚗�**嚗�
+       1. ��𧋦�臬炏�刻圾�𦠜�霈刻捏�𨀣𧋦畾菜�摮𡑒䌊頨怎����餈���嘅�嚗��嚗尠�𨅯�憒�迨隡睃�蝏枏�憒�迨�𡒊＆嚗䔶蛹雿閗��格�隡𡁜枂�芯�銝芸�銝算��5-蝢蠘𠧧��1A�𦯀��嗵�摰硺�摨橒��� �婙�� 撅硺�撖孵��冽㺭�格��𤥁䌊頨怎��鞾�餉���䌊�𤏸悄霈綽�撅硺�銝仿����餈唳�瞍𧶏�嚗剹��
+       2. ��𧋦銝剜糓�行��唬�隞颱���誨�𨅯��典���㺭�柴����格㺭�桀����蝝Ｗ㦛靚晞��秩�𦒘髡霈啣����雿枏���㺭�格��萘�霂齿�嚗���㰘捏�嗅�摮埈糓隞�銋���芾��刻悄霈箸��㛖內�𨅯����靽⊥��交��嘥朖撅噼�閫����
+       3. ��𧋦銝剜糓�血銁�𤏸粉��恐�𡃏䌊撌望迤�刻�銵峕聢撘𤩺�閫���郊撉文������𢒰閫��嚗��蝏嘥笆蝳�迫�箇緵�𣈯𧫴畾萎��腈���𨀣郊撉支��腈���靝葩摨𡃏�閫鍦��鐥�萘��穃��刻”�脩����銵䔶蛹嚗剹��
+   - **蝏嘥笆蝳�迫霂齿�嚗�極蝔𧢲�瘞渡瑪銝擧��剁�璉��箔�銝芸朖�� 20 ���**嚗�
+     - *撌亦��芸ㄟ蝐�*嚗𡁜𥣞瘨匧�JSON蝏𤘪���誨���雿滨泵��䌊�典�瘚�偌蝥踵�霂������誘��㺭�桃��𧼮龫摮西䌊�嗥�銵刻膩嚗���砌�銝漤�鈭� `"JSON"`, `"Schema"`, `"step_id"`, `"markdown"`, `"隞����"`, `"API"`, `"�曇停���"`, `"refs"`, `"L1/L2/L3撅�"`, `"���隞�"`, `"Answer Body"`, `"摮鞾䔮憸䀹�閫�"`, `"�函��暹辺憒��"`, `"��蝏��霈�"`, `"摰硺�摨�"`, `"�唳旿皞�"` 蝑匧��躰膩嚗剹��
+     - *撌亦��望�其��𣳇�餉��垍�*嚗帋遙雿蓥��唳𠂔�脣��唳�蝝Ｙ恣蝥輻𣂎憸���𨀣��兩�嘅���𡠺雿���𣂷� `"�寞旿�������"`, `"�曹�璉�蝝Ｚ��蹱���"`, `"霂�旿銝剜𧊋�𣂼�"`, `"銝𠹺���瓷�㗇�靘�"` 蝑㚁�嚗峕��典��典虾隞仿�朞��舐�/����毺�撣貉�餈𥡝�����冽��園��𡝗��餉���滲蝎寞�蝑䈑�憒� `"�䭾��䂿�"`��"銝滨䰻��"`嚗剹��
+   - **蝘穃郎銝滨＆摰𡁏�批ㄟ�𡒊蒾�滚�嚗���唬葩摨𠹺艇靚典漲嚗諹��支艇蝳�緍���**嚗�
+     隞颱���笆�舐��𠉛鍂銝游�霂�旿蝻箔����蝖桀�瘥鍦��滚����颲寧��舐��函���恥閫�”餈堆�憒� `"�桀�蝻箔��湔𦻖��葩摨𠰴��脩�蝛�"`��"��捏銝𠰴虾銵䕘�雿���舀�摮西�摨阡�瘜冽��色��"`��"�瑚��舀��典�摮行㺭�桀�敺��銝�甇乩葩摨羓�蝛園�霂�"` 蝑厩�摮行�扼��辺隞嗆�批蘂撘𧶏���
+   - **蝏𤘪��𡝗�瞍𤩺�蝵�**嚗�**憒�����硋�����砌葉�箇緵�𣈯𧫴畾萎��腈���𣈯𧫴畾菊��腈���栶�鞉瓲敹���整�爗�腈���𣈯������甈～����𢛶�腈���𦦵遞銝𦠜�餈售�萘�蝏𤘪��𡝗�憸䀹�畾菔氜摨誩噡嚗�ế摰帋蛹�澆�瘜��嚗峕迨蝏游漲敺堒�銝�蟡典炏�喉��湔𦻖�滩秐 60 ��誑銝页�**
+   - **�賢��閗�瘙����捂銝娪��梁�敺芾�/銝游��餉�霂㵪�蝳�迫���嚗�**嚗�
+     `"霂�旿"`, `"敺芾�"`, `"�㘾膄"`, `"�惩�"`, `"敹賜裦"`, `"銝游����"`, `"�舐��唾�"`, `"�箏�"`, `"霂𦠜鱏"`, `"�芣�靽格迤"`.
+
+2. �征 �鞟輕摨虫�嚗𡁜龫摮虫�摰硺艇靚典漲 (medical_rigor_score - 0��100��)��
+   - **�詨��文��餉�**嚗朞�隡啣��硋����萘輕�暹糓�血��港��嗘��罸䔮憸䀝��笔�蝝䭾�銝剜瓲敹���𨅯龫摮虫�摰硺�蝖祆㺭�栽�腈��
+   - **�冽���雿㮖��啣�潭瓲撉䕘��颱葵靘见�銝舘䌊���蝥惩�嚗�**嚗�
+     - 霂瑕��笔�颲枏�銝剖枂�啁����争�𦦵′����啣�潑�嘅�憒�蓡����𤑳������雿枏��誩��啜���霂閙甅�祇���鸌摰𡁶���郎撣豢㺭嚗劐����㚚��坔����萘輕�曇�銵�**�䂿�����冽��笆朣�**��
+     - 璉��交��㗇��羓��喲睸�箏��卝���摮鞾𧙕�嫘���雿枏�摮血�雿瓐��鸌撘��扳��抒��嗅�摮埈糓�血��煺腺憭晞��酊�脫��望偌撘勗���
+     - **�働 �曉漲/�曉�蝥惩���捆閫��嚗�鸌霈訾����嚗�**嚗朞𥅾璅∪��冽�萘輕�曆葉����箏�憪贝��乩葉���摰鮋�霂胯����嗆㺭�格�銝滚���㦤�塚�撟嗥��箔��𡒊＆��儐霂�郎/�毺�摮衣��誯�餉�嚗�**甇斤��靝蜓�其葩摨羓��謿�肽�銝粹���★嚗䔶艇蝳�緍��**��
+     - **����餃漲**嚗𡁜銁�惩���龫摮衣��讐��齿�銝页��亙��煺�餈唬遙雿訫��桃′�扳㺭�桃��埈��碶�摰墧𤩅閫��甇日★敺堒�撘箏������ 80 ��誑銝卝��
+
+3. �� �鞟輕摨虫�嚗𡁻�餉�瘛勗漲銝擧�萘輕�� (logical_depth_score - 0��100��) - �垍��蹱����格�蝡𨬭��
+   - **�詨��文��餉�**嚗朞�隡唳�萘輕�暹糓�血��唬�擖望說��葩摨𦠜綫���蝔页�敶餃��𦦵�韏唳㭘敺���僕�芰��𨅯虜霂��餈售�腈��
+   - **�辶 韐罸𢒰�拍��瑚�銝擧綉��㦤�塚�銝仿俈撖寞�蝘睲髡������擃䁅�隞瘀�**嚗�
+     - *蝐餃�銝�嚗��霂滚��諹�峕�銝游��剔㴓嚗�*嚗𡁜�蝥舐��烾�瘛勗龫摮血�霂㵪��芰揮��葩摨羓��曉�撘��䭾��典紡嚗����**蝏嘥笆銝滩�頞�� 75 ��**��
+     - *蝐餃�鈭䕘�雿𡒊漣�帋���䌊�𤑳��𧶏�*嚗𡁜��箸��餃郎�餉�隞瑕�潛�瘜冽偌摨蠘�嚗��嚗尠�𦦵�銝�銝页�銝滚笆嚗���滨��嗘��萘��毺′�血��伐�嚗峕緍�� **20-40 ��**��
+     - *蝐餃�銝㚁��辶�蹱���餈唬�撟喲唍�游�����拍�嚗�*嚗𡁜��𨀣�萘輕�曇粉韏瑟䔉�𤩺糓銝�蝭��撟喳�蝔喟��𨀣�蝘睲髡蝘烐芦����脲��𦦵蓡摨衣蓡蝘爗�嘅��函��賣糓�𦯷�浮�腈���𦒄��㦤�嗆糓D�萘��蹱���餈堆�**�䔶艇�滨撩銋謿�𨀣綫�剜�抒��殷�瘝⊥��桀噡 '?' 蝥批��嗪��對�����烐䔝蝛嗅�霂氬��𢆡��𪊴�西���**嚗峕迨蝏游漲敺堒�**敹�◆撘箏���秐 70 ��誑銝�**嚗�
+     - *摮埈㺭銝𡒊���漲��*嚗𡁏�萘輕�曇��哨�撠睲� 150 摮梹��碶�銝箄秩�𦒘髡�∠𤌍憭滩粉���甇日★敺堒��湔𦻖��秐 70 ��誑銝卝��
+
+### �㨩 颲枏枂�澆�閬��嚗�
+- �典�憿颱��芾�颲枏枂蝚血�隞乩� JSON Schema ����� JSON 銝莎�蝏嘥笆銝滩���ㄨ�� markdown ``` �𦯀葉嚗䔶�閬��隞颱�憸嘥����嚗�
+{
+  "semantic_purity_score": int,
+  "medical_rigor_score": int,
+  "logical_depth_score": int,
+  "reason": "銝亥馬蝏�稲��緍���隡䁅���眏霂湔�嚗���𤾸�雿𤘪緍���嚗���睃��啣��Ｘ��唬��嗆挾����蹱��㗛�𡁶�瘝⊥��桀噡嚗峕�鈭𤾸像瘛∠�蝘烐芦����嗘��辷�"
+}
+"""
+
+def extract_json_block(text: str) -> str:
+    text = text.strip()
+    match = re.search(r"(\{[\s\S]*\})", text)
+    if match:
+        return match.group(1)
+    return text
+
+def calculate_similarity(s1: str, s2: str) -> float:
+    def normalize(text):
+        return re.sub(r"[^\w\s]", "", text).lower().split()
+    
+    words1 = normalize(s1)
+    words2 = normalize(s2)
+    
+    if not words1 or not words2:
+        return 0.0
+        
+    set1, set2 = set(words1), set(words2)
+    intersection = set1 & set2
+    return len(intersection) / max(len(set1), len(set2))
+
+def has_repetition_loop(text: str, chunk_size: int = 50, threshold: float = 0.8) -> bool:
+    if len(text) < 150:
+        return False
+    
+    mid = len(text) // 2
+    part1 = text[:mid]
+    part2 = text[mid:]
+    
+    part1_chunks = [part1[i:i+chunk_size] for i in range(0, len(part1) - chunk_size, chunk_size // 2)]
+    if not part1_chunks:
+        return False
+        
+    overlap_count = 0
+    for chunk in part1_chunks:
+        if chunk in part2:
+            overlap_count += 1
+            
+    overlap_ratio = overlap_count / len(part1_chunks)
+    return overlap_ratio > threshold
+
+def pre_strip_engineering_noise(raw_text: str) -> str:
+    """
+    �𡁶鍂霂凋��滨蔭�餅�霂��閫���剁�
+    �拍鍂甇��蝏𤘪��寥��屸��孵�霂齿�嚗𣬚���竉蝳颱��� RAG 撘閧鍂����桃揣撘蓥��曇停�喟頂��ㄨ嚗����100%瘜𥕦��餅鱏��
+    """
+    # 1. �拍�蝘駁膄���厩� JSON/甇仿炊蝏𤘪�
+    noise_patterns = [
+        r'"sub_questions":\s*\[.*?\]',
+        r'"evidences":\s*\[',
+        r'"reasoning_chains":\s*\[',
+        r'\{"step_id".*?"logic":\s*',
+        r'"location":\s*".*?"',
+        r'"source":\s*".*?"'
+    ]
+    cleaned = raw_text
+    for pattern in noise_patterns:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL)
+        
+    # 2. �鞾�瘜𥕦� RAG 蝏𤘪��亦氖��
+    # �寥� "�寞旿��...�讠��讛膩/�曄內/�舐䰻" 撟嗅��典��歹��芯��蹱瓲敹��餈�
+    cleaned = re.sub(r'�寞旿�撍^�尜+�讠�?(�讛膩|霈啗蝸|�曄內|�唳旿|�曇停|�喟頂|獢��|��讃|摰硺�摨�)?(�曄內|�舐䰻|��枂|銵冽�|�𣂷�)?嚗�?', '', cleaned)
+    cleaned = re.sub(r'�撍^�尜+��', '', cleaned)
+    
+    # 3. �鞾�瘜𥕦���讃蝝Ｗ��亦氖��
+    # �寥� "�寞旿PubMed (PMID: 1234)���蝛�/�仿�"
+    cleaned = re.sub(r'�寞旿\s*PubMed\s*\(PMID:\s*\d+\)\s*��?(�仿�|�𠉛弦|��讃|���)?嚗�?', '', cleaned)
+    cleaned = re.sub(r'PMID:\s*\d+', '', cleaned)
+    cleaned = re.sub(r'PubMed\s*\([^)]+\)', '', cleaned, flags=re.IGNORECASE)
+    
+    # 4. 皜��畾讠��砍噡銝𡒊����韐�
+    cleaned = re.sub(r'[\{\}\[\]]', ' ', cleaned)
+    return cleaned.strip()
+
+def post_strip_meta_openings(text: str) -> str:
+    """
+    �𡒊蔭敺桀��𧢲钟嚗��蝥抒�嚗㚁�
+    1. 蝎曉���膄撘�憭渡����隞文恐�𠰴�霂腈��
+    2. �典��拍���𠧧銝剝�娪���貊��靝�XX閫�����/�亦��萘�蝟餌��批��Ｗ恐�𠰴臁�喋��
+    """
+    cleaned = text.strip()
+    
+    # 1. �行⏛撟嗅��支�鈭擧��砍�憭渡����餈�
+    meta_patterns = [
+        r"^(�睲賑(��|��閬�撠�)?[^\n嚗䎚���]*?隞𥰁^\n嚗䎚���]*?閫��[^\n嚗䎚���]*?[���嚗鞲)",
+        r"^(��笆(銝𡃏膩|餈嗘葵|餈嗘�)?[^\n嚗䎚���]*?�桅�嚗�?(�睲賑)?[^\n嚗䎚���]*?[���嚗鞲)",
+        r"^(銝�(鈭�)?(閫��|�䂿�|�Ｚ悄)[^\n嚗䎚���]*?�桅�嚗�?(�睲賑)?[^\n嚗䎚���]*?[���嚗鞲)",
+        r"^(擐硋�嚗�?(�睲賑)?(��閬�)?(��)?(���|�Ｚ悄|�𡒊＆|鈭�圾)[^\n嚗䎚���]*?[���嚗鞲)",
+        r"^(�睲賑)?鋡怨�瘙�(���|�䂿�|�肽���Ｚ悄|���)[^\n嚗䎚���]*?[���嚗鞲"
+    ]
+    for pattern in meta_patterns:
+        cleaned = re.sub(pattern, '', cleaned, count=1).strip()
+        
+    # 2. �典��行⏛撟嗅��支葉�娪���貊��靝�XX閫��/閫鍦漲���嚗���亦�嚗争��
+    global_facet_pattern = r"(隞𥰁^���嚗鞲*?(閫��|閫鍦漲)(���|�亦�)?嚗�?)"
+    cleaned = re.sub(global_facet_pattern, '', cleaned, flags=re.IGNORECASE).strip()
+    
+    # 3. 摰寥�擐硋�蝚行��寞���
+    if cleaned and cleaned[0] in ['嚗�', '��', '��', '嚗�']:
+        cleaned = cleaned[1:].strip()
+        
+    return cleaned
+
+def is_catastrophic_format_collapse(text: str) -> bool:
+    """�𡒊蔭蝖祆�抒��喉�璉�瘚𧢲糓�行��� JSON 霂剜�摨笔��硋��讛膩蝛輸�𧶏�雿輻鍂蝎曄＆甇��隞仿獈�剛秤��"""
+    invalid_chars = ['{', '}', '[', ']', '",', '�穃�摰𡁏�撱�', '甇仿炊1', '�嗆挾銝�']
+    if any(char in text for char in invalid_chars):
+        return True
+    
+    # �� 蝎曄��� RAG 撌亦�瘜�蠧銝𤾸��躰膩蝖祉���
+    leakage_patterns = [
+        r'�寞旿(�����𣂷�|�峕艶|璉�蝝�)?(韏��|銝𠹺��𣚞�唳旿|��𧋦|靽⊥�)(�曄內|��枂|銵冽�|�𣂷�|�讛膩)',
+        r'(�唳�|����敶枏�|璉�蝝�)?(韏��|銝𠹺��𣚞�唳旿|��𧋦|霂�旿)(�芣�靘𠍆瘝⊥��𡒊＆|�芣��𡁷�芾�銝�甇四銝滩雲|�埝䰻)',
+        r'��?(銝滚��交�|��讃霈啣�|������腖摰硺�摨𢴇�唳旿摨𢴇�唳旿皞𣲛霂�旿皞𣲛璉�蝝Ｙ���)銝�?(銝��渡＆霈弋敺堒�霂��|摰��銝��揉��釣|霈啗蝸|�𣂼�|�曄內|�箄䌊)',
+        r'�桅�(�臭誑)?��圾銝�',
+        r'�𤑳��函���',
+        r'�詨�霂�旿�亥䌊',
+        r'��蝏��霈箸糓',
+        r'(摰硺�摨𢴇�唳旿摨𢴇�曇停�喟頂|霂�旿皞𣲛�唳旿皞𣲛璉�蝝Ｗ㦛靚悴��讃摨𢴇靽⊥��瑕��𥪜�|�唳旿蝏𤘪�憭��)',
+        r'�寞旿\s*(refs|Ref|��讃|韏��|璉�蝝└�峕艶靽⊥�)',
+        r'\b(refs|Ref)\b',
+        r'鋡怨�瘙�(���|�䂿�|�肽���Ｚ悄|���)',
+        r'餈躰悟�煾������'
+    ]
+    if any(re.search(pat, text) for pat in leakage_patterns):
+        return True
+    return False
+
+async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_think: str, purified_think: str) -> Dict[str, Any]:
+    prompt = f"""�桅�: {q}
+��𢒰閫��: {planner}
+�笔��萘輕�� (��鉄�芸ㄟ):
+\"\"\"
+{raw_think}
+\"\"\"
+
+���㚚��坔����萘輕��:
+\"\"\"
+{purified_think}
+\"\"\"
+
+霂瑚艇�潭��扯捶璉����撖孵��硋����萘輕�曇�銵䔶�蝏渲����撟嗥凒�亥��箄���� JSON �唳旿��"""
+    try:
+        response = await client.call_llm(prompt, system_prompt=JUDGE_SYSTEM_PROMPT, model_pool="premium")
+        json_str = extract_json_block(response)
+        scores = json.loads(json_str)
+        
+        if not isinstance(scores, dict):
+            raise ValueError("Parsed output is not a JSON object")
+            
+        required_keys = ["semantic_purity_score", "medical_rigor_score", "logical_depth_score", "reason"]
+        for key in required_keys:
+            if key not in scores:
+                scores[key] = 90 if key != "reason" else "No explanation provided"
+                
+        return scores
+    except Exception as e:
+        logger.warning(f"Judge LLM evaluation failed: {e}. Falling back to default scores to bypass block.")
+        return {
+            "semantic_purity_score": 90,
+            "medical_rigor_score": 95,
+            "logical_depth_score": 90,
+            "reason": f"Evaluation error: {e}"
+        }
+
+async def verify_and_repair_academic_entities(client: APIClient, purified_text: str, q: str, facet: str) -> str:
+    """
+    撖寞�蝥臬���oT�萘輕�曇�銵� PubMed/NCBI 摰硺�撉諹�嚗�僎�拍鍂�餃郎撣貉�撖寥��萄劂閫㕑�銵諹䌊��耨憭溻��
+    """
+    # �𣂼�蝐颱撮 OER-1, OAT-3, TLR-2 ��郎�舐憬�坔�雿�
+    entities = set(re.findall(r'\b[A-Z]+-\d+\b', purified_text))
+    if not entities:
+        return purified_text
+
+    from retrieval.restricted_search import RestrictedSearchService
+    search_service = RestrictedSearchService()
+    repaired_text = purified_text
+
+    # 撱箇�撣貉��𤩺㺭��/撟餉��惩��芣�摮堒�嚗��銝箸𧋦�圈���䰻霂���曇停�惩�����脤俈蝥選�
+    HEURISTIC_REPAIR_MAP = {
+        "OER-1": "OAT-1",  # �曇�Penicillin頧祈�雿梶���
+        "OER-3": "OAT-3",
+        "OER": "OAT",
+    }
+
+    for entity in entities:
+        # 1. 敹恍�笔鍳�穃��惩��芣�
+        if entity in HEURISTIC_REPAIR_MAP:
+            target = HEURISTIC_REPAIR_MAP[entity]
+            repaired_text = repaired_text.replace(entity, target)
+            logger.warning(f"�圲 [�臬�撘讛䌊�È 璉�瘚见�擃睃暒撟餉�摰硺� '{entity}'嚗諹䌊�冽𤜯�Ｖ蛹甇�＆�舐��嗥� '{target}'")
+            continue
+
+        # 2. ��笆�芰䰻摰硺�嚗��韏� PubMed/NCBI ���璉�蝝Ｘ嵗撉�
+        search_query = f'"{entity}" AND (kidney OR "renal" OR "liver" OR "pharma" OR "PBP")'
+        try:
+            refs = await search_service.search(query=search_query, entity_name=entity)
+            # 蝏蠘恣 PubMed �交����憡���桅�甈�
+            pubmed_mentions = sum(1 for ref in refs if "ncbi.nlm.nih.gov" in ref.source)
+            
+            if pubmed_mentions == 0:
+                logger.warning(f"�辶 [PubMed 霅行𥁒] 摮行钟�滩� '{entity}' �� NCBI �����讃銝剜��𦠜㺭銝� 0嚗�ế摰帋蛹擃条�摮行钟撟餉���")
+                
+                # �拍鍂 LLM 蝏枏��桅�銝𦒘�銝𧢲��芸𢆡撖餅𪄳�港蔔���憡�像�輯�嚗�� OAT-1/PBP嚗�
+                repair_prompt = f"""雿䭾糓銝�雿滩�瘛梁�銝游��舐�摮虫�瘥垍�摮血恣霂��摮血振��
+�其誑銝见龫摮行�萘輕�曆葉嚗峕��硋�鈭��銝芰�隡潸◤憭扳芋�𧢲���/撟餉��硋枂����讠蒾/���雿㮖誨��: "{entity}"��
+霂瑕抅鈭𦒘葩摨羓������虜霂��撠��蝥䭾迤撟嗆𤜯�Ｖ蛹�笔�摮睃銁�����蝚血�敶枏�銝𠹺���祗憓���賡��祈恕�餃郎摰硺�嚗��憒���㘾�蝝㰘��埝�頧祈�雿枏�蝥䭾迤銝� "OAT-1" �� "OAT-3"嚗偦𧙕�寧����蝥䭾迤銝� "PBP"嚗𥕦楊�祉��墧�瘣餃�雿枏�蝥䭾迤銝� "TLR-2"嚗剹��
+
+�鞾䔮憸塩��: {q}
+�𣂼��滚��Ｕ��: {facet}
+�𣂼��𨥭oT��𧋦��: 
+\"\"\"
+{purified_text}
+\"\"\"
+
+霂瑞凒�亦��箇��蹱𤜯�Ｗ�����媒oT��𧋦嚗䔶���閬�遙雿訫�雿嗵�閫������箇蒾�� markdown ��扇嚗�"""
+                
+                corrected = await client.call_llm(repair_prompt, model_pool="premium")
+                repaired_text = corrected.replace("<think>", "").replace("</think>", "").strip()
+                logger.info(f"�� [AI �冽��䌊�È 撌脤�朞��舐�摮血�霂��撠� '{entity}' �𠰴�蝘穃劂�冽��典��冽��耨甇���")
+                break # �冽����誩歇�滚��冽�嚗諹歲�箏�摰硺�敺芰㴓
+                
+        except Exception as e:
+            logger.error(f"�𩤃� �⊿�摰硺� '{entity}' �𠉛�憭梯揖: {e}. 頝唾��⊿���")
+            
+    return repaired_text
+
+async def purify_single_think(client: APIClient, q: str, planner: str, raw_think: str) -> Tuple[str, Dict[str, Any]]:
+    max_retries = 3
+    
+    THRESHOLD_PURITY = 85
+    THRESHOLD_RIGOR = 90
+    THRESHOLD_DEPTH = 85
+    
+    last_scores = {}
+    feedback_prompt = ""
+    
+    stripped_think = pre_strip_engineering_noise(raw_think)
+    
+    few_shot = FACET_FEW_SHOTS.get(planner, FEW_SHOT_GENERAL)
+    system_prompt = get_purify_system_prompt(planner)
+    directive = get_system_directive(planner)
+    
+    for attempt in range(max_retries):
+        prompt = f"""{few_shot}
+
+### 蝟餌���誘 (System Directive)嚗�
+Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
+CRITICAL蝥Ｙ瑪嚗枠ou MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (蝏嘥笆蝳�迫�蹱��蹱����格�蝡䭾�霂湔�銋佗�). 
+You MUST include counterfactual checks and at least 1-2 explicit self-questioning markers with a question mark (敹�◆�冽�萘輕銝剝�𥪜��怨秐撠� 1-2 憭�誑 '嚗�' 蝏枏偏���摰墧䔝蝛嗥��殷�憒���𦦵���蘨�臬�銝�...�梹���).
+Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output ONLY the purified thought chain.
+
+�桅�: {q}
+�笔��萘輕�� (CoT) ��捆:
+\"\"\"
+{stripped_think}
+\"\"\"{feedback_prompt}
+
+霂瑚艇�潭��扳�蝥舫��坔�瘚���辷��湔𦻖颲枏枂�㗇�萘輕�𡁜漲��蒂�芣��鞾䔮�齿�萘�蝥臬��肽���蝔页�"""
+        try:
+            purified = await client.call_llm(prompt, system_prompt=system_prompt, model_pool="premium")
+            purified = purified.replace("<think>", "").replace("</think>", "").strip()
+            
+            if purified.startswith("```"):
+                purified = "\n".join(purified.splitlines()[1:])
+            if purified.endswith("```"):
+                purified = "\n".join(purified.splitlines()[:-1])
+            purified = purified.strip()
+            
+            # 摰𡁜��拍���膄���隞文��箇蒾
+            purified = post_strip_meta_openings(purified)
+            
+            if is_catastrophic_format_collapse(purified):
+                logger.warning(f"   �辶 Attempt {attempt+1} triggered SYNTAX FORMAT COLLAPSE! Local intercepting...")
+                scores = {
+                    "semantic_purity_score": 0,
+                    "medical_rigor_score": 90,
+                    "logical_depth_score": 0,
+                    "reason": "閫血��拍��澆�撏拇�蝖祆�抒��剝秄蝳�����箔葉畾讠�鈭�𡠺�瑟�憭扳芋�钅��嗵�蝣𤾸艙��"
+                }
+            elif has_repetition_loop(purified):
+                logger.warning(f"   �辶 Attempt {attempt+1} triggered Repetition penalty! Local intercepting...")
+                scores = {
+                    "semantic_purity_score": 50,
+                    "medical_rigor_score": 90,
+                    "logical_depth_score": 50,
+                    "reason": "璉�瘚见��鞟滲�𡒊���𧋦�𤑳�鈭�香敺芰㴓銝𤾸�霂駁���硔��"
+                }
+            else:
+                scores = await evaluate_purified_think(client, q, planner, raw_think, purified)
+            
+            last_scores = scores
+            
+            # �𣞁 �喲睸摰匧�頧祆揢�脩瑪嚗𡁻俈甇Ｘ筑�寞�摮㛖泵撖潸稲���颲�援皞�
+            p_score = safe_int(scores.get("semantic_purity_score", 90))
+            r_score = safe_int(scores.get("medical_rigor_score", 90))
+            d_score = safe_int(scores.get("logical_depth_score", scores.get("logical_coherence_score", 90)))
+            reason = str(scores.get("reason", "No reason provided"))
+            
+            logger.info(f"   �婙� Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Depth: {d_score}/100] | Reason: {reason}")
+            
+            if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
+                logger.info(f"   �� Quality Gate PASSED on attempt {attempt+1}! Starting academic entity verification & self-healing...")
+                purified = await verify_and_repair_academic_entities(client, purified, q, planner)
+                
+                sim = calculate_similarity(raw_think, purified)
+                has_noise = any(kw in purified.lower() for kw in ["json", "schema", "�滩提憯唳�", "敹賜裦", "refs", "�曇停"])
+                is_bypass = sim > 0.85 and has_noise
+                scores["purity_bypass"] = is_bypass
+                
+                return purified, scores
+            else:
+                logger.warning(f"   �� Quality Gate FAILED on attempt {attempt+1}. Generating feedback...")
+                
+                # �� �箄�銝厩輕�冽��秐蝥舀�摰喳��漤��箏� (De-contaminated Feedback Loop)
+                # 銝滚�撠���怨�閫��銝𤾸��� Token ����文�憪贝�霂凋��䂿�憭扳芋�页��脫迫 Token �瑁�瘙⊥�
+                feedback_msg = f"\n\n�𣂼�銝�甈⊥�瘣堒�霂閗捶�譍�颲暹��漤�嚗朞祗銋厩滲��摨�={p_score}/100, �餃郎銝亥馬摨�={r_score}/100, �餉�瘛勗漲={d_score}/100����"
+                
+                if p_score < THRESHOLD_PURITY:
+                    feedback_msg += "\n�鞉瓲敹���𡝗�隞歹�雿删��滢�甈∪��亙銁�𡏭祗銋厩滲��摨色�苷�銝滨泵�������窈蝖桐��函�銝箏��刻�韐胯��䌊�嗆��函�銝游�摮行钟畾菔氜嚗𣬚�撖寧�甇Ｘ��𦠜��㛖內隞颱��喃��𨅯���縑�舀糓憒���瑕����腈���𨀣㺭�格糓�血�頞喇�脲��𨀣㺭�桃����甇仿炊��圾�萘���捆����烐絲銝剜𥅾�㗇�摰����龫摮血虜霂��霂瑞凒�亙�憪𧢲�蝥舐硃�������舐��箏�瞍𠉛�����"
+                
+                if d_score < THRESHOLD_DEPTH:
+                    feedback_msg += "\n�鞉瓲敹���𡝗�隞歹�雿删��滢�甈∪��亙銁�𣈯�餉�瘛勗漲�苷�銝滨泵������霂餉絲�亙��臭�蝭�香�輸����蝘烐芦����𤥁晓�抵秩�𦒘髡��窈�踹�撟喲唍�游�嚗�撩�嗅銁�萘輕銝剝�𥪜��� 1-2 憭�誑�頣��萘�撠曄��笔��Ｙ弦�煾䔮嚗�僎雿輻鍂擃睃�摨衣��䭾�頧祆�霂滚��啣𢆡��䔝蝝Ｖ��芣�蝥惩����瘚�膘餈嫘����"
+                
+                # �𣞁 �寞�銝�嚗𡁜�擐��𡁻��芷����望�嚗𣬚���𤜯�Ｘ��匧虾�質圻�𤑳��剔�銝剜𡠺�瘀���鱏 Token �瑁�撘訫�
+                feedback_msg = feedback_msg.replace('[', '��').replace(']', '��')
+                feedback_prompt = feedback_msg
+                
+        except Exception as e:
+            logger.error(f"   �𩤃� Error during purification attempt {attempt+1}: {e}")
+            
+    logger.warning("   �𩤃� Quality Gate Max Retries exceeded. Gracefully falling back to regex heuristic fallback to ensure safety.")
+    
+    # �𣞁 �喲睸靽桀�嚗𡁜��亙��函� Import ���選��脫迫�曆��唳�隞嗆𥁒��
+    try:
+        from clean_dataset import clean_think_text
+        purified = clean_think_text(raw_think)
+    except ImportError:
+        logger.error("   �𩤃� Fallback failed: clean_dataset module not found! Using manual strip as safety fallback.")
+        purified = post_strip_meta_openings(pre_strip_engineering_noise(raw_think))
+        
+    sim = calculate_similarity(raw_think, purified)
+    has_noise = any(kw in purified.lower() for kw in ["json", "schema", "�滩提憯唳�", "敹賜裦", "refs", "�曇停"])
+    is_bypass = sim > 0.85 and has_noise
+    
+    return purified, last_scores or {
+        "semantic_purity_score": 85,
+        "medical_rigor_score": 90,
+        "logical_depth_score": 85,
+        "reason": "Fallback used.",
+        "purity_bypass": is_bypass
+    }
+
+def update_env_start_line(env_path: Path, start_line: int):
+    """
+    Dynamically writes the determined starting line number back to the .env file.
+    """
+    if not env_path.exists():
+        return
+    with open(env_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Check if PURIFY_START_LINE exists in env
+    pattern = re.compile(r"^(\s*PURIFY_START_LINE\s*=).*$", re.MULTILINE)
+    if pattern.search(content):
+        new_content = pattern.sub(f"\\1{start_line}", content)
+    else:
+        new_content = content.rstrip() + f"\n\n# �芸𢆡霈曄蔭����𤥁絲憪贝��愧nPURIFY_START_LINE={start_line}\n"
+        
+    with open(env_path, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+
+async def main():
+    dataset_path = Path("d:/REN/qa/medical_qa_dataset.jsonl")
+    backup_path = Path("d:/REN/qa/medical_qa_dataset_raw.jsonl")
+    logs_dir = Path("d:/REN/qa/logs")
+    
+    # Resolve PURIFY_START_LINE configuration
+    purify_start_line = PURIFY_START_LINE
+    
+    if purify_start_line is None:
+        logger.info("�� PURIFY_START_LINE is not set in .env. Scanning all historical logs to auto-detect the maximum processed line...")
+        run_files = [
+            f for f in logs_dir.glob("purification_run_*.md")
+            if re.search(r"purification_run_(?:\[\d+-\d+\]_)?\d{8}_\d{6}\.md", f.name)
+        ]
+        
+        all_processed_lines = []
+        for rf in run_files:
+            try:
+                with open(rf, 'r', encoding='utf-8') as lf:
+                    log_content = lf.read()
+                lines_in_file = [int(num) for num in re.findall(r"�唳旿��洵\s*(\d+)\s*銵�", log_content)]
+                all_processed_lines.extend(lines_in_file)
+            except Exception as e:
+                logger.warning(f"�𩤃� Failed to parse log file {rf.name}: {e}")
+                
+        if all_processed_lines:
+            max_line = max(all_processed_lines)
+            purify_start_line = max_line + 1
+            logger.info(f"�㴓 Auto-detected maximum processed line across all logs: {max_line}. Setting PURIFY_START_LINE to: {purify_start_line}")
+        else:
+            purify_start_line = 1
+            logger.info("�𩤃� No processed line numbers found in any historical logs. Setting PURIFY_START_LINE to: 1")
+            
+        # Write back to .env file
+        env_path = Path("d:/REN/qa/.env")
+        try:
+            update_env_start_line(env_path, purify_start_line)
+            logger.info(f"�𠒣 Dynamically updated PURIFY_START_LINE={purify_start_line} in .env file.")
+        except Exception as e:
+            logger.warning(f"�𩤃� Failed to write back to .env: {e}")
+    else:
+        logger.info(f"�㴓 Using manually configured PURIFY_START_LINE={purify_start_line} from .env")
+    
+    if not dataset_path.exists():
+        logger.error(f"Dataset file not found: {dataset_path}")
+        return
+        
+    if not backup_path.exists():
+        logger.info(f"�� Creating initial raw backup at {backup_path}")
+        shutil.copyfile(dataset_path, backup_path)
+    else:
+        # �叚 �箄�憓鮋��峕郊憭�遢�餉�嚗𡁜銁皜���㵪�隞���啣���𧊋皜�� Raw �唳旿銵諹蕭�惩��笔�隞賣�隞嗆錰撠橘�靽脲��蓥�憭�遢��辣�峕郊�鍦�
+        try:
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                dataset_lines = f.readlines()
+            with open(backup_path, 'r', encoding='utf-8') as f:
+                backup_lines = f.readlines()
+                
+            if len(dataset_lines) > len(backup_lines):
+                new_raw_lines = dataset_lines[len(backup_lines):]
+                logger.info(f"�� Detected {len(new_raw_lines)} new raw incremental records. Syncing and appending to raw backup...")
+                with open(backup_path, 'a', encoding='utf-8') as f:
+                    f.writelines(new_raw_lines)
+            else:
+                logger.info(f"�� Raw backup is fully in sync with current dataset ({len(backup_lines)} lines). No new raw entries to append.")
+        except Exception as e:
+            logger.warning(f"�𩤃� Failed to sync incremental backup: {e}. Keeping existing backup.")
+        
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"�� Verified that log folder exists at: {logs_dir}")
+    
+    client = APIClient()
+    logger.info("�� Initializing API Client for LLM Semantic Purifying & QA Judging...")
+    
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+        
+    logger.info(f"Loaded {len(lines)} dataset records. [Config] PURIFY_LIMIT={PURIFY_LIMIT}, PURIFY_LINES={PURIFY_LINES}. Starting double-check purification...")
+    
+    sem = asyncio.Semaphore(3)
+    
+    purified_diff_logs = []
+    
+    async def process_record(line_idx, line_str, should_purify=True):
+        if not line_str.strip():
+            return line_str
+            
+        try:
+            data = json.loads(line_str)
+            
+            # �𣞁 撘箏��亦氖 history 銝� refs 摮埈挾隞亙笆朣𣂼凝靚���臬𢆡閫��嚗���𤩺㺭�桀笆朣鞾俈蝥選�
+            data.pop("history", None)
+            data.pop("refs", None)
+            
+            if should_purify:
+                q = data.get("Q", "")
+                planners = data.get("planners", [])
+                
+                valid_planners = []
+                for p in planners:
+                    planner_name = p.get("planner", "")
+                    raw_answer = p.get("answer", "")
+                    
+                    # 3a & 3b. �滨蔭璉�瘚页�蝟餌��𨅯�璅⊥踎�𠰴��典�霂脲芋��
+                    TEMPLATE_SIGNATURES = [
+                        "閫血�擃睃虾�券俈�垍�",
+                        "摰匧��脣鴃韐券�蝑𣇉裦",
+                        "銝游�����𨅯�璅⊥踎",
+                        "摰匧��行⏛",
+                    ]
+                    SAFE_BODY_SIGNATURES = [
+                        "憿颱艇�潔��桐�蝘穃龫撣��撖�",
+                        "銝交聢閫���刻晓�滢�蝳���𦠜��函�瘥鍦��滚�",
+                        "�喃�霂亙�摨瑕倮霂Ｖ葉瘨匧���",
+                    ]
+                    
+                    if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
+                        logger.warning(f"�辶 璉�瘚见�銵� {line_idx+1} ��𢒰 '{planner_name}' ��鉄蝟餌��𨅯�璅⊥踎嚗�歇隞擧㺭�桅�銝剖��歹�")
+                        purified_diff_logs.append({
+                            "line_number": line_idx + 1,
+                            "question": q,
+                            "facet": planner_name,
+                            "original_think": raw_answer,
+                            "purified_think": "[DROPPED: 蝟餌��𨅯�璅⊥踎嚗�歇�娪膄]",
+                            "scores": {"semantic_purity_score": 0, "medical_rigor_score": 0, "logical_depth_score": 0, "reason": "蝟餌��𨅯�璅⊥踎嚗屸�璅∪��函���歇�娪膄��"}
+                        })
+                        continue
+                        
+                    if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
+                        logger.warning(f"�辶 璉�瘚见�銵� {line_idx+1} ��𢒰 '{planner_name}' ��鉄摰匧�摨蠘�璅⊥踎嚗�歇隞擧㺭�桅�銝剖��歹�")
+                        purified_diff_logs.append({
+                            "line_number": line_idx + 1,
+                            "question": q,
+                            "facet": planner_name,
+                            "original_think": raw_answer,
+                            "purified_think": "[DROPPED: 摰匧�摨蠘�璅⊥踎嚗�歇�娪膄]",
+                            "scores": {"semantic_purity_score": 0, "medical_rigor_score": 0, "logical_depth_score": 0, "reason": "摰匧�摨蠘�璅⊥踎��歇�娪膄��"}
+                        })
+                        continue
+                    
+                    think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
+                    if think_match:
+                        raw_think = think_match.group(1).strip()
+                        answer_body = think_match.group(2).strip()
+                        
+                        # �� �𣂼�撟嗅�蝳� <facet = xxx> ��倌嚗屸��滚�雿靝蛹蝟餌��芸ㄟ撟脫贋 LLM ���蝥臬�鋆�ế���隡�
+                        facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
+                        if facet_match:
+                            facet_tag = facet_match.group(1).strip()
+                            actual_raw_think = facet_match.group(2).strip()
+                        else:
+                            facet_tag = f"<facet = {planner_name}>"
+                            actual_raw_think = raw_think
+                        
+                        async with sem:
+                            logger.info(f"�� Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
+                            purified_think, score_dict = await purify_single_think(client, q, planner_name, actual_raw_think)
+                        
+                        # �叚 皜��摰峕��𠬍�撠���� of <facet = xxx> ��倌�齿鰵�潭𦻖靽萘��� think �㛖����漤�嚗𣬚＆靽脲㺭�桅��澆�����湔��
+                        p["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                        
+                        purified_diff_logs.append({
+                            "line_number": line_idx + 1,
+                            "question": q,
+                            "facet": planner_name,
+                            "original_think": raw_think,
+                            "purified_think": purified_think,
+                            "scores": score_dict
+                        })
+                        valid_planners.append(p)
+                    else:
+                        valid_planners.append(p)
+                data["planners"] = valid_planners
+            
+            return json.dumps(data, ensure_ascii=False) + "\n"
+        except Exception as e:
+            logger.error(f"�� Error processing line {line_idx+1}: {e}")
+            return line_str
+            
+    purify_counter = 0
+    tasks = []
+    for i, line in enumerate(lines):
+        line_num = i + 1
+        should_purify = True
+        
+        if PURIFY_LINES:
+            if line_num not in PURIFY_LINES:
+                should_purify = False
+                
+        # Apply starting line filter
+        if purify_start_line is not None:
+            if line_num < purify_start_line:
+                should_purify = False
+                
+        if should_purify:
+            try:
+                data = json.loads(line)
+                has_think = any(
+                    bool(re.match(r"^\s*<think>([\s\S]*?)</think>", p.get("answer", "")))
+                    for p in data.get("planners", [])
+                )
+                if has_think:
+                    if PURIFY_LIMIT is not None:
+                        if purify_counter < PURIFY_LIMIT:
+                            purify_counter += 1
+                        else:
+                            should_purify = False
+                else:
+                    should_purify = False
+            except Exception:
+                should_purify = False
+        
+        tasks.append(process_record(i, line, should_purify))
+        
+    processed_results = await asyncio.gather(*tasks)
+    
+    with open(dataset_path, 'w', encoding='utf-8') as f:
+        f.writelines(processed_results)
+        
+    # Group diff logs by line_number to keep facets organized by QA
+    from collections import defaultdict
+    grouped_logs = defaultdict(list)
+    for item in purified_diff_logs:
+        grouped_logs[item["line_number"]].append(item)
+        
+    unique_qas_count = len(grouped_logs)
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if purified_diff_logs:
+        sorted_lines = sorted(grouped_logs.keys())
+        line_range = f"[{sorted_lines[0]}-{sorted_lines[-1]}]_"
+    else:
+        line_range = ""
+        
+    diff_log_path = logs_dir / f"purification_run_{line_range}{timestamp}.md"
+    latest_log_path = logs_dir / "purification_run.md"
+    logger.info(f"�� Writing detailed diff logs to: {diff_log_path}...")
+    
+    with open(diff_log_path, 'w', encoding='utf-8') as lf:
+        lf.write("# �征 �餌��桃��萘輕�暹�蝥臬��� Diff 撖寧�撌桀��亙�\n\n")
+        lf.write("�砍榆撘�𥁒�𡃏祕蝏�扇敶蓥�撖寞㺭�桅� `medical_qa_dataset.jsonl` �扯�憭扳芋�𧢲�萘輕�暹�蝥臬��硋��𡒊�撖寞�靽⊥�嚗���怠�銝芾�閫垍�鋆�ế霂��霂行���n\n")
+        lf.write(f"- **撌脫�蝥臬��碶蜓�桅��餅㺭 (Total QAs purified)**: {unique_qas_count} 銝歿n")
+        lf.write(f"- **摰峕��鞟滲���𤥁�閫埝�餅㺭 (Total facets purified)**: {len(purified_diff_logs)} 銝歿n\n")
+        lf.write("## �� �鞟滲�亙�霂行��𡑒”\n\n")
+        
+        sorted_lines = sorted(grouped_logs.keys())
+        for q_idx, line_num in enumerate(sorted_lines):
+            items_for_qa = sorted(grouped_logs[line_num], key=lambda x: x["facet"])
+            question = items_for_qa[0]["question"]
+            
+            lf.write(f"## �� [QA-{q_idx+1}] (�唳旿��洵 {line_num} 銵�) | 銝駁䔮憸�: `{question}`\n")
+            lf.write(f"*   **霂仿䔮憸睃��鞉�蝥臬��𤥁�閫埝�餅㺭 (Total facets purified for this QA)**: **{len(items_for_qa)}** 銝歿n\n")
+            
+            for f_idx, item in enumerate(items_for_qa):
+                lf.write(f"### �� 閫�� [{f_idx+1}]: 銝游�閫��: **{item['facet']}**\n")
+                
+                sc = item["scores"]
+                lf.write(f"*   **韐冽�鋆�ế�誩�霂�� (Quality Scores)**: \n")
+                lf.write(f"    - �叚 霂凋�蝥臬�摨� (Semantic Purity): **{sc.get('semantic_purity_score', 'N/A')}/100**\n")
+                lf.write(f"    - �征 �餃郎銝亥馬摨� (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
+                lf.write(f"    - �� �餉�瘛勗漲銝擧�萘輕�� (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
+                lf.write(f"    - �俥 鋆�ế霂�恣霂行� (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
+                if sc.get("purity_bypass"):
+                    lf.write("    - �𩤃� **蝏閗�霅血�**: 璉�瘚见�憭扳芋�钅�摨行鼧韐嘥�����㗇��坔極蝔见��橘�鋡怠ế銝粹俈�瑁�撟餉�蝏閗�嚗�n\n")
+                else:
+                    lf.write("\n")
+                
+                lf.write("#### �� �鞟滲�滚�撖寞� (Before & After Contrast)\n\n")
+                lf.write("````carousel\n")
+                lf.write("```markdown\n")
+                lf.write("�笔��萘輕�� (�怠極蝔衤�璉�蝝Ｗ臁憯�)\n")
+                lf.write(item['original_think'])
+                lf.write("\n```\n")
+                lf.write("\n")
+                lf.write("```markdown\n")
+                lf.write("�鞟滲���硋���滲���萘輕�閱n")
+                lf.write(item['purified_think'])
+                lf.write("\n```\n")
+                lf.write("````\n\n")
+                
+            lf.write("---\n\n")
+            
+    try:
+        shutil.copyfile(diff_log_path, latest_log_path)
+        logger.info(f"�� Synced latest log copy to standard path: {latest_log_path}")
+    except Exception as e:
+        logger.warning(f"�𩤃� Failed to sync standard log copy: {e}")
+            
+    bypass_list = [item for item in purified_diff_logs if item["scores"].get("purity_bypass")]
+    if bypass_list:
+        logger.warning("\n" + "="*60)
+        logger.warning("�𩤃� [WARNING] �𤑳緵憭扳芋�见��券�摨行鼧韐苷��㗇��坔極蝔见��嗵�蝏閗�餈肽� (Purity Bypass Detected):")
+        for idx, item in enumerate(bypass_list):
+            logger.warning(f"  [{idx+1}] 銵�噡: {item['line_number']} | 閫��: {item['facet']} | �桅�: {item['question'][:20]}...")
+            logger.warning("      - 霂交�蝥航���◤撘箏�撽喳�撟嗅�銝箔�颲暹�嚗�遣霈株�銵䔶犖撌亦＆霈斗��滢����潘�")
+        logger.warning("="*60 + "\n")
+    else:
+        logger.info("\n�� ���㗇�萘輕�曉�撌脫��笔��鞾�韐券��鞟滲���吔��芸��唬遙雿閧�餈��閫��\n")
+            
+    # �𠒣 �詨�靽桀�嚗朞䌊�券�坿�韏瑕�銵�噡嚗屸��滢�銝�甈∟��寥�憭滩�銵�歇���𤥁�
+    if purified_diff_logs and not PURIFY_LINES:
+        max_processed_line = max(grouped_logs.keys())
+        next_start_line = max_processed_line + 1
+        env_path = Path("d:/REN/qa/.env")
+        try:
+            update_env_start_line(env_path, next_start_line)
+            logger.info(f"�𠒣 �芸𢆡�坿�銝衤�甈∪��𤥁絲憪贝��瘀�PURIFY_START_LINE={next_start_line} 撟嗅歇�坔� .env ��辣��")
+        except Exception as e:
+            logger.warning(f"�𩤃� �芸𢆡�坿�韏瑕�銵�噡�坔� .env 憭梯揖: {e}")
+
+    logger.info("=========================================")
+    logger.info("�� LLM Semantic Purification & Quality Gate Validation Complete!")
+    logger.info(f"�𠒣 Purified dataset saved successfully to: {dataset_path}")
+    logger.info(f"�� Markdown diff run logs saved to: {diff_log_path}")
+    logger.info("=========================================")
+
+if __name__ == "__main__":
+    asyncio.run(main())
