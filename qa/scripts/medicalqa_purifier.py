@@ -35,6 +35,51 @@ def safe_int(val: Any, default: int = 90) -> int:
     except (ValueError, TypeError):
         return default
 
+# 🟢 全局进程内缓存，防止在提纯大规模语料时由于高频出现相同别扭标签导致 API 成本与延迟激增
+_SMOOTHED_PLANNER_CACHE = {}
+
+async def smooth_planner_term(client: APIClient, planner: str) -> str:
+    """
+    利用 LLM 零样本自适应平滑机器拼接的别扭切面名称，使其转换为规范的人类学术术语。
+    """
+    planner_clean = planner.strip()
+    if not planner_clean:
+        return planner_clean
+        
+    if planner_clean in _SMOOTHED_PLANNER_CACHE:
+        return _SMOOTHED_PLANNER_CACHE[planner_clean]
+        
+    prompt = f"""你是一个顶级医学名词规范化专家。你的任务是把上游机器学习自动拼接或生造的、不合常理、别扭的“非人类医学标签”实时平滑、翻译并规范化为“符合医学专家日常口吻的自然专业术语”。
+
+### 🛠️ 规范化红线：
+1. 直接输出规范化后的短语，绝对不要包含任何解释、标点符号、Markdown 格式或前言后语。
+2. 保持原有的核心医学/药理学/文献学含义不变。
+3. 必须使用人类医学、药理学或文献学中高频、自然的专业词汇。
+
+### 📐 转换示范 (Few-shot Examples)：
+- 输入: "古籍收采" -> 输出: "中医药典籍源流与文献考证"
+- 输入: "包装形式" -> 输出: "药物包装规格与形态特征"
+- 输入: "指标偶联监测" -> 输出: "多指标联合动态临床监测"
+- 输入: "剂量调整" -> 输出: "临床给药剂量调整方案"
+
+现在，请规范化以下标签：
+输入: "{planner_clean}" -> 输出: """
+
+    try:
+        response = await client.call_llm(prompt, model_pool="premium")
+        smoothed = response.strip().replace('"', '').replace("'", "").replace("“", "").replace("”", "")
+        # 对非正常回复进行校验和兜底
+        if not smoothed or len(smoothed) > 20 or "输入" in smoothed or "输出" in smoothed:
+            logger.warning(f"⚠️ Paraphrase result abnormal: '{smoothed}' for '{planner_clean}'. Falling back.")
+            smoothed = planner_clean
+        else:
+            logger.info(f"✨ [AI Paraphrase] Smoothed raw planner '{planner_clean}' -> '{smoothed}'")
+            _SMOOTHED_PLANNER_CACHE[planner_clean] = smoothed
+        return smoothed
+    except Exception as e:
+        logger.error(f"⚠️ Failed to smooth planner term '{planner_clean}': {e}. Falling back.")
+        return planner_clean
+
 def get_system_directive(planner: str) -> str:
     """根据视角（Planner）动态生成特异性引导，杜绝硬编码偏置"""
     directives = {
@@ -416,9 +461,12 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     
     stripped_think = pre_strip_engineering_noise(raw_think)
     
+    # 🌟 方案2：利用 LLM 零样本自适应平滑机器拼接的别扭切面名称，引入在体缓存防止 API 消耗与延迟
+    smoothed_planner = await smooth_planner_term(client, planner)
+    
     few_shot = FACET_FEW_SHOTS.get(planner, FEW_SHOT_GENERAL)
-    system_prompt = get_purify_system_prompt(planner)
-    directive = get_system_directive(planner)
+    system_prompt = get_purify_system_prompt(smoothed_planner)
+    directive = get_system_directive(smoothed_planner)
     
     for attempt in range(max_retries):
         prompt = f"""{few_shot}
@@ -427,7 +475,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
 Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
 CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
 You MUST include counterfactual checks and at least 1-2 explicit self-questioning markers with a question mark (必须在思考中途加入 1-2 处以“？”结尾的真实探究疑问与假说排查).
-Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output ONLY the purified thought chain.
+Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. Output ONLY the purified thought chain.
 
 问题: {q}
 原始思维链 (CoT) 内容:
@@ -466,7 +514,7 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
                     "reason": "检测到提纯后的文本发生了大面积死循环与复读退化（Repetition Collapse），这在思维链微调语料中属于致命缺陷。请确保重构后的思维链推导流畅，不包含任何长段落的复读复印！"
                 }
             else:
-                scores = await evaluate_purified_think(client, q, planner, raw_think, purified)
+                scores = await evaluate_purified_think(client, q, smoothed_planner, raw_think, purified)
             
             last_scores = scores
             
@@ -480,7 +528,7 @@ Do NOT output the word 'facet' or the facet name '{planner}' in the text. Output
             
             if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
                 logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}! Starting academic entity verification & self-healing...")
-                purified = await verify_and_repair_academic_entities(client, purified, q, planner)
+                purified = await verify_and_repair_academic_entities(client, purified, q, smoothed_planner)
                 
                 sim = calculate_similarity(raw_think, purified)
                 has_noise = any(kw in purified.lower() for kw in ["json", "schema", "免责声明", "忽略", "refs", "图谱"])
