@@ -1,51 +1,38 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import json
-import random
-import re
 import logging
 from typing import List, Dict, Any, Tuple
 from api_client import APIClient
-from models import FacetPlan, FacetQAOutput
-import prompts
-import config
+from core.pipeline_workflow import PipelineWorkflow
+from strategies.redundancy_filter.llm_filter import LLMRedundancyFilterStrategy
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("MedicalQA.PipelineProxy")
 
+# Re-export parse functions to keep compatibility
 def extract_json_block(text: str) -> str:
-    """
-    Robustly extracts JSON content from text, even if wrapped in markdown fences.
-    """
+    from api_client import APIClient
+    # Fallback import locally if needed
+    import re
     text = text.strip()
-    # Remove markdown code blocks if present
     match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
     if match:
         text = match.group(1).strip()
-    
-    # Locate the outer boundaries of the JSON block
     first_brace = text.find('{')
     first_bracket = text.find('[')
-    
     start = -1
     end = -1
-    
     if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
-        # Starts with an object
         start = first_brace
         end = text.rfind('}')
     elif first_bracket != -1:
-        # Starts with an array
         start = first_bracket
         end = text.rfind(']')
-        
     if start != -1 and end != -1 and end > start:
         return text[start:end+1]
-        
     return text
 
 def parse_json_safely(text: str, default_value: Any = None) -> Any:
-    """
-    Attempts to safely parse JSON from raw LLM responses.
-    """
     clean_text = extract_json_block(text)
     try:
         return json.loads(clean_text)
@@ -54,357 +41,42 @@ def parse_json_safely(text: str, default_value: Any = None) -> Any:
         return default_value
 
 class MedicalQAPipeline:
+    """
+    Surgically elegant backward-compatible Proxy Pipeline representing the 
+    legacy MedicalQAPipeline interface, routing execution to modularized Workflow.
+    """
     def __init__(self, api_client: APIClient):
         self.api_client = api_client
+        if api_client is not None:
+            self.workflow = PipelineWorkflow(
+                llm_service=api_client.llm_service,
+                graph_service=api_client.graph_service,
+                redundancy_filter=LLMRedundancyFilterStrategy(api_client.llm_service)
+            )
 
     async def _prepare_context_and_refs(self, graph_data: Dict[str, Any], query: str = "") -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-        """
-        Converts Knowledge Graph response (entities & relationships) into context and reference blocks.
-        Additionally performs clinical Guideline Grounding by injecting authoritative rules from the local DB.
-        """
-        entities = graph_data.get("entities", []) or []
-        relationships = graph_data.get("relationships", []) or []
-        
-        context_list = []
-        refs = []
-        
-        # Phase 4 Guideline Grounding Injection using Tiered Retrieval orchestrator
-        from retrieval.retrieval_manager import RetrievalManager
-        retrieval_mgr = RetrievalManager()
-        
-        # Format entities
-        for entity in entities:
-            name = entity.get("name", "未命名实体")
-            ent_type = entity.get("type", "普通实体")
-            description = entity.get("description", "暂无描述").strip()
-            ent_id = entity.get("id", "")
-            
-            context_str = f"医疗实体【{name}】（类型: {ent_type}）：{description}"
-            source_str = f"《图谱实体集:{name}》"
-            
-            item = {
-                "context": context_str,
-                "source": source_str,
-                "entity_id": str(ent_id)
-            }
-            context_list.append(item)
-            refs.append({
-                "context": f"概念定义: {name} (类型: {ent_type}) - {description}",
-                "source": f"refs:《实体库:{name}》"
-            })
-            
-            # Clinical Guideline Grounding matched via 3-tiered retrieval (Local -> API -> Restricted Search)
-            try:
-                tiered_refs, tier_label = await retrieval_mgr.get_grounding_references(query, name)
-                logger.info(f"Tiered Grounding match found for '{name}' via [{tier_label}]: injecting {len(tiered_refs)} reference items.")
-                for r_item in tiered_refs:
-                    refs.append(r_item)
-            except Exception as e:
-                logger.error(f"Failed to fetch tiered retrieval grounding for entity '{name}': {e}")
-            
-        # Format relationships
-        for rel in relationships:
-            src = rel.get("sourceName", "")
-            tgt = rel.get("targetName", "")
-            relation = rel.get("relationship", "")
-            strength = rel.get("relationshipStrength", 10)
-            
-            context_str = f"关联关系：【{src}】与【{tgt}】之间存在关联【{relation}】（强度: {strength}）"
-            source_str = f"《图谱关系集:{src}-{tgt}》"
-            
-            item = {
-                "context": context_str,
-                "source": source_str
-            }
-            context_list.append(item)
-            refs.append({
-                "context": f"知识关联: 【{src}】 --({relation})--> 【{tgt}】",
-                "source": f"refs:《图谱关系:{src}-{tgt}》"
-            })
-            
-        retrieval_mgr.close()
-        return context_list, refs
+        return await self.workflow._prepare_context_and_refs(graph_data, query)
 
     async def generate_initial_question(self, context_list: List[Dict[str, str]], task_id_label: str = "") -> str:
-        """
-        Generate multiple questions from context and pick one randomly.
-        """
-        prompt = prompts.render_prompt(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
-        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}初始问题生成")
-        questions = parse_json_safely(response, [])
-        
-        if not questions:
-            # Fallback if generation failed
-            raise Exception("Failed to generate questions from context.")
-            
-        # Pick one randomly
-        selected_q = random.choice(questions)
-        logger.info(f"Generated {len(questions)} questions. Selected: '{selected_q}'")
-        return selected_q
+        return await self.workflow.generate_initial_question(context_list, task_id_label)
 
     async def plan_facets(self, query: str, task_id_label: str = "") -> List[str]:
-        """
-        Plan answering perspectives (facets) for a query using Pydantic schema constraints.
-        """
-        prompt = prompts.render_prompt(prompts.FACET_PLANNER_TEMPLATE, query=query)
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            # Enforce dynamic structured output using FacetPlan Pydantic model
-            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-            result: FacetPlan = await self.api_client.call_llm_structured(messages, FacetPlan, model_pool="premium", stage=f"{stage_prefix}视角切面规划")
-            # Extract list of facet values (strings) from Pydantic Enum list
-            facets = [f for f in result.facets]
-            logger.info(f"Planned initial facets strictly via Pydantic: {facets}")
-            return facets
-        except Exception as e:
-            logger.error(f"Failed to plan facets using Pydantic: {e}. Falling back to default list.")
-            return ["临床表现", "药理学机制"]
+        return await self.workflow.plan_facets(query, task_id_label)
 
     async def preprocess_facets(self, query: str, facets: List[str], task_id_label: str = "") -> List[str]:
-        """
-        Preprocess facets according to rules:
-        - If > 8: reduce to 8.
-        - If > 2 and < 8 (3 to 7): expand.
-        - Otherwise, do nothing.
-        """
-        count = len(facets)
-        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        if count > 8:
-            logger.info(f"Facet count {count} > 8. Running Facet Reducer...")
-            prompt = prompts.render_prompt(prompts.FACET_REDUCER_TEMPLATE, query=query, facets=facets)
-            response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}切面视角缩减过滤")
-            reduced_facets = parse_json_safely(response, [])
-            if len(reduced_facets) == 8:
-                return reduced_facets
-            else:
-                logger.warning(f"Reducer failed to output exactly 8 facets (got {len(reduced_facets)}). Capping original list.")
-                return facets[:8]
-                
-        elif 2 < count < 8:
-            logger.info(f"Facet count {count} is between 2 and 8. Running Facet Expander...")
-            prompt = prompts.render_prompt(prompts.FACET_EXPANDER_TEMPLATE, query=query, facets=facets)
-            response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}切面视角丰富扩充")
-            expanded_new = parse_json_safely(response, [])
-            
-            # Combine unique facets
-            combined = list(facets)
-            for f in expanded_new:
-                if f not in combined:
-                    combined.append(f)
-            logger.info(f"Expanded facets from {count} to {len(combined)} elements: {combined}")
-            return combined
-            
-        else:
-            logger.info(f"Facet count {count} does not require preprocessing.")
-            return facets
+        return await self.workflow.preprocess_facets(query, facets, task_id_label)
 
     async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, task_id_label: str = "") -> Tuple[str, str]:
-        """
-        Call the FacetGraph-QA Agent for a single perspective using L1-L3 Prompt Layering and FacetQAOutput Pydantic constraint.
-        Incorporates a dual-stage quality guardrail to filter safety refusals and few-shot pollution.
-        """
-        async with semaphore:
-            # 1. Load static System Meta Layer (L1)
-            system_prompt = prompts.L1_SYSTEM_META_TEMPLATE
-            
-            # 2. Render dynamic Task Execution Layer (L2) and dynamic Context Layer (L3)
-            task_prompt = prompts.render_prompt(prompts.L2_TASK_EXECUTION_TEMPLATE, facet=facet)
-            context_prompt = prompts.render_prompt(
-                prompts.L3_DYNAMIC_CONTEXT_TEMPLATE,
-                query=query,
-                refs=refs,
-                history=[]
-            )
-            user_prompt = f"{task_prompt}\n\n{context_prompt}"
-            
-            # 3. Assemble chat messages for role-based attention isolation
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-            
-            max_quality_attempts = 2
-            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-            
-            try:
-                result = None
-                is_passed = False
-                reason = ""
-                
-                # Structured output loop with quality check retries
-                for q_attempt in range(max_quality_attempts + 1):
-                    # Enforce structural decoding using FacetQAOutput model
-                    result: FacetQAOutput = await self.api_client.call_llm_structured(messages, FacetQAOutput, model_pool="premium", stage=f"{stage_prefix}切面深度问答 - {facet}")
-                    
-                    is_passed, reason = self._check_answer_quality(result.answer_body, getattr(result, "_reasoning_content", ""))
-                    if is_passed:
-                        break
-                    
-                    logger.warning(f"Quality Guardrail FAILED on structured QA attempt {q_attempt} for facet '{facet}': {reason}. Retrying...")
-                    
-                if not is_passed:
-                    # Trigger the exception block so that we go to fallback
-                    raise ValueError(f"Quality Guardrail failed repeatedly for structured output: {reason}")
-                
-                # 5. Extract native reasoning_content or build fallback artificial one
-                reasoning_content = getattr(result, "_reasoning_content", "")
-                
-                if reasoning_content:
-                    # Clean out duplicate XML tags if present
-                    cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
-                    think_block = f"<think><facet = {facet}>\n{cleaned_reasoning}\n</think>\n"
-                else:
-                    # Re-assemble reasoning details into standard `<think>` block for perfect backward compatibility
-                    evidences_str = "\n".join([
-                        f"[证据R{i+1}：来源={e.source}，定位={e.location}，要点={e.summary}]"
-                        for i, e in enumerate(result.evidences)
-                    ])
-                    
-                    reasoning_str = "\n".join([
-                        f"- {step.step_id}: {step.logic}"
-                        for step in result.reasoning_chains
-                    ])
-                    
-                    sub_questions_str = "\n".join([f"- {q}" for q in result.sub_questions])
-                    
-                    think_block = (
-                        f"<think><facet = {facet}>\n"
-                        f"问题拆解：\n{sub_questions_str}\n"
-                        f"证据清单：\n{evidences_str}\n"
-                        f"推理链：\n{reasoning_str}\n"
-                        f"最终结论摘要：\n- {result.final_conclusion_summary}\n"
-                        f"</think>\n"
-                    )
-                
-                # Reconstruct the expected response combining thinking with final answer body
-                response = think_block + result.answer_body
-                logger.info(f"Successfully generated structured and layered QA output for facet: {facet}")
-                
-            except Exception as e:
-                logger.error(f"Structured QA call failed or rejected for facet '{facet}': {e}. Triggering robust fallback.")
-                
-                # Fallback to standard textual completion with quality-based retry loop
-                fallback_prompt = f"{system_prompt}\n\n{user_prompt}"
-                
-                raw_response = ""
-                reasoning_content = ""
-                is_passed = False
-                reason = ""
-                
-                for fb_attempt in range(max_quality_attempts + 1):
-                    raw_response, reasoning_content = await self.api_client.call_llm_with_reasoning(fallback_prompt, model_pool="premium", stage=f"{stage_prefix}切面深度问答降级 - {facet}")
-                    
-                    check_body = raw_response
-                    if "</think>" in raw_response:
-                        check_body = raw_response.split("</think>")[-1].strip()
-                        if not reasoning_content and "<think>" in raw_response:
-                            parts = raw_response.split("</think>")[0].split("<think>")
-                            if len(parts) > 1:
-                                reasoning_content = parts[1].strip()
-                        
-                    is_passed, reason = self._check_answer_quality(check_body, reasoning_content)
-                    if is_passed:
-                        break
-                    logger.warning(f"Quality Guardrail FAILED on fallback QA attempt {fb_attempt} for facet '{facet}': {reason}. Retrying...")
-                
-                if not is_passed:
-                    logger.critical(f"Quality guard failed repeatedly for facet '{facet}'. DROPPING this facet (not injecting template).")
-                    return facet, None
-                
-                # Format check the raw response
-                if "<think>" in raw_response and f"facet =" not in raw_response:
-                    response = raw_response.replace("<think>", f"<think><facet = {facet}>")
-                elif not raw_response.startswith("<think"):
-                    if reasoning_content:
-                        cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
-                        response = f"<think><facet = {facet}>\n{cleaned_reasoning}\n</think>\n" + raw_response
-                    else:
-                        mock_think = f"<think><facet = {facet}>\n{facet}切面推理过程\n</think>\n"
-                        response = mock_think + raw_response
-                else:
-                    response = raw_response
-                    
-            return facet, response
+        return await self.workflow.answer_single_facet(query, facet, refs, semaphore, task_id_label)
 
     async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
-        """
-        Runs the QA Agent in parallel for all facets.
-        """
-        semaphore = asyncio.Semaphore(config.CONCURRENT_QA_LIMIT)
-        tasks = [self.answer_single_facet(query, facet, refs, semaphore, task_id_label=task_id_label) for facet in facets]
-        results = await asyncio.gather(*tasks)
-        
-        planners = []
-        for facet, answer in results:
-            if answer is None:
-                logger.warning(f"Facet '{facet}' was dropped due to quality guard failure. Excluding from dataset.")
-                continue
-            planners.append({
-                "planner": facet,
-                "answer": answer
-            })
-        return planners
-
-    async def detect_redundancy_and_filter(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
-        """
-        Call Facet Redundancy Detector to filter out redundant perspective answers.
-        """
-        prompt = prompts.render_prompt(prompts.FACET_REDUNDANCY_DETECTOR_TEMPLATE, query=query, planners=planners)
-        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}视角切面冗余度检测与去重过滤")
-        indices_to_remove = parse_json_safely(response, [])
-        
-        if not isinstance(indices_to_remove, list):
-            logger.warning(f"Redundancy detector returned invalid format: {response}. Skipping filtering.")
-            return planners
-            
-        logger.info(f"Redundancy detector indices to remove (0-indexed): {indices_to_remove}")
-        
-        filtered_planners = []
-        for i, p in enumerate(planners):
-            if i not in indices_to_remove:
-                filtered_planners.append(p)
-                
-        logger.info(f"Filtered planners: {len(filtered_planners)} out of {len(planners)} remaining.")
-        return filtered_planners
+        return await self.workflow.run_parallel_answers(query, facets, refs, task_id_label)
 
     async def synthesize_answers(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> str:
-        """
-        Synthesize filtered answers into a single cohesive final summary answer.
-        """
-        # Extract the pure answer body without <think> tags for synthesis input to avoid confusing the summarizer
-        answers_clean = []
-        for p in planners:
-            ans = p["answer"]
-            if "</think>" in ans:
-                parts = ans.split("</think>")
-                ans_body = parts[-1].strip()
-            else:
-                ans_body = ans.strip()
-            answers_clean.append(ans_body)
-            
-        prompt = prompts.render_prompt(prompts.MULTI_ANSWER_SYNTHESIS_TEMPLATE, query=query, answers=answers_clean)
-        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        summary = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}切面问答综合凝练")
-        logger.info("Successfully synthesized final answer summary.")
-        return summary
+        return await self.workflow.synthesize_answers(query, planners, task_id_label)
 
     async def generate_next_question(self, context_list: List[Dict[str, str]], history: List[Dict[str, Any]], previous_summary: str, task_id_label: str = "") -> str:
-        """
-        Generate the next logical question in a multi-round dialog.
-        """
-        prompt = prompts.render_prompt(
-            prompts.NEXT_QUESTION_TEMPLATE,
-            context_list=context_list,
-            history=history,
-            summary=previous_summary
-        )
-        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        next_q = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}多轮对话下一问生成")
-        next_q = next_q.strip().strip('"').strip("'")
-        logger.info(f"Generated next question: '{next_q}'")
-        return next_q
+        return await self.workflow.generate_next_question(context_list, history, previous_summary, task_id_label)
 
     async def generate_single_round(
         self, 
@@ -413,153 +85,15 @@ class MedicalQAPipeline:
         history: List[Dict[str, Any]] = None,
         task_id_label: str = ""
     ) -> Dict[str, Any]:
-        """
-        Execute a complete single round QA generation.
-        """
-        logger.info(f"--- Starting Round QA for Q: '{query}' ---")
-        
-        # 1. Plan facets
-        initial_facets = await self.plan_facets(query, task_id_label=task_id_label)
-        if not initial_facets:
-            initial_facets = ["临床表现", "药理学机制"]
-            
-        # 2. Preprocess facets (reduction / expansion)
-        final_facets = await self.preprocess_facets(query, initial_facets, task_id_label=task_id_label)
-        
-        # 3. Parallel answer generation
-        planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
-        
-        # 4. Redundancy filter
-        non_redundant_planners = await self.detect_redundancy_and_filter(query, planners, task_id_label=task_id_label)
-        if not non_redundant_planners:
-            # Fallback in case everything got filtered
-            non_redundant_planners = planners
-            
-        # 5. Synthesize final answer
-        summary = await self.synthesize_answers(query, non_redundant_planners, task_id_label=task_id_label)
-        
-        round_data = {
-            "Q": query,
-            "planners": non_redundant_planners,
-            "history": list(history) if history else [],
-            "summary": summary
-        }
-        return round_data
+        return await self.workflow.generate_single_round(query, refs, history, task_id_label)
 
     async def generate_multi_round_dataset(self, intent: Dict[str, Any] = None, task_id_label: str = "") -> Dict[str, Any]:
-        """
-        Executes a 3 to 8 round dialog flow, generating and nesting QA rounds.
-        Upgraded to Intention-Guided Graph-RAG (Phase 4), merging high-quality clinical themes to isolate intent context.
-        """
-        log_prefix = f"[{task_id_label}] " if task_id_label else ""
-        # Determine random number of rounds
-        import os
-        num_rounds = int(os.getenv("NUM_ROUNDS", 1))
-        logger.info(f"{log_prefix}=== Starting Multi-Round Generation: {num_rounds} Rounds ===")
-        
-        # 1. Fetch initial graph context directly from the Graph Database
-        try:
-            graph_data = await self.api_client.fetch_random_knowledge_graph(count=1)
-        except Exception as e:
-            logger.critical(f"{log_prefix}Failed to fetch random KG data from Graph Database: {e}")
-            graph_data = {"entities": [], "relationships": []}
-            
-        if "entities" not in graph_data or not graph_data["entities"]:
-            graph_data["entities"] = []
-        if "relationships" not in graph_data or not graph_data["relationships"]:
-            graph_data["relationships"] = []
-            
-        # 2. Determine selected theme dynamically or from passed intent
-        if intent is not None:
-            selected_theme = intent.get("theme", "临床医学研究")
-            # If explicit intent is passed, merge its seeds and rels into graph_data
-            for seed in intent.get("seeds", []):
-                if not any(e.get("name") == seed["name"] for e in graph_data["entities"]):
-                    graph_data["entities"].append({
-                        "id": random.randint(10000, 99999),
-                        "name": seed["name"],
-                        "type": seed["type"],
-                        "description": seed["description"]
-                    })
-            for rel in intent.get("rels", []):
-                if not any(r.get("sourceName") == rel["sourceName"] and r.get("targetName") == rel["targetName"] for r in graph_data["relationships"]):
-                    graph_data["relationships"].append(rel)
-        else:
-            # Dynamically formulate the clinical theme directly from the fetched graph database
-            if graph_data.get("relationships"):
-                import random
-                rel = random.choice(graph_data["relationships"])
-                src = rel.get("sourceName", "")
-                tgt = rel.get("targetName", "")
-                relation = rel.get("relationship", "")
-                selected_theme = f"{src}与{tgt}的{relation}临床诊疗规范与医学循证"
-            elif graph_data.get("entities"):
-                names = [e.get("name") for e in graph_data["entities"][:2]]
-                selected_theme = "与".join(names) + "的临床应用研究与用药指南"
-            else:
-                selected_theme = "常见疾病的循证医学用药指南"
-                
-        logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Active! Selected Theme: '{selected_theme}' ---")
-        
-        context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
-        
-        # 2. Generate first question
-        q1 = await self.generate_initial_question(context_list, task_id_label=task_id_label)
-        
-        history = []
-        current_q = q1
-        
-        for r in range(1, num_rounds + 1):
-            logger.info(f"{log_prefix}=== Running Round {r} / {num_rounds} ===")
-            
-            # Execute round pipeline
-            round_result = await self.generate_single_round(current_q, refs, history, task_id_label=task_id_label)
-            
-            # Append to history
-            history.append(round_result)
-            
-            # Generate next question for next round if not the last round
-            if r < num_rounds:
-                # Add small random chance to pull more KG entities to keep context rich in long dialogues
-                if random.random() < 0.3:
-                    try:
-                        logger.info(f"{log_prefix}Random trigger: Fetching additional entities to expand dialog horizon...")
-                        additional_graph = await self.api_client.fetch_random_knowledge_graph(count=1)
-                        new_context, new_refs = await self._prepare_context_and_refs(additional_graph, query=current_q)
-                        context_list.extend(new_context)
-                        refs.extend(new_refs)
-                    except Exception as e:
-                        logger.warning(f"{log_prefix}Failed to fetch additional KG entities: {e}. Continuing with current context.")
-                        
-                current_q = await self.generate_next_question(context_list, history, round_result["summary"], task_id_label=task_id_label)
-                
-        logger.info(f"{log_prefix}=== Multi-Round Dialog Generation Completed! ===")
-        # The final dialog trajectory is the last round structure, which contains all previous history
-        history[-1]["refs"] = refs
-        return history[-1]
+        return await self.workflow.generate_multi_round_dataset(intent, task_id_label)
 
     def _check_answer_quality(self, answer_body: str, reasoning_content: str = "") -> Tuple[bool, str]:
         """
-        Runs quality guardrails on the generated answer body and optional reasoning content
-        to filter out refusals, few-shot pollution, and lazy thought blocks.
-        Returns (is_passed, error_reason).
+        Runs quality guardrails to filter out refusals and prompt pollutions (backward compatible wrapper).
         """
-        # 1. Check for Safety Refusal in body
-        refusal_pattern = re.compile(r"(抱歉|无法协助|不符合安全规定|作为一个AI|不能回答|作为AI|未获得授权)")
-        if refusal_pattern.search(answer_body):
-            return False, "safety refusal"
-            
-        # 2. Check for Prompt Pollution / Meta leakage in body
-        pollution_pattern = re.compile(r"(Step A|推理链|证据清单|法律合规|供应链|财务审计|few-shot|提示词|模型生成)")
-        if pollution_pattern.search(answer_body):
-            return False, "prompt pollution"
-            
-        # 3. Check for lazy reasoning content (think block)
-        if reasoning_content:
-            cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
-            
-            # If think block is too short, it's likely a lazy model shortcut
-            if len(cleaned_reasoning) < 120:
-                return False, f"lazy reasoning (too short: {len(cleaned_reasoning)} chars)"
-            
-        return True, ""
+        from strategies.quality_gate.answer_guard import check_answer_quality
+        return check_answer_quality(answer_body, reasoning_content)
+
