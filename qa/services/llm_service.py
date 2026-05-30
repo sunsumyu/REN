@@ -14,11 +14,11 @@ logger = logging.getLogger("MedicalQA.LLMService")
 
 class ILLMService(ABC):
     @abstractmethod
-    async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> str:
+    async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> str:
         pass
         
     @abstractmethod
-    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> Tuple[str, str]:
+    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> Tuple[str, str]:
         pass
         
     @abstractmethod
@@ -194,7 +194,7 @@ class LLMService(ILLMService):
         print_token_usage(current_stage, resolved_model, duration, usage)
         return response_data, resolved_model
 
-    async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> str:
+    async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> str:
         await self.init_supported_models()
         headers = self._build_request_headers()
         messages = self._prepare_messages(prompt, system_prompt)
@@ -207,6 +207,8 @@ class LLMService(ILLMService):
             "top_p": config.LLM_TOP_P,
             "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
         }
+        if max_tokens is not None:
+            data["max_tokens"] = max_tokens
         
         logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}]...")
         response_data, resolved_model = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
@@ -218,7 +220,7 @@ class LLMService(ILLMService):
             logger.error(f"Failed to parse LLM response format: {response_data}")
             raise Exception(f"Invalid LLM response format: {e}")
 
-    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> Tuple[str, str]:
+    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> Tuple[str, str]:
         await self.init_supported_models()
         headers = self._build_request_headers()
         messages = self._prepare_messages(prompt, system_prompt)
@@ -231,6 +233,8 @@ class LLMService(ILLMService):
             "top_p": config.LLM_TOP_P,
             "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
         }
+        if max_tokens is not None:
+            data["max_tokens"] = max_tokens
         
         logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}]...")
         response_data, resolved_model = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)

@@ -32,11 +32,11 @@ from strategies.quality_gate.llm_judge import LLMJudgeStrategy
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
-async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, line_num: int = None) -> Tuple[str, Dict[str, Any]]:
+async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
     """
     Surgically delegate single thought trace purification to modularized PurificationEngine (reusing injected engine).
     """
-    return await engine.purify_single_think(q, planner, raw_think, line_num)
+    return await engine.purify_single_think(q, planner, raw_think, line_num, refs)
 
 def update_env_start_line(env_path: Path, start_line: int):
     """
@@ -151,6 +151,7 @@ async def main():
             
         try:
             data = json.loads(line_str)
+            refs = data.get("refs", [])  # 🌟 提取原始图谱及外部文献引用作为刚性事实白名单锚点
             data.pop("history", None)
             data.pop("refs", None)
             
@@ -195,7 +196,7 @@ async def main():
                         
                         async with sem:
                             logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
-                            purified_think, score_dict = await purify_single_think(engine, q, planner_name, actual_raw_think, line_num=line_idx+1)
+                            purified_think, score_dict = await purify_single_think(engine, q, planner_name, actual_raw_think, line_num=line_idx+1, refs=refs)
                         
                         # 🚨 核心网关：若最终质量网关判定未通过（包含高仿真幻觉风险等），在此阶段直接抛弃该视角，绝不落盘污染！
                         if not score_dict.get("is_passed", False):
@@ -272,6 +273,20 @@ async def main():
         
     processed_results = await asyncio.gather(*tasks)
     
+    # 🌟 [企业级安全并发合并写回机制 - 防止 Lost Update 并发覆盖]
+    # 在写回磁盘前，重新读取一次磁盘上最新的数据集。防止在提纯大模型调用期间（通常长达数十秒至数分钟）
+    # 后台并发的生成器进程又追加写入了新的原始语料，导致提纯写回时以 w 模式将这些新语料无情覆盖抹杀。
+    try:
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            latest_disk_lines = f.readlines()
+        
+        if len(latest_disk_lines) > len(lines):
+            new_appended_count = len(latest_disk_lines) - len(lines)
+            logger.warning(f"⚠️ [并发写冲突拦截] 检测到在提纯期间，生成器追加了 {new_appended_count} 条新语料。正在进行安全合并...")
+            processed_results = list(processed_results) + latest_disk_lines[len(lines):]
+    except Exception as e:
+        logger.error(f"⚠️ [并发写冲突拦截] 读取最新数据进行合并失败: {e}。退回默认覆盖写。")
+        
     with open(dataset_path, 'w', encoding='utf-8') as f:
         f.writelines(processed_results)
         
