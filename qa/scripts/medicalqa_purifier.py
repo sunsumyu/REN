@@ -372,4 +372,10 @@ async def main():
     logger.info("=========================================")
 
 if __name__ == "__main__":
+    try:
+        from utils.process_lock import acquire_process_lock
+        acquire_process_lock("medicalqa_purifier")
+    except Exception as e:
+        print(f"⚠️ [ProcessLock Error] Failed to initialize lock: {e}")
+
     asyncio.run(main())

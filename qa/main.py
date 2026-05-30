@@ -171,6 +171,12 @@ async def run_generator():
         await client.close()
 
 if __name__ == "__main__":
+    try:
+        from utils.process_lock import acquire_process_lock
+        acquire_process_lock("main_pipeline")
+    except Exception as e:
+        print(f"⚠️ [ProcessLock Error] Failed to initialize lock: {e}")
+
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(run_generator())
