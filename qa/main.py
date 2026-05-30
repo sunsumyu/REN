@@ -68,8 +68,13 @@ async def generate_and_save_single_task(
             judge_prompt = JUDGE_COMPREHENSIVE_PROMPT.replace("{{ query }}", query).replace("{{ answer }}", summary_text.replace('"', '\\"')).replace("{{ refs_text }}", refs_text)
             judge_messages = [{"role": "user", "content": judge_prompt}]
             
-            # 3. 大模型裁判打分
-            metrics: ComprehensiveJudgeMetrics = await client.call_llm_structured(judge_messages, ComprehensiveJudgeMetrics, model_pool="judge")
+            # 3. 大模型裁判打分 (注入 task_label 标签，实现终端耗时表格行号大一统)
+            metrics: ComprehensiveJudgeMetrics = await client.call_llm_structured(
+                judge_messages, 
+                ComprehensiveJudgeMetrics, 
+                model_pool="judge",
+                stage=f"[{task_label}] 生成数据集质检打分"
+            )
             all_scores = [
                 metrics.grounding.score,
                 metrics.isolation.score,

@@ -27,7 +27,7 @@ MODEL_POOL_JUDGE = os.getenv("MODEL_POOL_JUDGE", "deepseek-v4-pro")
 # 流程控制配置
 MAX_RETRIES = 3  # 根据用户要求，大模型请求与网络重试次数严格限制在 3 次以内
 RETRY_BACKOFF_FACTOR = 2.0  # 增加退避斜率以充分应对网关滑动窗口
-CONCURRENT_QA_LIMIT = 4     # 并行解答的并发度限制
+CONCURRENT_QA_LIMIT = int(os.getenv("CONCURRENT_QA_LIMIT", "4"))     # 并行解答的并发度限制
 
 # 批处理高并发速率控制
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))                  # 单次并发生成的总样本数
@@ -45,6 +45,9 @@ LLM_FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.2"))
 # 思维链提纯净化控制配置
 PURIFY_LIMIT_RAW = os.getenv("PURIFY_LIMIT", "").strip()
 PURIFY_LIMIT = int(PURIFY_LIMIT_RAW) if PURIFY_LIMIT_RAW and PURIFY_LIMIT_RAW.isdigit() else None
+
+# 提纯进程在全链路大并发时的最大并发度限制
+PURIFY_CONCURRENCY = int(os.getenv("PURIFY_CONCURRENCY", "25"))
 
 # 净化起始行号 (1-based index)
 PURIFY_START_LINE_RAW = os.getenv("PURIFY_START_LINE", "").strip()

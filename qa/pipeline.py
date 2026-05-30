@@ -125,12 +125,13 @@ class MedicalQAPipeline:
         retrieval_mgr.close()
         return context_list, refs
 
-    async def generate_initial_question(self, context_list: List[Dict[str, str]]) -> str:
+    async def generate_initial_question(self, context_list: List[Dict[str, str]], task_id_label: str = "") -> str:
         """
         Generate multiple questions from context and pick one randomly.
         """
         prompt = prompts.render_prompt(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
-        response = await self.api_client.call_llm(prompt, model_pool="premium")
+        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+        response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}初始问题生成")
         questions = parse_json_safely(response, [])
         
         if not questions:
@@ -142,7 +143,7 @@ class MedicalQAPipeline:
         logger.info(f"Generated {len(questions)} questions. Selected: '{selected_q}'")
         return selected_q
 
-    async def plan_facets(self, query: str) -> List[str]:
+    async def plan_facets(self, query: str, task_id_label: str = "") -> List[str]:
         """
         Plan answering perspectives (facets) for a query using Pydantic schema constraints.
         """
@@ -150,7 +151,8 @@ class MedicalQAPipeline:
         messages = [{"role": "user", "content": prompt}]
         try:
             # Enforce dynamic structured output using FacetPlan Pydantic model
-            result: FacetPlan = await self.api_client.call_llm_structured(messages, FacetPlan, model_pool="premium")
+            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+            result: FacetPlan = await self.api_client.call_llm_structured(messages, FacetPlan, model_pool="premium", stage=f"{stage_prefix}视角切面规划")
             # Extract list of facet values (strings) from Pydantic Enum list
             facets = [f for f in result.facets]
             logger.info(f"Planned initial facets strictly via Pydantic: {facets}")
@@ -159,7 +161,7 @@ class MedicalQAPipeline:
             logger.error(f"Failed to plan facets using Pydantic: {e}. Falling back to default list.")
             return ["临床表现", "药理学机制"]
 
-    async def preprocess_facets(self, query: str, facets: List[str]) -> List[str]:
+    async def preprocess_facets(self, query: str, facets: List[str], task_id_label: str = "") -> List[str]:
         """
         Preprocess facets according to rules:
         - If > 8: reduce to 8.
@@ -167,10 +169,11 @@ class MedicalQAPipeline:
         - Otherwise, do nothing.
         """
         count = len(facets)
+        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
         if count > 8:
             logger.info(f"Facet count {count} > 8. Running Facet Reducer...")
             prompt = prompts.render_prompt(prompts.FACET_REDUCER_TEMPLATE, query=query, facets=facets)
-            response = await self.api_client.call_llm(prompt, model_pool="premium")
+            response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}切面视角缩减过滤")
             reduced_facets = parse_json_safely(response, [])
             if len(reduced_facets) == 8:
                 return reduced_facets
@@ -181,7 +184,7 @@ class MedicalQAPipeline:
         elif 2 < count < 8:
             logger.info(f"Facet count {count} is between 2 and 8. Running Facet Expander...")
             prompt = prompts.render_prompt(prompts.FACET_EXPANDER_TEMPLATE, query=query, facets=facets)
-            response = await self.api_client.call_llm(prompt, model_pool="premium")
+            response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}切面视角丰富扩充")
             expanded_new = parse_json_safely(response, [])
             
             # Combine unique facets
@@ -196,7 +199,7 @@ class MedicalQAPipeline:
             logger.info(f"Facet count {count} does not require preprocessing.")
             return facets
 
-    async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore) -> Tuple[str, str]:
+    async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, task_id_label: str = "") -> Tuple[str, str]:
         """
         Call the FacetGraph-QA Agent for a single perspective using L1-L3 Prompt Layering and FacetQAOutput Pydantic constraint.
         Incorporates a dual-stage quality guardrail to filter safety refusals and few-shot pollution.
@@ -222,6 +225,7 @@ class MedicalQAPipeline:
             ]
             
             max_quality_attempts = 2
+            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
             
             try:
                 result = None
@@ -231,7 +235,7 @@ class MedicalQAPipeline:
                 # Structured output loop with quality check retries
                 for q_attempt in range(max_quality_attempts + 1):
                     # Enforce structural decoding using FacetQAOutput model
-                    result: FacetQAOutput = await self.api_client.call_llm_structured(messages, FacetQAOutput, model_pool="premium")
+                    result: FacetQAOutput = await self.api_client.call_llm_structured(messages, FacetQAOutput, model_pool="premium", stage=f"{stage_prefix}切面深度问答 - {facet}")
                     
                     is_passed, reason = self._check_answer_quality(result.answer_body, getattr(result, "_reasoning_content", ""))
                     if is_passed:
@@ -289,7 +293,7 @@ class MedicalQAPipeline:
                 reason = ""
                 
                 for fb_attempt in range(max_quality_attempts + 1):
-                    raw_response, reasoning_content = await self.api_client.call_llm_with_reasoning(fallback_prompt, model_pool="premium")
+                    raw_response, reasoning_content = await self.api_client.call_llm_with_reasoning(fallback_prompt, model_pool="premium", stage=f"{stage_prefix}切面深度问答降级 - {facet}")
                     
                     check_body = raw_response
                     if "</think>" in raw_response:
@@ -323,12 +327,12 @@ class MedicalQAPipeline:
                     
             return facet, response
 
-    async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
         """
         Runs the QA Agent in parallel for all facets.
         """
         semaphore = asyncio.Semaphore(config.CONCURRENT_QA_LIMIT)
-        tasks = [self.answer_single_facet(query, facet, refs, semaphore) for facet in facets]
+        tasks = [self.answer_single_facet(query, facet, refs, semaphore, task_id_label=task_id_label) for facet in facets]
         results = await asyncio.gather(*tasks)
         
         planners = []
@@ -342,12 +346,13 @@ class MedicalQAPipeline:
             })
         return planners
 
-    async def detect_redundancy_and_filter(self, query: str, planners: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    async def detect_redundancy_and_filter(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
         """
         Call Facet Redundancy Detector to filter out redundant perspective answers.
         """
         prompt = prompts.render_prompt(prompts.FACET_REDUNDANCY_DETECTOR_TEMPLATE, query=query, planners=planners)
-        response = await self.api_client.call_llm(prompt, model_pool="premium")
+        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+        response = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}视角切面冗余度检测与去重过滤")
         indices_to_remove = parse_json_safely(response, [])
         
         if not isinstance(indices_to_remove, list):
@@ -364,7 +369,7 @@ class MedicalQAPipeline:
         logger.info(f"Filtered planners: {len(filtered_planners)} out of {len(planners)} remaining.")
         return filtered_planners
 
-    async def synthesize_answers(self, query: str, planners: List[Dict[str, str]]) -> str:
+    async def synthesize_answers(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> str:
         """
         Synthesize filtered answers into a single cohesive final summary answer.
         """
@@ -380,11 +385,12 @@ class MedicalQAPipeline:
             answers_clean.append(ans_body)
             
         prompt = prompts.render_prompt(prompts.MULTI_ANSWER_SYNTHESIS_TEMPLATE, query=query, answers=answers_clean)
-        summary = await self.api_client.call_llm(prompt, model_pool="premium")
+        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+        summary = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}切面问答综合凝练")
         logger.info("Successfully synthesized final answer summary.")
         return summary
 
-    async def generate_next_question(self, context_list: List[Dict[str, str]], history: List[Dict[str, Any]], previous_summary: str) -> str:
+    async def generate_next_question(self, context_list: List[Dict[str, str]], history: List[Dict[str, Any]], previous_summary: str, task_id_label: str = "") -> str:
         """
         Generate the next logical question in a multi-round dialog.
         """
@@ -394,7 +400,8 @@ class MedicalQAPipeline:
             history=history,
             summary=previous_summary
         )
-        next_q = await self.api_client.call_llm(prompt, model_pool="premium")
+        stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+        next_q = await self.api_client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}多轮对话下一问生成")
         next_q = next_q.strip().strip('"').strip("'")
         logger.info(f"Generated next question: '{next_q}'")
         return next_q
@@ -403,7 +410,8 @@ class MedicalQAPipeline:
         self, 
         query: str, 
         refs: List[Dict[str, str]], 
-        history: List[Dict[str, Any]] = None
+        history: List[Dict[str, Any]] = None,
+        task_id_label: str = ""
     ) -> Dict[str, Any]:
         """
         Execute a complete single round QA generation.
@@ -411,24 +419,24 @@ class MedicalQAPipeline:
         logger.info(f"--- Starting Round QA for Q: '{query}' ---")
         
         # 1. Plan facets
-        initial_facets = await self.plan_facets(query)
+        initial_facets = await self.plan_facets(query, task_id_label=task_id_label)
         if not initial_facets:
             initial_facets = ["临床表现", "药理学机制"]
             
         # 2. Preprocess facets (reduction / expansion)
-        final_facets = await self.preprocess_facets(query, initial_facets)
+        final_facets = await self.preprocess_facets(query, initial_facets, task_id_label=task_id_label)
         
         # 3. Parallel answer generation
-        planners = await self.run_parallel_answers(query, final_facets, refs)
+        planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
         
         # 4. Redundancy filter
-        non_redundant_planners = await self.detect_redundancy_and_filter(query, planners)
+        non_redundant_planners = await self.detect_redundancy_and_filter(query, planners, task_id_label=task_id_label)
         if not non_redundant_planners:
             # Fallback in case everything got filtered
             non_redundant_planners = planners
             
         # 5. Synthesize final answer
-        summary = await self.synthesize_answers(query, non_redundant_planners)
+        summary = await self.synthesize_answers(query, non_redundant_planners, task_id_label=task_id_label)
         
         round_data = {
             "Q": query,
@@ -496,7 +504,7 @@ class MedicalQAPipeline:
         context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
         
         # 2. Generate first question
-        q1 = await self.generate_initial_question(context_list)
+        q1 = await self.generate_initial_question(context_list, task_id_label=task_id_label)
         
         history = []
         current_q = q1
@@ -505,7 +513,7 @@ class MedicalQAPipeline:
             logger.info(f"{log_prefix}=== Running Round {r} / {num_rounds} ===")
             
             # Execute round pipeline
-            round_result = await self.generate_single_round(current_q, refs, history)
+            round_result = await self.generate_single_round(current_q, refs, history, task_id_label=task_id_label)
             
             # Append to history
             history.append(round_result)
@@ -523,7 +531,7 @@ class MedicalQAPipeline:
                     except Exception as e:
                         logger.warning(f"{log_prefix}Failed to fetch additional KG entities: {e}. Continuing with current context.")
                         
-                current_q = await self.generate_next_question(context_list, history, round_result["summary"])
+                current_q = await self.generate_next_question(context_list, history, round_result["summary"], task_id_label=task_id_label)
                 
         logger.info(f"{log_prefix}=== Multi-Round Dialog Generation Completed! ===")
         # The final dialog trajectory is the last round structure, which contains all previous history

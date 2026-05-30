@@ -3,6 +3,7 @@ import httpx
 import logging
 import random
 import json
+import time
 from typing import List, Dict, Any, Set, Tuple
 from pydantic import BaseModel
 import config
@@ -10,6 +11,47 @@ import config
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.box import ROUNDED
+    _has_rich = True
+    _console = Console()
+except ImportError:
+    _has_rich = False
+
+def print_token_usage(stage: str, model: str, duration: float, usage: dict):
+    stage = stage or "LLM Call"
+    prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
+    completion_tokens = usage.get("completion_tokens", 0) if usage else 0
+    total_tokens = usage.get("total_tokens", 0) if usage else 0
+
+    if _has_rich:
+        table = Table(box=ROUNDED, show_header=True, header_style="bold magenta")
+        table.add_column("Stage / 环节", style="bold cyan", min_width=20)
+        table.add_column("Model / 模型", style="green")
+        table.add_column("Latency / 耗时", style="yellow", justify="right")
+        table.add_column("Prompt / 输入", style="blue", justify="right")
+        table.add_column("Completion / 输出", style="magenta", justify="right")
+        table.add_column("Total / 总消耗", style="bold red", justify="right")
+        
+        table.add_row(
+            stage,
+            model,
+            f"{duration:.3f}s",
+            str(prompt_tokens),
+            str(completion_tokens),
+            str(total_tokens)
+        )
+        
+        _console.print(table)
+    else:
+        logger.info(
+            f"[{stage}] Model: {model} | Latency: {duration:.3f}s | "
+            f"Prompt: {prompt_tokens} | Completion: {completion_tokens} | Total: {total_tokens}"
+        )
+
 
 class APIClient:
     def __init__(self):
@@ -204,7 +246,7 @@ class APIClient:
         logger.warning(f"Absolutely all pool fallbacks failed. Selecting first gateway model '{fallback}'.")
         return fallback
 
-    async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium") -> str:
+    async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> str:
         """
         Call the Large Language Model completions API with smart model pool routing and dynamic model-not-found self-healing fallback.
         """
@@ -242,6 +284,7 @@ class APIClient:
         }
         
         logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}]...")
+        start_time = time.time()
         try:
             response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
         except Exception as e:
@@ -250,9 +293,14 @@ class APIClient:
                 resolved_model = config.LLM_MODEL
                 data["model"] = resolved_model
                 logger.info(f"Retrying Call with Fallback LLM ({resolved_model})...")
+                start_time = time.time()
                 response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
             else:
                 raise e
+        
+        duration = time.time() - start_time
+        usage = response_data.get("usage", {})
+        print_token_usage(stage, resolved_model, duration, usage)
         
         # Parse standard chat completion response
         try:
@@ -262,7 +310,7 @@ class APIClient:
             logger.error(f"Failed to parse LLM response format: {response_data}")
             raise Exception(f"Invalid LLM response format: {e}")
 
-    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium") -> Tuple[str, str]:
+    async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> Tuple[str, str]:
         """
         Call the Large Language Model completions API with smart model pool routing and dynamic model-not-found self-healing fallback.
         Returns a tuple of (content, reasoning_content).
@@ -301,6 +349,7 @@ class APIClient:
         }
         
         logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}]...")
+        start_time = time.time()
         try:
             response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
         except Exception as e:
@@ -309,9 +358,14 @@ class APIClient:
                 resolved_model = config.LLM_MODEL
                 data["model"] = resolved_model
                 logger.info(f"Retrying Call with Fallback LLM ({resolved_model})...")
+                start_time = time.time()
                 response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
             else:
                 raise e
+        
+        duration = time.time() - start_time
+        usage = response_data.get("usage", {})
+        print_token_usage(stage, resolved_model, duration, usage)
         
         # Parse standard chat completion response
         try:
@@ -323,7 +377,7 @@ class APIClient:
             logger.error(f"Failed to parse LLM response format: {response_data}")
             raise Exception(f"Invalid LLM response format: {e}")
 
-    async def call_llm_structured(self, messages: List[Dict[str, str]], response_model: type, model_pool: str = "premium") -> Any:
+    async def call_llm_structured(self, messages: List[Dict[str, str]], response_model: type, model_pool: str = "premium", stage: str = "") -> Any:
         """
         Calls the LLM using API-level Structured Outputs with JSON Schema strict constraints.
         Includes a 2-attempt Self-Healing loop to correct formats recursively in case of Pydantic validation failures.
@@ -396,6 +450,7 @@ class APIClient:
             else:
                 logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] in Structured Output Mode for {response_model.__name__}...")
                 
+            start_time = time.time()
             try:
                 response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
             except Exception as e:
@@ -404,9 +459,17 @@ class APIClient:
                     resolved_model = config.LLM_MODEL
                     data["model"] = resolved_model
                     logger.info(f"Retrying Call in Structured Mode with Fallback LLM ({resolved_model})...")
+                    start_time = time.time()
                     response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
                 else:
                     raise e
+            
+            duration = time.time() - start_time
+            usage = response_data.get("usage", {})
+            current_stage = stage
+            if attempt > 0:
+                current_stage = f"{stage} (自愈重试 {attempt})"
+            print_token_usage(current_stage, resolved_model, duration, usage)
             
             try:
                 message = response_data["choices"][0]["message"]

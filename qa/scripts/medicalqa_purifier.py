@@ -22,7 +22,7 @@ parent_dir = current_dir.parent
 sys.path.append(str(current_dir))
 sys.path.append(str(parent_dir))
 
-from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE
+from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE, PURIFY_CONCURRENCY
 from api_client import APIClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -38,7 +38,7 @@ def safe_int(val: Any, default: int = 90) -> int:
 # 🟢 全局进程内缓存，防止在提纯大规模语料时由于高频出现相同别扭标签导致 API 成本与延迟激增
 _SMOOTHED_PLANNER_CACHE = {}
 
-async def smooth_planner_term(client: APIClient, planner: str) -> str:
+async def smooth_planner_term(client: APIClient, planner: str, line_num: int = None) -> str:
     """
     利用 LLM 零样本自适应平滑机器拼接的别扭切面名称，使其转换为规范的人类学术术语。
     """
@@ -66,7 +66,8 @@ async def smooth_planner_term(client: APIClient, planner: str) -> str:
 输入: "{planner_clean}" -> 输出: """
 
     try:
-        response = await client.call_llm(prompt, model_pool="premium")
+        stage_prefix = f"[{line_num}行] " if line_num else ""
+        response = await client.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}医学标签规范化 - {planner_clean}")
         smoothed = response.strip().replace('"', '').replace("'", "").replace("“", "").replace("”", "")
         # 对非正常回复进行校验和兜底
         if not smoothed or len(smoothed) > 20 or "输入" in smoothed or "输出" in smoothed:
@@ -211,7 +212,9 @@ JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量�
      - 请将原始输入中出现的所有“硬指标数值”（如百分比发生率、具体剂量参数、受试样本量、特定生理学常数）与净化重写后的思维链进行**非结构化动态对齐**。
      - 检查所有提及的关键基因型、分子靶点、受体化学实体、特异性毒性症状名字是否发生丢失、歪曲或脱水弱化。
      - **💡 百度/百川纠偏包容规则（特许不扣分）**：若模型在思维链中指出了原始输入中的事实错误、过时数据或不合理机制，并给出了明确的循证学/生理学纠偏逻辑，**此种“主动临床纠偏”视为高分项，严禁扣分**。
-     - **扣分刻度**：在无合理医学纠偏的前提下，若发生上述任何关键硬性数据的遗漏或事实曲解，此项得分强制锁定在 80 分以下。
+      - **扣分刻度**：在无合理医学纠偏的前提下，若发生上述任何关键硬性数据的遗漏或事实曲解，此项得分强制锁定在 80 分以下。
+      - **💡【图数据库与 refs 刚性事实一致性核验】**：提纯后的思维链必须与原始素材中**来自于医学知识图谱数据库（Graph Database，即 refs 中标注为《实体库:xxx》或《图谱关系:xxx》的定义与关联）**进行硬性对齐校验。严禁篡改图数据库中明确定义的实体化学属性、靶点归宿、以及图谱中已确认的临床相互关系。任何与图谱数据库核心证据相冲突的编造（例如图谱表明两药有配伍禁忌而思维链内容谎称可以同用，或者图谱指出该药为噻唑并吡啶骨架而思维链篡改为噻吩并吡啶）一经判定，属于严重事实违规，医学严谨度得分一票否决直接扣至 50 分以下并驳回重写！
+     - **🚨【绝对红线：严打学术伪造与高仿真幻觉】**：裁判大模型必须动用你知识库中最精密的生化与临床药理知识，严密审视提纯后的思维链是否存在“凭空捏造分子结构骨架（例如将噻唑并吡啶记错为噻吩并吡啶）、伪造 pKa 电离常数与电荷分布、虚构/篡改临床特异性逆转剂的实际结合效能（例如谎称 Andexanet 无法螯合艾多沙班）”等行为。一旦发现模型在“没有确切 refs 证据且缺乏医学公理支撑”的前提下，使用极为自信的伪学术行话进行事实虚构，判定为“高仿真幻觉违规”，此维度得分一票否决直接扣至 50 分以下并驳回重写！
 
 3. 🧠 【维度三：逻辑深度与思维熵 (logical_depth_score - 0到100分) - 拒绝静态科普文章】
    - **核心判定逻辑**：评估思维链是否呈现了饱满的临床推理过程，彻底杜绝走捷径、干瘪的“常识陈述”。
@@ -313,6 +316,9 @@ def post_strip_meta_openings(text: str) -> str:
     """
     cleaned = text.strip()
     
+    # 0. 物理切除大模型在对齐硬性指标时遗留的草稿占位符，如 "，见？"、"(见?)"、"（见？）" 等尾巴
+    cleaned = re.sub(r'[,，、\s]*(?:\(见[？\?]\)|（见[？\?]）|见[？\?])', '', cleaned)
+    
     # 1. 拦截并切除位于文本开头的元描述
     meta_patterns = [
         r"^(我们(需|需要|将)?[^\n，。：]*?从[^\n，。：]*?视角[^\n，。：]*?[。，：])",
@@ -356,7 +362,7 @@ def is_catastrophic_format_collapse(text: str) -> bool:
         return True
     return False
 
-async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_think: str, purified_think: str) -> Dict[str, Any]:
+async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_think: str, purified_think: str, line_num: int = None) -> Dict[str, Any]:
     prompt = f"""问题: {q}
 切面视角: {planner}
 原始思维链 (包含噪声):
@@ -371,7 +377,8 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
 
 请严格按照质检准则对净化后的思维链进行三维评分，并直接输出规范 of JSON 数据。"""
     try:
-        response = await client.call_llm(prompt, system_prompt=JUDGE_SYSTEM_PROMPT, model_pool="premium")
+        stage_prefix = f"[{line_num}行] " if line_num else ""
+        response = await client.call_llm(prompt, system_prompt=JUDGE_SYSTEM_PROMPT, model_pool="premium", stage=f"{stage_prefix}思维链三维质检 - {planner}")
         json_str = extract_json_block(response)
         scores = json.loads(json_str)
         
@@ -393,7 +400,7 @@ async def evaluate_purified_think(client: APIClient, q: str, planner: str, raw_t
             "reason": f"Evaluation error: {e}"
         }
 
-async def verify_and_repair_academic_entities(client: APIClient, purified_text: str, q: str, facet: str) -> str:
+async def verify_and_repair_academic_entities(client: APIClient, purified_text: str, q: str, facet: str, line_num: int = None) -> str:
     """
     对纯 oT 的学术实体进行 PubMed/NCBI 权威验证，并对幻觉实体进行 AI 动态自愈。
     """
@@ -439,7 +446,8 @@ async def verify_and_repair_academic_entities(client: APIClient, purified_text: 
 
 请输出修正并提纯后的完整思考链，不要带有任何 <think> 标记，也不要有任何 Markdown 围栏或解释。"""
                 
-                corrected = await client.call_llm(repair_prompt, model_pool="premium")
+                stage_prefix = f"[{line_num}行] " if line_num else ""
+                corrected = await client.call_llm(repair_prompt, model_pool="premium", stage=f"{stage_prefix}学术实体自愈 - {entity}")
                 repaired_text = corrected.replace("<think>", "").replace("</think>", "").strip()
                 logger.info(f"✨ [AI Healed] Successfully repaired hallucinated term '{entity}' in thought trace.")
                 break
@@ -449,7 +457,7 @@ async def verify_and_repair_academic_entities(client: APIClient, purified_text: 
             
     return repaired_text
 
-async def purify_single_think(client: APIClient, q: str, planner: str, raw_think: str) -> Tuple[str, Dict[str, Any]]:
+async def purify_single_think(client: APIClient, q: str, planner: str, raw_think: str, line_num: int = None) -> Tuple[str, Dict[str, Any]]:
     max_retries = 3
     
     THRESHOLD_PURITY = 85
@@ -462,7 +470,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
     stripped_think = pre_strip_engineering_noise(raw_think)
     
     # 🌟 方案2：利用 LLM 零样本自适应平滑机器拼接的别扭切面名称，引入在体缓存防止 API 消耗与延迟
-    smoothed_planner = await smooth_planner_term(client, planner)
+    smoothed_planner = await smooth_planner_term(client, planner, line_num=line_num)
     
     few_shot = FACET_FEW_SHOTS.get(planner, FEW_SHOT_GENERAL)
     system_prompt = get_purify_system_prompt(smoothed_planner)
@@ -474,7 +482,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
 ### 系统指令 (System Directive)：
 Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
 CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
-You MUST include counterfactual checks and at least 1-2 explicit self-questioning markers with a question mark (必须在思考中途加入 1-2 处以“？”结尾的真实探究疑问与假说排查).
+In corporate with counterfactual checks, you should naturally integrate clinical self-questioning markers with a question mark at points of uncertainty or divergence (在遇到逻辑分叉或极限情况时，应自然融入探究性的自我提问，展现真实的解题反思与假说排查，例如以以“？”结尾的疑问句进行内部推演，但绝对禁止在文本尾部生硬塞入无意义的问号占位符).
 Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. Output ONLY the purified thought chain.
 
 问题: {q}
@@ -485,8 +493,9 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
 
 请严格按照净化重写指南，仅输出重构后的纯净思维链本身。"""
         try:
-            purified = await client.call_llm(prompt, system_prompt=system_prompt, model_pool="premium")
-            purified = purified.replace("<think>", "").replace("</think>", "").strip()
+            stage_prefix = f"[{line_num}行] " if line_num else ""
+            purified = await client.call_llm(prompt, system_prompt=system_prompt, model_pool="premium", stage=f"{stage_prefix}思维链重写提纯 - {smoothed_planner}")
+            purified = purified.replace("<think>", "").replace("<think>", "").replace("</think>", "").strip()
             
             if purified.startswith("```"):
                 purified = "\n".join(purified.splitlines()[1:])
@@ -514,7 +523,7 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
                     "reason": "检测到提纯后的文本发生了大面积死循环与复读退化（Repetition Collapse），这在思维链微调语料中属于致命缺陷。请确保重构后的思维链推导流畅，不包含任何长段落的复读复印！"
                 }
             else:
-                scores = await evaluate_purified_think(client, q, smoothed_planner, raw_think, purified)
+                scores = await evaluate_purified_think(client, q, smoothed_planner, raw_think, purified, line_num=line_num)
             
             last_scores = scores
             
@@ -528,16 +537,30 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
             
             if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
                 logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}! Starting academic entity verification & self-healing...")
-                purified = await verify_and_repair_academic_entities(client, purified, q, smoothed_planner)
+                purified = await verify_and_repair_academic_entities(client, purified, q, smoothed_planner, line_num=line_num)
                 
                 sim = calculate_similarity(raw_think, purified)
                 has_noise = any(kw in purified.lower() for kw in ["json", "schema", "免责声明", "忽略", "refs", "图谱"])
                 is_bypass = sim > 0.85 and has_noise
                 scores["purity_bypass"] = is_bypass
+                scores["is_passed"] = True
                 
                 return purified, scores
             else:
-                logger.warning(f"   ❌ Quality Gate FAILED on attempt {attempt+1}. Generating feedback...")
+                logger.warning(
+                    f"\n============================================================\n"
+                    f"   ❌ Quality Gate FAILED on attempt {attempt+1}!\n"
+                    f"   [Line Number / 行号]: {line_num or 'Unknown'}\n"
+                    f"   [Facet / 切面]: {smoothed_planner}\n"
+                    f"   [Purity Score / 纯净度]: {p_score} / {THRESHOLD_PURITY} (threshold)\n"
+                    f"   [Rigor Score / 严谨度]: {r_score} / {THRESHOLD_RIGOR} (threshold)\n"
+                    f"   [Depth Score / 深度]: {d_score} / {THRESHOLD_DEPTH} (threshold)\n"
+                    f"   [Failing Reason / 裁判评语]: {reason}\n"
+                    f"------------------------------------------------------------\n"
+                    f"   [Failing Purified CoT / 不合格思维链文本]:\n"
+                    f"\"\"\"\n{purified}\n\"\"\"\n"
+                    f"============================================================\n"
+                )
                 
                 # 🧠 智能三维动态至纯无害化反馈机制 (De-contaminated Feedback Loop)
                 # 不再将包含违规词与引力 Token 的裁判原始评语传回给大模型，防止 Token 拷贝污染
@@ -569,13 +592,16 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
     has_noise = any(kw in purified.lower() for kw in ["json", "schema", "免责声明", "忽略", "refs", "图谱"])
     is_bypass = sim > 0.85 and has_noise
     
-    return purified, last_scores or {
+    ret_scores = last_scores or {
         "semantic_purity_score": 85,
         "medical_rigor_score": 90,
         "logical_depth_score": 85,
         "reason": "Fallback used.",
         "purity_bypass": is_bypass
     }
+    ret_scores["is_passed"] = False
+    
+    return purified, ret_scores
 
 def update_env_start_line(env_path: Path, start_line: int):
     """
@@ -588,7 +614,7 @@ def update_env_start_line(env_path: Path, start_line: int):
     
     pattern = re.compile(r"^(\s*PURIFY_START_LINE\s*=).*$", re.MULTILINE)
     if pattern.search(content):
-        new_content = pattern.sub(f"\\1{start_line}", content)
+        new_content = pattern.sub(f"\\g<1>{start_line}", content)
     else:
         new_content = content.rstrip() + f"\n\n# 自动设置的净化起始行号\nPURIFY_START_LINE={start_line}\n"
         
@@ -671,7 +697,7 @@ async def main():
         
     logger.info(f"Loaded {len(lines)} dataset records. Starting double-check purification...")
     
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(PURIFY_CONCURRENCY)
     
     purified_diff_logs = []
     
@@ -688,28 +714,27 @@ async def main():
                 q = data.get("Q", "")
                 planners = data.get("planners", [])
                 
-                valid_planners = []
-                for p in planners:
+                TEMPLATE_SIGNATURES = [
+                    "触发物理格式崩溃",
+                    "质量网关硬指标",
+                    "自动重新净化重写",
+                ]
+                SAFE_BODY_SIGNATURES = [
+                    "根据参考资料",
+                    "现有资料未提供",
+                ]
+                
+                async def process_planner(p):
                     planner_name = p.get("planner", "")
                     raw_answer = p.get("answer", "")
                     
-                    TEMPLATE_SIGNATURES = [
-                        "触发物理格式崩溃",
-                        "质量网关硬指标",
-                        "自动重新净化重写",
-                    ]
-                    SAFE_BODY_SIGNATURES = [
-                        "根据参考资料",
-                        "现有资料未提供",
-                    ]
-                    
                     if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
                         logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{planner_name}' due to template signature.")
-                        continue
+                        return None, None
                         
                     if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
                         logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{planner_name}' due to safety warning signature.")
-                        continue
+                        return None, None
                     
                     think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
                     if think_match:
@@ -726,21 +751,40 @@ async def main():
                         
                         async with sem:
                             logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
-                            purified_think, score_dict = await purify_single_think(client, q, planner_name, actual_raw_think)
+                            purified_think, score_dict = await purify_single_think(client, q, planner_name, actual_raw_think, line_num=line_idx+1)
                         
-                        p["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                        # 🚨 核心网关：若最终质量网关判定未通过（包含高仿真幻觉风险等），在此阶段直接抛弃该视角，绝不落盘污染！
+                        if not score_dict.get("is_passed", False):
+                            logger.critical(f"   ❌ [Hallucination/Quality Gate Intercept] Drop facet '{planner_name}' for Line {line_idx+1} due to Quality Gate Failure.")
+                            return None, None
                         
-                        purified_diff_logs.append({
+                        p_new = p.copy()
+                        p_new["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                        
+                        diff_log = {
                             "line_number": line_idx + 1,
                             "question": q,
                             "facet": planner_name,
                             "original_think": raw_think,
                             "purified_think": purified_think,
                             "scores": score_dict
-                        })
-                        valid_planners.append(p)
+                        }
+                        return p_new, diff_log
                     else:
-                        valid_planners.append(p)
+                        return p, None
+
+                # 并发执行单行内的所有切面
+                planner_tasks = [process_planner(p) for p in planners]
+                planner_results = await asyncio.gather(*planner_tasks)
+                
+                valid_planners = []
+                for p_new, diff_log in planner_results:
+                    if p_new is None:
+                        continue
+                    if diff_log:
+                        purified_diff_logs.append(diff_log)
+                    valid_planners.append(p_new)
+                
                 data["planners"] = valid_planners
             
             return json.dumps(data, ensure_ascii=False) + "\n"
