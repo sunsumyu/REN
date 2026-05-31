@@ -64,6 +64,25 @@ class HealingService(IHealingService):
                 cleaned = "\n".join(cleaned.splitlines()[:-1])
             cleaned = cleaned.strip()
             
+            # 🛡️ 【学术引用自愈清洗层】：强力拦截并平滑当前/历史产生的任何工程代偿词，确保完美的自然医学口吻
+            SEMANTIC_WASH_MAP = {
+                "刚性事实锚点": "临床确证事实",
+                "刚性对齐红线": "临床确证事实",
+                "刚性事实": "文献记载事实",
+                "刚性锚点": "临床证据",
+                "事实锚点": "临床确证证据",
+                "知识锚点": "现有证据",
+                "锚定事实": "文献报道事实",
+                "锚定数据": "临床记载数据",
+                "图谱关系": "已知关联",
+                "图谱显示": "文献记载",
+                "刚性对齐": "循证事实对齐",
+                "锚点": "临床事实"
+            }
+            for eng_word, med_word in SEMANTIC_WASH_MAP.items():
+                if eng_word in cleaned:
+                    cleaned = cleaned.replace(eng_word, med_word)
+            
             # 健全性防御，确保模型返回了实质内容，防止幻觉性过度裁剪
             if cleaned and len(cleaned) > len(text) * 0.7:
                 logger.info("✨ [Lightweight Healing] Successfully cleared conversational noise & resolved transitions/truncations.")

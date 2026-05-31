@@ -76,9 +76,9 @@ class PurificationEngine:
                 anchors_text = "\n".join(anchors)
                 anchors_prompt = f"""
 
-### 刚性事实锚点白名单 (Rigid Knowledge Anchors):
+### 确证医学文献事实与临床研究数据 (Confirmed Clinical & Literature Facts):
 {anchors_text}
-【⚠️ 刚性对齐红线】：你必须将上述锚点中的事实作为临床与药理机制因果推演的绝对真理基石。你可以展示深层医学逻辑，但绝对禁止对锚点中的任何药理关系、不良反应或用药禁忌进行任何否定、篡改或凭空编造！"""
+【⚠️ 确证事实对齐】：请注意，以上数据为临床确证事实，你的药理因果推演必须与之完全吻合，绝对禁止对其中任何药理关系、不良反应或用药禁忌进行任何否定、篡改或凭空编造！"""
         
         for attempt in range(max_retries):
             prompt = f"""{few_shot}
@@ -87,7 +87,7 @@ class PurificationEngine:
 Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
 CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
 In corporate with counterfactual checks, you should naturally integrate clinical self-questioning markers with a question mark at points of uncertainty or divergence (在遇到逻辑分叉或极限情况时，应自然融入探究性的自我提问，展现真实的解题反思与假说排查，例如以以“？”结尾的疑问句进行内部推演，但绝对禁止在文本尾部生硬塞入无意义的问号占位符).
-Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. You are strictly FORBIDDEN from using any meta-narrative terms indicating data sources or retrieval processes, such as 'refs', '参考资料', '检索', '图谱', '根据资料', '说明书显示', '数据源' or '背景信息'. Output ONLY the purified thought chain.{anchors_prompt}
+Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. You are strictly FORBIDDEN from using any meta-narrative terms indicating internal system implementations, such as 'refs', '图谱', '实体库', '关系库', '数据源', 'json_schema', 'answer_body', 'sub_questions' or 'reasoning_chains'. Output ONLY the purified thought chain. You are permitted and highly encouraged to naturally attribute facts using standard, professional references such as "根据药品说明书记载", "临床文献报道指出", or "根据临床研究数据".{anchors_prompt}
 
 问题: {q}
 原始思维链 (CoT) 内容:
