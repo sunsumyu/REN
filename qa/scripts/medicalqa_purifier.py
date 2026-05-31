@@ -32,6 +32,39 @@ from strategies.quality_gate.llm_judge import LLMJudgeStrategy
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
+# 针对 Windows 控制台环境，强行配置标准输出为 UTF-8
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
+async def verify_facet_by_small_model(client: APIClient, facet: str) -> bool:
+    """
+    利用轻量级小模型对视角（facet）进行语义分类，
+    智能判定其是否为“合法的医学/临床视角”或“非法的反问/拒答/占位符”。
+    """
+    system_prompt = (
+        "你是一个极速的语义分类器网关。你的唯一任务是判断给定的文本是否为【合法的医学或临床视角/切面名称】。\n\n"
+        "### ⚖️ 判定准则：\n"
+        "1. 【VALID】：文本是一个干净的词汇或短语，代表某种学术、病理、药理、临床或合规的叙事切面（例如：“药代动力学”、“用药注意事项”、“古籍收采”、“分子机制”、“不良反应预防”）。\n"
+        "2. 【INVALID】：文本是一句人机对话反问、澄清疑问、报错占位符、缺少上下文的抱怨、或者极其冗长的描述（例如：“请提供具体的医疗问题以便规划视角”、“请输入详细病例”、“数据不足无法规划”、“该药物有何副作用？”、“一句话描述”）。\n\n"
+        "### 📤 输出规则：\n"
+        "只输出一个单词：'VALID' 或 'INVALID'。严禁输出任何解释、标点符号或额外空格。"
+    )
+    try:
+        response = await client.call_llm(
+            prompt=f"待测文本: '{facet}'",
+            system_prompt=system_prompt,
+            model_pool="lightweight",
+            stage="视角语义安全校验网关"
+        )
+        result = response.strip().upper()
+        return "INVALID" not in result
+    except Exception as e:
+        logger.error(f"⚠️ 视角小模型网关校验异常: {e}，默认通过。")
+        return True
+
 async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
     """
     Surgically delegate single thought trace purification to modularized PurificationEngine (reusing injected engine).
@@ -58,9 +91,9 @@ def update_env_start_line(env_path: Path, start_line: int):
 
 async def main():
     start_time = time.time()
-    dataset_path = Path("d:/REN/qa/medical_qa_dataset.jsonl")
-    backup_path = Path("d:/REN/qa/medical_qa_dataset_raw.jsonl")
-    logs_dir = Path("d:/REN/qa/logs")
+    dataset_path = parent_dir / "medical_qa_dataset.jsonl"
+    backup_path = parent_dir / "medical_qa_dataset_raw.jsonl"
+    logs_dir = parent_dir / "logs"
     
     purify_start_line = PURIFY_START_LINE
     
@@ -89,7 +122,7 @@ async def main():
             purify_start_line = 1
             logger.info("⚠️ No processed line numbers found in any historical logs. Setting PURIFY_START_LINE to: 1")
             
-        env_path = Path("d:/REN/qa/.env")
+        env_path = parent_dir / ".env"
         try:
             update_env_start_line(env_path, purify_start_line)
             logger.info(f"✨ Dynamically updated PURIFY_START_LINE={purify_start_line} in .env file.")
@@ -170,16 +203,25 @@ async def main():
                 ]
                 
                 async def process_planner(p):
-                    planner_name = p.get("planner", "")
+                    raw_planner_name = p.get("planner", "")
                     raw_answer = p.get("answer", "")
                     
                     if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
-                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{planner_name}' due to template signature.")
+                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{raw_planner_name}' due to template signature.")
                         return None, None
                         
                     if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
-                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{planner_name}' due to safety warning signature.")
+                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{raw_planner_name}' due to safety warning signature.")
                         return None, None
+                    
+                    # 🚦 接入轻量级小模型视角语义校验网关
+                    is_valid = await verify_facet_by_small_model(client, raw_planner_name)
+                    if not is_valid:
+                        logger.warning(f"  🚨 [小模型网关校验拦截] 发现行 {line_idx+1} 的非医学视角占位符: '{raw_planner_name}'。进行安全重置与自愈兜底...")
+                        planner_name = "临床用药安全"
+                        p["planner"] = planner_name
+                    else:
+                        planner_name = raw_planner_name
                     
                     think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
                     if think_match:
@@ -190,6 +232,10 @@ async def main():
                         if facet_match:
                             facet_tag = facet_match.group(1).strip()
                             actual_raw_think = facet_match.group(2).strip()
+                            
+                            # 若发生过网关修正，需同步修正 think 块内的 facet_tag，避免结构不一致
+                            if not is_valid:
+                                facet_tag = "<facet = 临床用药安全>"
                         else:
                             facet_tag = f"<facet = {planner_name}>"
                             actual_raw_think = raw_think
@@ -372,7 +418,7 @@ async def main():
     if purified_diff_logs and not PURIFY_LINES:
         max_processed_line = max(grouped_logs.keys())
         next_start_line = max_processed_line + 1
-        env_path = Path("d:/REN/qa/.env")
+        env_path = parent_dir / ".env"
         try:
             update_env_start_line(env_path, next_start_line)
             logger.info(f"✨ Automatically updated PURIFY_START_LINE={next_start_line} in .env file.")

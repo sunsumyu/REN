@@ -6,16 +6,26 @@
 
 import json
 import re
+import sys
 from pathlib import Path
 
+# 针对 Windows 控制台环境，强行配置标准输出为 UTF-8 以保证对特殊字符的安全打印
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 def run_verification():
-    dataset_path = Path("d:/REN/qa/medical_qa_dataset.jsonl")
+    from pathlib import Path
+    current_dir = Path(__file__).resolve().parent
+    dataset_path = current_dir.parent / "medical_qa_dataset.jsonl"
     
     if not dataset_path.exists():
-        print(f"❌ 未找到数据集文件: {dataset_path}")
+        print(f"[ERROR] 未找到数据集文件: {dataset_path}")
         return
         
-    print("🚀 开始执行数据集净化效果自动化验证...")
+    print("[START] 开始执行数据集净化效果自动化验证...")
     print("-----------------------------------------")
     
     # 绝对禁止词（工程噪声）
@@ -63,9 +73,9 @@ def run_verification():
                         
                         if found_banned:
                             noise_leaks += 1
-                            print(f"⚠️ 行 {line_idx+1} [{planner_name}] 检出工程噪声残留: {found_banned}")
+                            print(f"[WARN] 行 {line_idx+1} [{planner_name}] 检出工程噪声残留: {found_banned}")
                             
-                        # 2. 扫描医学指标是否无损 (对匹配的疾病/药物)
+                        # 2. 扫描医学指标是否无损 (对匹配 of 疾病/药物)
                         for topic, indicators in medical_indicators.items():
                             if topic in q:
                                 # 检查 CoT 或回答正文中是否保留了关键数据
@@ -75,10 +85,10 @@ def run_verification():
                                         missing.append(ind)
                                 if missing:
                                     rigor_failures += 1
-                                    print(f"❌ 行 {line_idx+1} [{planner_name}] 指标缺失: 问题关于 '{topic}'，但未检出关键指标 {missing}")
+                                    print(f"[ERROR] 行 {line_idx+1} [{planner_name}] 指标缺失: 问题关于 '{topic}'，但未检出关键指标 {missing}")
                                     
             except Exception as e:
-                print(f"⚠️ 解析第 {line_idx+1} 行记录失败: {e}")
+                print(f"[WARN] 解析第 {line_idx+1} 行记录失败: {e}")
                 
     print("-----------------------------------------")
     print("📊 验证统计报告 (Verification Summary):")
@@ -86,22 +96,22 @@ def run_verification():
     
     # 报告工程噪声残留情况
     if noise_leaks == 0:
-        print("  - 🎉 工程噪声零残留校验 (Noise-Free Check): PASS (100% 纯净度)")
+        print("  - [PASS] 工程噪声零残留校验 (Noise-Free Check): OK (100% 纯净度)")
     else:
         leak_rate = (noise_leaks / total_checks) * 100
-        print(f"  - ❌ 工程噪声残留校验失败: 发现 {noise_leaks} 处泄露 (泄漏率: {leak_rate:.2f}%)")
+        print(f"  - [FAIL] 工程噪声残留校验失败: 发现 {noise_leaks} 处泄露 (泄漏率: {leak_rate:.2f}%)")
         
     # 报告核心硬指标无损情况
     if rigor_failures == 0:
-        print("  - 🎉 医学硬指标无损校验 (Medical Rigor Check): PASS (100% 完整性)")
+        print("  - [PASS] 医学硬指标无损校验 (Medical Rigor Check): OK (100% 完整性)")
     else:
-        print(f"  - ❌ 医学硬指标无损校验失败: 发现 {rigor_failures} 处缺失或曲解")
+        print(f"  - [FAIL] 医学硬指标无损校验失败: 发现 {rigor_failures} 处缺失或曲解")
         
     print("-----------------------------------------")
     if noise_leaks == 0 and rigor_failures == 0:
-        print("🌟 结论: 该数据集已经通过了最高级别的企业生产级质量校验！")
+        print("[SUCCESS] 结论: 该数据集已经通过了最高级别的企业生产级质量校验！")
     else:
-        print("🌟 结论: 仍有部分样本需进一步净化，请确认或重新调整系统 Prompt。")
+        print("[WARN] 结论: 仍有部分样本需进一步净化，请确认或重新调整系统 Prompt。")
 
 if __name__ == "__main__":
     run_verification()

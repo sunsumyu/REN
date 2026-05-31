@@ -98,13 +98,13 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
 请严格按照净化重写指南，仅输出重构后的纯净思维链本身。"""
             try:
                 stage_prefix = f"[{line_num}行] " if line_num else ""
-                # 设定 max_tokens=1600 限制大模型冗余度释放，挤掉生成水分，将单视角生成耗时缩短 35% 以上
+                # 设定 max_tokens=3072 给深层临床药理因果推演提供充足的空间，避免物理截断
                 purified = await self.llm_service.call_llm(
                     prompt, 
                     system_prompt=system_prompt, 
                     model_pool="premium", 
                     stage=f"{stage_prefix}思维链重写提纯 - {smoothed_planner}",
-                    max_tokens=1600
+                    max_tokens=3072
                 )
                 purified = purified.replace("<think>", "").replace("</think>", "").strip()
                 
@@ -114,9 +114,9 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
                     purified = "\n".join(purified.splitlines()[:-1])
                 purified = purified.strip()
                 
-                purified = purifier_module.post_strip_meta_openings(purified)
-                # 🌟 [本地段落序号与过渡结构平滑器 - 0 延时物理擦除一票否决结构化泄漏风险]
-                purified = purifier_module.post_strip_structural_transitions(purified)
+                # 🟢 【泛化升级】：将去噪、抹除做题家序号与残缺自愈完全交给轻量级大模型（model_pool="lightweight"）进行智能语义重构，
+                # 彻底废除脆弱、易破损主语的 post_strip_meta_openings 和 post_strip_structural_transitions 正则。
+                purified = await self.healing_service.heal_conversational_noise(purified, line_num=line_num)
                 
                 if purifier_module.is_catastrophic_format_collapse(purified):
                     logger.warning(f"   🚨 Attempt {attempt+1} triggered SYNTAX FORMAT COLLAPSE! Local intercepting...")
@@ -146,6 +146,51 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
                 
                 logger.info(f"   └─ Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Depth: {d_score}/100] | Reason: {reason}")
                 
+                # 🌟 [方案四 - 语义提纯网关触发]
+                if p_score < THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
+                    logger.info("   🛡️ [方案四 - 语义提纯网关触发] 检测到医学及逻辑达标，但纯净度偏低。启动企业级语义重构...")
+                    purifier_prompt = f"""你是一个顶级循证医学学术编辑。你的任务是将一段混有“开场废话”、“视角扮演宣告”和“元叙事噪声”的医疗推理思维链（CoT），重构为一段完全连贯、自然流动且绝对纯净的临床专家学术推理心流。
+
+### 🛠️ 重构与平滑红线：
+1. ❌ 彻底移除任何元叙事废话与开场白（如：“好的”、“我们被要求以...视角”、“问题是...”、“我的分析是...”）。
+2. 🔄 语义平滑融合：如果开场句中包含关键实体（例如“地氟烷”、“瑞波西利”等药物或疾病名称），请将该实体与真实的药理/推演逻辑完美融合为一句专业的学术开场白（例如，将“我们被要求分析地氟烷的禁忌”重构为“解构地氟烷的临床禁忌边界，必须剖析其...”），绝对不要直接截断导致首句不连贯！
+3. 🔗 修复指代关系：确保第一句有明确的医学实体作为主语，将任何模糊的代词（如“它”、“该药物”、“此类患者”）替换为具体的医学名字，确保全篇行云流水、因果严密。
+4. 📤 仅输出重构后的纯净思维链本身，不要包裹在 <think> 或 markdown 块中，不要有任何额外解释。
+
+原始思维链内容:
+\"\"\"
+{purified}
+\"\"\""""
+                    try:
+                        purified_smooth = await self.llm_service.call_llm(
+                            purifier_prompt,
+                            model_pool="lightweight",
+                            stage=f"{stage_prefix}思维链语义提纯 - {smoothed_planner}"
+                        )
+                        purified_smooth = purified_smooth.replace("<think>", "").replace("</think>", "").strip()
+                        if purified_smooth.startswith("```"):
+                            purified_smooth = "\n".join(purified_smooth.splitlines()[1:])
+                        if purified_smooth.endswith("```"):
+                            purified_smooth = "\n".join(purified_smooth.splitlines()[:-1])
+                        purified_smooth = purified_smooth.strip()
+                        
+                        # 🟢 【方案四提纯】：提纯模型已经过详尽 prompt 去除了过渡序号和开场噪音，直接信任并保留其输出
+                        pass
+                        
+                        # 重新运行裁判打分校验
+                        scores_smooth = await self.evaluator.evaluate(q, smoothed_planner, raw_think, purified_smooth, line_num=line_num)
+                        p_score_smooth = purifier_module.safe_int(scores_smooth.get("semantic_purity_score", 90))
+                        
+                        logger.info(f"   └─ 提纯后重校验: [Purity: {p_score_smooth}/100] | Reason: {scores_smooth.get('reason', 'N/A')}")
+                        
+                        if p_score_smooth >= THRESHOLD_PURITY:
+                            logger.info("   🎉 [方案四 - 语义提纯成功] 纯净度已完全达标！")
+                            purified = purified_smooth
+                            scores = scores_smooth
+                            p_score = p_score_smooth
+                    except Exception as e_smooth:
+                        logger.error(f"   ⚠️ [方案四 - 提纯发生异常]: {e_smooth}")
+
                 if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
                     logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}! Healing academic entities...")
                     purified = await self.healing_service.verify_and_repair_academic_entities(
