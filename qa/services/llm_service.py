@@ -103,6 +103,7 @@ class LLMService(ILLMService):
         backoff = 2.0
         
         while True:
+            req_start_time = time.time()
             try:
                 async with self.global_semaphore:
                     response = await self.client.request(method, url, timeout=120.0, **kwargs)
@@ -122,11 +123,12 @@ class LLMService(ILLMService):
                         )
                     return res_json
             except (httpx.HTTPStatusError, httpx.HTTPError, httpx.NetworkError) as e:
-                logger.error(f"HTTP/API error on request {method} {url}: {e}")
+                elapsed = time.time() - req_start_time
+                logger.error(f"HTTP/API error on request {method} {url} (elapsed: {elapsed:.2f}s): {e}")
                 # 🚨 [504 Gateway Timeout 熔断保护]：
                 # 如果是网关对大模型超时未返回强行进行了 HTTP 504 关闭，直接物理熔断抛出异常，不进行退避重试
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code == 504:
-                    logger.critical("🚨 [504 Timeout Intercept] Gateway timed out waiting for LLM and closed HTTP connection. Aborting retries to prevent queue congestion.")
+                    logger.critical(f"🚨 [504 Timeout Intercept] Gateway timed out waiting for LLM after {elapsed:.2f}s and closed HTTP connection. Aborting retries to prevent queue congestion.")
                     raise e
             
             retries += 1
