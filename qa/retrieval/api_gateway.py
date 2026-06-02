@@ -182,63 +182,108 @@ class APIGatewayService:
 
         # 使用真实的网页实时抓取 (Web Scraping) 替代硬编码 Mock 
         # 当没有 API Key 时，通过爬取公开网页获取真实文本
-        loop = asyncio.get_event_loop()
+        import urllib.parse
+        import re
+        import httpx
         
-        def scrape_drug_info():
-            import urllib.request
-            import urllib.parse
-            import re
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1"
+        }
+        
+        # 提取纯文本辅助函数
+        def extract_text_snippet(html_content: str, keyword: str, window_size: int = 150) -> str:
+            # 移除 script 和 style
+            text = re.sub(r'<script.*?>.*?</script>', ' ', html_content, flags=re.IGNORECASE|re.DOTALL)
+            text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.IGNORECASE|re.DOTALL)
+            # 移除所有 HTML 标签
+            text = re.sub(r'<[^>]+>', ' ', text)
+            # 合并空白字符
+            text = re.sub(r'\s+', ' ', text).strip()
             
-            # 首选尝试抓取百度百科的药品描述，作为真实数据的来源
-            try:
-                url = f"https://baike.baidu.com/item/{urllib.parse.quote(drug_name)}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-                with urllib.request.urlopen(req, timeout=3.0) as r:
-                    html = r.read().decode('utf-8', errors='ignore')
+            # 找寻 keyword
+            idx = text.find(keyword)
+            if idx != -1:
+                start = max(0, idx - window_size)
+                end = min(len(text), idx + window_size)
+                return text[start:end]
+            return ""
+
+        async def scrape_drug_info():
+            # 彻底禁用系统环境变量代理（trust_env=False），直接连外网，防止 VPN 的代理隧道干扰 TLS 握手
+            async with httpx.AsyncClient(verify=False, timeout=8.0, trust_env=False) as client:
+                # 1. 首选尝试抓取百度百科的药品描述，作为真实数据的来源
+                try:
+                    baike_url = f"https://baike.baidu.com/item/{urllib.parse.quote(drug_name)}"
+                    baike_headers = headers.copy()
+                    baike_headers["Referer"] = "https://www.baidu.com/"
+                    resp = await client.get(baike_url, headers=baike_headers, follow_redirects=True)
+                    if resp.status_code == 200:
+                        html = resp.text
+                        # 提取 meta description 作为药物简介
+                        match = re.search(r'<meta name="description" content="(.*?)">', html, re.IGNORECASE)
+                        if match:
+                            desc = match.group(1).strip()
+                            if desc and drug_name in desc:
+                                return [{
+                                    "source": "在线医学百科数据库实时抓取",
+                                    "context": f"【公开药品档案】: {desc}",
+                                    "category": "药品信息",
+                                    "metadata": {"drug_name": drug_name, "scrape_source": "baike"}
+                                }]
+                except Exception as e:
+                    logger.warning(f"Baike scrape failed for '{drug_name}': {e}")
                     
-                    # 提取 meta description 作为药物简介
-                    match = re.search(r'<meta name="description" content="(.*?)">', html, re.IGNORECASE)
-                    if match:
-                        desc = match.group(1).strip()
-                        if desc:
+                # 2. 如果百科失败，降级抓取 39健康网搜索页面的纯文本
+                try:
+                    url_39 = f"https://yp.39.net/search/{urllib.parse.quote(drug_name)}.shtml"
+                    headers_39 = headers.copy()
+                    headers_39["Referer"] = "https://yp.39.net/"
+                    resp_39 = await client.get(url_39, headers=headers_39, follow_redirects=True)
+                    
+                    if resp_39.status_code == 200:
+                        # 39健康网多数页面是 GB2312/GBK
+                        html_39 = resp_39.content.decode('gbk', errors='ignore') 
+                        
+                        snippet = extract_text_snippet(html_39, drug_name, 250)
+                        if snippet:
                             return [{
-                                "source": "在线医学百科数据库实时抓取",
-                                "context": f"【公开药品档案】: {desc}",
+                                "source": "39健康网在线实时抓取",
+                                "context": f"【39健康网实时检索】: 检索到关于药物【{drug_name}】的相关描述: “...{snippet}...”。请详细阅读说明书或遵医嘱。",
                                 "category": "药品信息",
-                                "metadata": {"drug_name": drug_name, "scrape_source": "baike"}
+                                "metadata": {"drug_name": drug_name, "scrape_source": "39net"}
                             }]
-            except Exception as e:
-                logger.warning(f"Baike scrape failed for '{drug_name}': {e}")
-                
-            # 如果百科失败，降级抓取 39健康网搜索页面的纯文本
-            try:
-                url_39 = f"https://yp.39.net/search/{urllib.parse.quote(drug_name)}.shtml"
-                req_39 = urllib.request.Request(url_39, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-                with urllib.request.urlopen(req_39, timeout=3.0) as r:
-                    html_39 = r.read().decode('gbk', errors='ignore') # 39健康网多数页面是 GB2312/GBK
+                        else:
+                            # 提取简单的页面标题兜底
+                            title_match = re.search(r'<title>(.*?)</title>', html_39, re.IGNORECASE)
+                            title_text = title_match.group(1).strip() if title_match else ""
+                            if drug_name in title_text:
+                                return [{
+                                    "source": "39健康网在线实时抓取",
+                                    "context": f"【39健康网实时检索】: 仅检索到网页标题: {title_text}。未能获取正文详情。",
+                                    "category": "药品信息",
+                                    "metadata": {"drug_name": drug_name, "scrape_source": "39net_title_only"}
+                                }]
+                except Exception as e:
+                    logger.warning(f"39net scrape failed for '{drug_name}': {e}")
                     
-                    # 提取简单的页面标题和一点上下文
-                    title_match = re.search(r'<title>(.*?)</title>', html_39, re.IGNORECASE)
-                    title_text = title_match.group(1).strip() if title_match else ""
-                    if drug_name in title_text:
-                        return [{
-                            "source": "39健康网在线实时抓取",
-                            "context": f"【39健康网实时检索】: 检索到关于药物【{drug_name}】的相关条目。网页标题信息: {title_text}。请详细阅读原网页说明书或遵医嘱。",
-                            "category": "药品信息",
-                            "metadata": {"drug_name": drug_name, "scrape_source": "39net"}
-                        }]
-            except Exception as e:
-                logger.warning(f"39net scrape failed for '{drug_name}': {e}")
+                # 3. 如果抓取都被反爬虫拦截，兜底说明
+                return [{
+                    "source": "在线公开检索系统抓取异常",
+                    "context": f"【未收录或网络异常】: 当前未能在公开在线网络(39健康/百科)中抓取到关于【{drug_name}】的详细真实数据，可能被防爬拦截，请参考医师建议。",
+                    "category": "药品信息",
+                    "metadata": {"drug_name": drug_name, "status": "scrape_failed"}
+                }]
                 
-            # 如果抓取都被反爬虫拦截，为了防止大模型生成流水线崩溃，返回空数据或兜底说明
-            return [{
-                "source": "在线公开检索系统抓取异常",
-                "context": f"【未收录或网络异常】: 当前未能在公开在线网络(39健康/百科)中抓取到关于【{drug_name}】的详细真实数据，可能被防爬拦截，请参考医师建议。",
-                "category": "药品信息",
-                "metadata": {"drug_name": drug_name, "status": "scrape_failed"}
-            }]
-            
-        mock_data = await loop.run_in_executor(None, scrape_drug_info)
+        mock_data = await scrape_drug_info()
 
         self._save_cache_response(cache_key, drug_name, "yaozh_39", mock_data)
         return mock_data

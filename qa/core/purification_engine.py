@@ -39,7 +39,8 @@ class PurificationEngine:
         planner: str, 
         raw_think: str, 
         line_num: int = None,
-        refs: List[Dict[str, Any]] = None
+        refs: List[Dict[str, Any]] = None,
+        simplify: bool = False
     ) -> Tuple[str, Dict[str, Any]]:
         """
         利用反馈控制环路和无监督“刚性事实锚点”注入机制，将原始混杂 RAG 与工程噪声的思维链，
@@ -48,7 +49,7 @@ class PurificationEngine:
         max_retries = 3
         THRESHOLD_PURITY = 85
         THRESHOLD_RIGOR = 90
-        THRESHOLD_DEPTH = 85
+        THRESHOLD_DEPTH = 50 if simplify else 85
         
         last_scores = {}
         feedback_prompt = ""
@@ -57,7 +58,7 @@ class PurificationEngine:
         smoothed_planner = await purifier_module.smooth_planner_term(self.llm_service, planner, line_num=line_num)
         
         few_shot = purifier_module.FACET_FEW_SHOTS.get(planner, purifier_module.FEW_SHOT_GENERAL)
-        system_prompt = purifier_module.get_purify_system_prompt(smoothed_planner)
+        system_prompt = purifier_module.get_purify_system_prompt(smoothed_planner, simplify=simplify)
         directive = purifier_module.get_system_directive(smoothed_planner)
 
         # 🛡️ 【企业级刚性事实锚点解析注入】提取绝对正确的原始图谱或联网事实，强行阻断幻觉空间
@@ -81,6 +82,10 @@ class PurificationEngine:
 【⚠️ 确证事实对齐】：请注意，以上数据为临床确证事实，你的药理因果推演必须与之完全吻合，绝对禁止对其中任何药理关系、不良反应或用药禁忌进行任何否定、篡改或凭空编造！"""
         
         for attempt in range(max_retries):
+            simplify_prompt_addition = ""
+            if simplify:
+                simplify_prompt_addition = "\n【⚠️ 极简重构硬性要求】：该问题为简单事实查询，严禁脑补虚构复杂的分子机制或大样本临床试验。请直接用 2-3 步精炼的因果推导得出结论（禁止大段微观机制演绎），但必须保持流畅的探究性临床推理心流（至少 150 字），不能只写一句话结论或复读说明书条目。"
+            
             prompt = f"""{few_shot}
 
 ### 系统指令 (System Directive)：
@@ -95,7 +100,7 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
 {stripped_think}
 \"\"\"{feedback_prompt}
 
-请严格按照净化重写指南，仅输出重构后的纯净思维链本身。"""
+请严格按照净化重写指南，仅输出重构后的纯净思维链本身。{simplify_prompt_addition}"""
             try:
                 stage_prefix = f"[{line_num}行] " if line_num else ""
                 # 设定 max_tokens=3072 给深层临床药理因果推演提供充足的空间，避免物理截断

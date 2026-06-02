@@ -188,11 +188,10 @@ class LLMService(ILLMService):
             except (httpx.HTTPStatusError, httpx.HTTPError, httpx.NetworkError) as e:
                 elapsed = time.time() - req_start_time
                 logger.error(f"HTTP/API error on request {method} {url} (elapsed: {elapsed:.2f}s): {e}")
-                # 🚨 [504 Gateway Timeout 熔断保护]：
-                # 如果是网关对大模型超时未返回强行进行了 HTTP 504 关闭，直接物理熔断抛出异常，不进行退避重试
+                # 🚨 [504 Gateway Timeout 退避重试]：
+                # 如果是网关对大模型超时未返回强行进行了 HTTP 504 关闭，改为允许退避重试以增加容错性
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code == 504:
-                    logger.critical(f"🚨 [504 Timeout Intercept] Gateway timed out waiting for LLM after {elapsed:.2f}s and closed HTTP connection. Aborting retries to prevent queue congestion.")
-                    raise e
+                    logger.warning(f"⚠️ [504 Timeout Intercept] Gateway timed out waiting for LLM after {elapsed:.2f}s. Will retry to recover.")
             
             retries += 1
             if retries > config.MAX_RETRIES:

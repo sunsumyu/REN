@@ -66,11 +66,99 @@ async def verify_facet_by_small_model(client: APIClient, facet: str) -> bool:
         logger.error(f"⚠️ 视角小模型网关校验异常: {e}，默认通过。")
         return True
 
-async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+async def check_semantic_compatibility(client: APIClient, question: str, facet: str) -> str:
+    """
+    利用轻量级小模型（deepseek-v4-flash）对“问题”与“视角”进行语义匹配和兼容性校验。
+    返回:
+      - 'COMPATIBLE': 视角与问题高度兼容，正常执行深度提纯。
+      - 'COMPATIBLE_SIMPLE': 视角可用于解题，但由于问题本身极其简单（如查剂量、成分等事实问题），
+                             必须极简化处理，严禁脑补和虚构复杂机制。
+      - 'FORCED_SKIP': 属于明显的强行视角硬套或无谓的过度逻辑漂移，直接过滤丢弃该切面。
+    """
+    system_prompt = (
+        "你是一个极其严格的医疗问答视角语义匹配网关（Gatekeeper）。你的唯一任务是评估给定的【主问题】与【分析视角/切面】之间的语义适配性，以防范数据清洗过程中的‘视角强行套用’及由此引发的‘虚假因果关系编造’。\n\n"
+        "### ⚖️ 评估判定规则：\n"
+        "1. 【FORCED_SKIP】(绝对禁止强套)：\n"
+        "   - 当主问题是一个简单的事实查找（如具体的药品剂量、单次口服量、药品成分、药品包装规格等），却被强行匹配了极其宏观或深度学术化的视角（如：“分子机制”、“药代动力学”、“特殊人群安全”、“数据隐私”、“循证证据”等），且原始思维链为了迎合该视角不得不进行大篇幅的牵强附会或事实捏造（如将 0.2g 单次剂量解释为 IC50 建模推导、无端捏造特定性别限制）。这类情况属于严重的强行视角，直接舍弃。\n"
+        "2. 【COMPATIBLE_SIMPLE】(简单兼容，极简推理)：\n"
+        "   - 当主问题是相对直接的临床问题，匹配了有一定关联但无需长篇大论的视角（例如：查剂量问题匹配了“药物过量”、“不良反应”或“禁忌症”）。这些视角可以保留，但逻辑非常单一（直接回答剂量安全上限或常见副作用即可），不需要进行微观病生理链条的深度因果推演。此时判定为 COMPATIBLE_SIMPLE。\n"
+        "3. 【COMPATIBLE】(完全兼容，深度推理)：\n"
+        "   - 问题本身具有探索性、机制性，或者与视角高度贴合（例如：“缺乏DPYD为何导致严重5-FU毒性” 匹配 “分子机制”；“急性心梗患者为何禁用非洛地平” 匹配 “用药方案与配伍禁忌”）。这需要呈现深度、复杂的临床或药理演绎。判定为 COMPATIBLE。\n\n"
+        "### 📤 输出规则：\n"
+        "只输出一个单词：'COMPATIBLE'、'COMPATIBLE_SIMPLE' 或 'FORCED_SKIP'。严禁输出任何解释、标点符号或额外空格。"
+    )
+    user_prompt = f"主问题: '{question}'\n分析视角: '{facet}'"
+    try:
+        response = await client.call_llm(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            model_pool="lightweight",
+            stage="视角适配语义网关"
+        )
+        result = response.strip().upper()
+        for verdict in ["FORCED_SKIP", "COMPATIBLE_SIMPLE", "COMPATIBLE"]:
+            if verdict in result:
+                return verdict
+        return "COMPATIBLE"
+    except Exception as e:
+        logger.error(f"⚠️ 视角适配网关校验异常: {e}，默认完全兼容。")
+        return "COMPATIBLE"
+
+async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None, simplify: bool = False) -> Tuple[str, Dict[str, Any]]:
     """
     Surgically delegate single thought trace purification to modularized PurificationEngine (reusing injected engine).
     """
-    return await engine.purify_single_think(q, planner, raw_think, line_num, refs)
+    return await engine.purify_single_think(q, planner, raw_think, line_num, refs, simplify)
+
+async def generate_diff_analysis(llm_service, item: dict) -> str:
+    """
+    使用轻量级大模型对单个视角的提纯差异进行智能分析，生成
+    "原始 CoT 存在的问题" 与 "提纯改动说明" 两段结构化叙述。
+    """
+    original = item.get("original_think", "")
+    purified = item.get("purified_think", "")
+    question = item.get("question", "")
+    facet = item.get("facet", "")
+    judge_reason = item.get("scores", {}).get("reason", "")
+    compatibility = item.get("compatibility", "COMPATIBLE")
+    simplify = item.get("simplify", False)
+
+    mode_hint = ""
+    if compatibility == "COMPATIBLE_SIMPLE" or simplify:
+        mode_hint = "（注：本视角被语义网关判定为 COMPATIBLE_SIMPLE 极简模式，提纯时采用了精简指令。）"
+    elif compatibility == "FORCED_SKIP":
+        mode_hint = "（注：本视角已被语义网关拦截丢弃，未进入提纯流程。）"
+
+    prompt = f"""你是医疗 CoT 数据集提纯质检专家。请对以下思维链的"原始版本"与"提纯后版本"进行简明差异分析。
+{mode_hint}
+主问题: {question}
+临床视角: {facet}
+裁判评审意见: {judge_reason}
+
+原始思维链:
+\"\"\"
+{original[:1200]}
+\"\"\"
+
+提纯后思维链:
+\"\"\"
+{purified[:1200]}
+\"\"\"
+
+请严格按以下格式输出，每项2-4句话，中文简洁叙述，不加任何 Markdown 标题或额外说明：
+【原始问题】: （列举原始思维链中存在的具体质量缺陷，如：工程词汇泄露、RAG引用痕迹、结构化标题、元叙述废话、推理平铺直叙、字数不足等）
+【改动说明】: （说明提纯过程的主要改动内容及效果，若有信息损失或过度简化也需指出）"""
+    try:
+        response = await llm_service.call_llm(
+            prompt,
+            model_pool="lightweight",
+            stage=f"[{item.get('line_number')}行] 提纯差异分析 - {facet}"
+        )
+        return response.strip()
+    except Exception as e:
+        logger.warning(f"⚠️ 差异分析生成失败: {e}")
+        return "【原始问题】: 分析生成失败。\n【改动说明】: 分析生成失败。"
+
 
 def update_env_start_line(env_path: Path, start_line: int):
     """
@@ -204,66 +292,85 @@ async def main():
                 ]
                 
                 async def process_planner(p):
-                    raw_planner_name = p.get("planner", "")
-                    raw_answer = p.get("answer", "")
-                    
-                    if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
-                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{raw_planner_name}' due to template signature.")
-                        return None, None
+                    try:
+                        raw_planner_name = p.get("planner", "")
+                        raw_answer = p.get("answer", "")
                         
-                    if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
-                        logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{raw_planner_name}' due to safety warning signature.")
-                        return None, None
-                    
-                    # 🚦 接入轻量级小模型视角语义校验网关
-                    is_valid = await verify_facet_by_small_model(client, raw_planner_name)
-                    if not is_valid:
-                        logger.warning(f"  🚨 [小模型网关校验拦截] 发现行 {line_idx+1} 的非医学视角占位符: '{raw_planner_name}'。进行安全重置与自愈兜底...")
-                        planner_name = "临床用药安全"
-                        p["planner"] = planner_name
-                    else:
-                        planner_name = raw_planner_name
-                    
-                    think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
-                    if think_match:
-                        raw_think = think_match.group(1).strip()
-                        answer_body = think_match.group(2).strip()
-                        
-                        facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
-                        if facet_match:
-                            facet_tag = facet_match.group(1).strip()
-                            actual_raw_think = facet_match.group(2).strip()
+                        if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
+                            logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{raw_planner_name}' due to template signature.")
+                            return None, None
                             
-                            # 若发生过网关修正，需同步修正 think 块内的 facet_tag，避免结构不一致
-                            if not is_valid:
-                                facet_tag = "<facet = 临床用药安全>"
-                        else:
-                            facet_tag = f"<facet = {planner_name}>"
-                            actual_raw_think = raw_think
-                        
-                        async with sem:
-                            logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
-                            purified_think, score_dict = await purify_single_think(engine, q, planner_name, actual_raw_think, line_num=line_idx+1, refs=refs)
-                        
-                        # 🚨 核心网关：若最终质量网关判定未通过（包含高仿真幻觉风险等），在此阶段直接抛弃该视角，绝不落盘污染！
-                        if not score_dict.get("is_passed", False):
-                            logger.critical(f"   ❌ [Hallucination/Quality Gate Intercept] Drop facet '{planner_name}' for Line {line_idx+1} due to Quality Gate Failure.")
+                        if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
+                            logger.warning(f"  🚨 Skip Line {line_idx+1} facet '{raw_planner_name}' due to safety warning signature.")
                             return None, None
                         
-                        p_new = p.copy()
-                        p_new["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                        # 🚦 接入轻量级小模型视角语义校验网关
+                        is_valid = await verify_facet_by_small_model(client, raw_planner_name)
+                        if not is_valid:
+                            logger.warning(f"  🚨 [小模型网关校验拦截] 发现行 {line_idx+1} 的非医学视角占位符: '{raw_planner_name}'。进行安全重置与自愈兜底...")
+                            planner_name = "临床用药安全"
+                            p["planner"] = planner_name
+                        else:
+                            planner_name = raw_planner_name
                         
-                        diff_log = {
-                            "line_number": line_idx + 1,
-                            "question": q,
-                            "facet": planner_name,
-                            "original_think": raw_think,
-                            "purified_think": purified_think,
-                            "scores": score_dict
-                        }
-                        return p_new, diff_log
-                    else:
-                        return p, None
+                        # 🚦 [企业级语义适配度校验网关]：检测主问题与当前视角是否强套
+                        compatibility = await check_semantic_compatibility(client, q, planner_name)
+                        if compatibility == "FORCED_SKIP":
+                            logger.critical(f"  🚨 [企业级网关强行视角拦截] 拦截行 {line_idx+1} 的强套视角 '{planner_name}' 并执行物理剪枝丢弃。")
+                            return None, None
+                        
+                        simplify = (compatibility == "COMPATIBLE_SIMPLE")
+                        if simplify:
+                            logger.info(f"  💡 [企业级网关简化提示] 行 {line_idx+1} 的视角 '{planner_name}' 与简单问题匹配，开启极简重构。")
+                        
+                        think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
+                        if think_match:
+                            raw_think = think_match.group(1).strip()
+                            answer_body = think_match.group(2).strip()
+                            
+                            facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
+                            if facet_match:
+                                facet_tag = facet_match.group(1).strip()
+                                actual_raw_think = facet_match.group(2).strip()
+                                
+                                # 若发生过网关修正，需同步修正 think 块内的 facet_tag，避免结构不一致
+                                if not is_valid:
+                                    facet_tag = "<facet = 临床用药安全>"
+                            else:
+                                facet_tag = f"<facet = {planner_name}>"
+                                actual_raw_think = raw_think
+                            
+                            async with sem:
+                                logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
+                                purified_think, score_dict = await purify_single_think(
+                                    engine, q, planner_name, actual_raw_think, 
+                                    line_num=line_idx+1, refs=refs, simplify=simplify
+                                )
+                            
+                            # 🚨 核心网关：若最终质量网关判定未通过（包含高仿真幻觉风险等），在此阶段直接抛弃该视角，绝不落盘污染！
+                            if not score_dict.get("is_passed", False):
+                                logger.critical(f"   ❌ [Hallucination/Quality Gate Intercept] Drop facet '{planner_name}' for Line {line_idx+1} due to Quality Gate Failure.")
+                                return None, None
+                            
+                            p_new = p.copy()
+                            p_new["answer"] = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                            
+                            diff_log = {
+                                "line_number": line_idx + 1,
+                                "question": q,
+                                "facet": planner_name,
+                                "original_think": raw_think,
+                                "purified_think": purified_think,
+                                "scores": score_dict,
+                                "compatibility": compatibility,
+                                "simplify": simplify
+                            }
+                            return p_new, diff_log
+                        else:
+                            return p, None
+                    except Exception as e:
+                        logger.error(f"❌ [Exception Intercept] Exception occurred when purifying line {line_idx+1} facet '{p.get('planner', '')}': {e}. Drop this facet to prevent pollution.")
+                        return None, None
  
                 # 并发执行单行内的所有切面
                 planner_tasks = [process_planner(p) for p in planners]
@@ -353,6 +460,15 @@ async def main():
         
     diff_log_path = logs_dir / f"purification_run_{line_range}{timestamp}.md"
     latest_log_path = logs_dir / "purification_run.md"
+
+    # 🧠 [批量差异分析] 在写报告前，并发调用轻量级大模型对每个视角生成原始问题分析与改动说明
+    if purified_diff_logs:
+        logger.info(f"🔬 Running batch diff analysis for {len(purified_diff_logs)} facets using lightweight LLM...")
+        analysis_tasks = [generate_diff_analysis(client.llm_service, item) for item in purified_diff_logs]
+        analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+        for item, analysis in zip(purified_diff_logs, analyses):
+            item["diff_analysis"] = analysis if isinstance(analysis, str) else "分析生成失败。"
+
     logger.info(f"📝 Writing detailed diff logs to: {diff_log_path}...")
     
     with open(diff_log_path, 'w', encoding='utf-8') as lf:
@@ -383,6 +499,26 @@ async def main():
                     lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
                 else:
                     lf.write("\n")
+                
+                # 🔬 差异分析段：原始问题 & 改动说明
+                compatibility_val = item.get("compatibility", "COMPATIBLE")
+                simplify_flag = item.get("simplify", False)
+                mode_badge = ""
+                if compatibility_val == "COMPATIBLE_SIMPLE" or simplify_flag:
+                    mode_badge = " 🔵 `SIMPLIFY 极简模式`"
+                
+                lf.write(f"#### 🔬 原始问题 & 改动说明{mode_badge}\n\n")
+                diff_analysis = item.get("diff_analysis", "")
+                if diff_analysis:
+                    for al in diff_analysis.split("\n"):
+                        al = al.strip()
+                        if al.startswith("【原始问题】:"):
+                            lf.write(f"- **🔴 原始 CoT 存在的问题**: {al[len('【原始问题】:'):].strip()}\n")
+                        elif al.startswith("【改动说明】:"):
+                            lf.write(f"- **🟢 提纯改动说明**: {al[len('【改动说明】:'):].strip()}\n")
+                        elif al:
+                            lf.write(f"  {al}\n")
+                lf.write("\n")
                 
                 lf.write("#### 🔍 提纯前后对比 (Before & After Contrast)\n\n")
                 lf.write("````carousel\n")
