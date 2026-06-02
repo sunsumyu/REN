@@ -5,6 +5,7 @@ import logging
 import random
 import json
 import time
+import os
 from typing import List, Dict, Any, Tuple
 from abc import ABC, abstractmethod
 import config
@@ -31,11 +32,14 @@ class LLMService(ILLMService):
         self.global_semaphore = global_semaphore
         self.supported_models: List[str] = []
 
-    async def init_supported_models(self):
+    async def init_supported_models(self, force: bool = False):
         """
         Dynamically fetch the list of supported models from the gateway.
+        Supports offline caching in 'supported_models_cache.json' to handle network glitches.
         """
-        if self.supported_models:
+        cache_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "supported_models_cache.json")
+        
+        if self.supported_models and not force:
             return
             
         headers = {
@@ -55,18 +59,45 @@ class LLMService(ILLMService):
         try:
             response = await self.client.get(url, headers=headers, timeout=10.0)
             if response.status_code == 200:
-                res_data = response.json()
+                try:
+                    res_data = response.json()
+                except json.JSONDecodeError as je:
+                    logger.error(
+                        f"❌ 获取支持模型时 JSON 解析失败 (JSONDecodeError): {url}\n"
+                        f"  - 响应状态码: {response.status_code}\n"
+                        f"  - 响应头部: {dict(response.headers)}\n"
+                        f"  - 响应内容 (前1000字): {repr(response.text[:1000])}"
+                    )
+                    raise je
                 if isinstance(res_data, dict) and "data" in res_data:
                     self.supported_models = [item.get("id") for item in res_data["data"] if item.get("id")]
-                    logger.info(f"Successfully loaded {len(self.supported_models)} supported models dynamically!")
+                    logger.info(f"Successfully loaded {len(self.supported_models)} supported models dynamically from gateway!")
+                    # Write to local cache
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump(self.supported_models, f, ensure_ascii=False, indent=2)
+                        logger.info(f"Updated supported models cache file: {cache_file}")
+                    except Exception as cache_err:
+                        logger.warning(f"Failed to save supported models to cache: {cache_err}")
+                    return
             else:
                 logger.warning(f"Failed to query supported models from {url}: HTTP {response.status_code}")
         except Exception as e:
             logger.warning(f"Error querying supported models from {url}: {e}")
+            
+        # Fallback to local cache if query failed or gateway was unreachable
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    self.supported_models = json.load(f)
+                logger.info(f"Loaded supported models from local cache file: {cache_file} (Total: {len(self.supported_models)} models)")
+            except Exception as cache_err:
+                logger.error(f"Failed to load supported models from cache file: {cache_err}")
 
-    def _resolve_model(self, model_pool: str, is_structured: bool = False) -> str:
+    async def _resolve_model(self, model_pool: str, is_structured: bool = False, force_refresh_on_missing: bool = True) -> str:
         """
         Resolve the model pool name to the actual model identifier from config.
+        If model candidate is not found in currently loaded list, dynamically force-refresh from gateway.
         """
         pool = model_pool.lower()
         
@@ -81,17 +112,40 @@ class LLMService(ILLMService):
         else:
             model_candidate = config.MODEL_POOL_PREMIUM
             
-        # Verify compatibility against dynamically loaded models, with fallback
-        if self.supported_models and model_candidate not in self.supported_models:
-            logger.warning(f"Configured model '{model_candidate}' is not present in supported models list.")
-            if config.LLM_MODEL in self.supported_models:
-                logger.info(f"Routing to verified default LLM_MODEL: '{config.LLM_MODEL}'")
-                return config.LLM_MODEL
-            elif self.supported_models:
-                fallback_first = self.supported_models[0]
-                logger.info(f"Routing to first available verified model: '{fallback_first}'")
-                return fallback_first
-                
+        def find_match():
+            if not self.supported_models:
+                return None
+            for m in self.supported_models:
+                if m == model_candidate:
+                    return m
+                # 检查是否存在带前缀的精确匹配 (支持 - 和 / 分隔符，例如 bsp-deepseek-v4-pro 或 deepseek/deepseek-v4-pro)
+                if m.endswith(f"-{model_candidate}") or m.endswith(f"/{model_candidate}") or f"-{model_candidate}-" in m or f"/{model_candidate}/" in m:
+                    logger.info(f"✨ [AI Model Match] Matched configured '{model_candidate}' to verified API model: '{m}'")
+                    return m
+            return None
+
+        # 1. Try finding in currently loaded list
+        matched_model = find_match()
+        
+        # 2. If not matched, force refresh from gateway to see if new models became available
+        if not matched_model and force_refresh_on_missing:
+            logger.warning(f"⚠️ Model candidate '{model_candidate}' not found in current supported models. Forcing dynamic re-fetch from gateway...")
+            await self.init_supported_models(force=True)
+            matched_model = find_match()
+            
+        if matched_model:
+            return matched_model
+            
+        # 3. Fallback routing if still not found
+        logger.warning(f"Configured model '{model_candidate}' is not present in supported models list: {self.supported_models}")
+        if config.LLM_MODEL in self.supported_models:
+            logger.info(f"Routing to verified default LLM_MODEL: '{config.LLM_MODEL}'")
+            return config.LLM_MODEL
+        elif self.supported_models:
+            fallback_first = self.supported_models[0]
+            logger.info(f"Routing to first available verified model: '{fallback_first}'")
+            return fallback_first
+            
         return model_candidate
 
     async def _request_with_retry(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
@@ -109,7 +163,16 @@ class LLMService(ILLMService):
                     response = await self.client.request(method, url, timeout=120.0, **kwargs)
                     response.raise_for_status()
                     
-                    res_json = response.json()
+                    try:
+                        res_json = response.json()
+                    except json.JSONDecodeError as je:
+                        logger.error(
+                            f"❌ 大模型接口请求 JSON 解析失败 (JSONDecodeError): {url}\n"
+                            f"  - 响应状态码: {response.status_code}\n"
+                            f"  - 响应头部: {dict(response.headers)}\n"
+                            f"  - 响应内容 (前1000字): {repr(response.text[:1000])}"
+                        )
+                        raise je
                     # Check for API-level business errors packaged in 200 responses
                     if isinstance(res_json, dict) and res_json.get("error"):
                         err = res_json.get("error", {})
@@ -200,7 +263,7 @@ class LLMService(ILLMService):
         await self.init_supported_models()
         headers = self._build_request_headers()
         messages = self._prepare_messages(prompt, system_prompt)
-        resolved_model = self._resolve_model(model_pool)
+        resolved_model = await self._resolve_model(model_pool)
 
         data = {
             "model": resolved_model,
@@ -209,10 +272,17 @@ class LLMService(ILLMService):
             "top_p": config.LLM_TOP_P,
             "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
         }
-        if max_tokens is not None:
-            data["max_tokens"] = max_tokens
-        
-        logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}]...")
+        # 统计当前并发调用数
+        if hasattr(self, "global_semaphore"):
+            active_sem = self.global_semaphore._value if hasattr(self.global_semaphore, "_value") else "N/A"
+            total_sem = config.GLOBAL_API_SEMAPHORE
+            try:
+                active_count = max(0, total_sem - int(active_sem))
+            except Exception:
+                active_count = "N/A"
+            logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] (Current Active/Limit: {active_count}/{total_sem})...")
+        else:
+            logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}]...")
         response_data, resolved_model = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
         
         try:
@@ -226,7 +296,7 @@ class LLMService(ILLMService):
         await self.init_supported_models()
         headers = self._build_request_headers()
         messages = self._prepare_messages(prompt, system_prompt)
-        resolved_model = self._resolve_model(model_pool)
+        resolved_model = await self._resolve_model(model_pool)
 
         data = {
             "model": resolved_model,
@@ -235,10 +305,17 @@ class LLMService(ILLMService):
             "top_p": config.LLM_TOP_P,
             "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
         }
-        if max_tokens is not None:
-            data["max_tokens"] = max_tokens
-        
-        logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}]...")
+        # 统计当前并发调用数
+        if hasattr(self, "global_semaphore"):
+            active_sem = self.global_semaphore._value if hasattr(self.global_semaphore, "_value") else "N/A"
+            total_sem = config.GLOBAL_API_SEMAPHORE
+            try:
+                active_count = max(0, total_sem - int(active_sem))
+            except Exception:
+                active_count = "N/A"
+            logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}] (Current Active/Limit: {active_count}/{total_sem})...")
+        else:
+            logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}]...")
         response_data, resolved_model = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
         
         try:
@@ -259,7 +336,7 @@ class LLMService(ILLMService):
         
         max_healing_attempts = 2
         current_messages = list(messages)
-        resolved_model = self._resolve_model(model_pool, is_structured=True)
+        resolved_model = await self._resolve_model(model_pool, is_structured=True)
         
         is_openai = resolved_model.lower().startswith("gpt")
         
@@ -294,7 +371,18 @@ class LLMService(ILLMService):
             if attempt > 0:
                 logger.warning(f"Self-Healing formatted retry attempt {attempt} / {max_healing_attempts} for model: {response_model.__name__} ({resolved_model})")
             else:
-                logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] in Structured Output Mode for {response_model.__name__}...")
+                # 统计当前Premium池的并发调用数
+                if hasattr(self, "global_semaphore"):
+                    active_sem = self.global_semaphore._value if hasattr(self.global_semaphore, "_value") else "N/A"
+                    # 因为 Semaphore 信号量是递减的，当前活跃数 = 总量 - 信号量当前可用值
+                    total_sem = config.GLOBAL_API_SEMAPHORE
+                    try:
+                        active_count = max(0, total_sem - int(active_sem))
+                    except Exception:
+                        active_count = "N/A"
+                    logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] (Current Active/Limit: {active_count}/{total_sem}) in Structured Output Mode for {response_model.__name__}...")
+                else:
+                    logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] in Structured Output Mode for {response_model.__name__}...")
                 
             response_data, resolved_model = await self._execute_with_fallback(
                 headers, data, resolved_model, model_pool, stage, attempt=attempt

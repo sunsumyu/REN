@@ -20,8 +20,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from utils.logging_config import setup_logging
+setup_logging()
 logger = logging.getLogger("MedicalQA.Evaluator")
 
 # Add current directory and parent directory to sys.path to resolve imports

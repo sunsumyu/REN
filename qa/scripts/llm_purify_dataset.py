@@ -26,7 +26,8 @@ sys.path.append(str(parent_dir))
 from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES
 from api_client import APIClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from utils.logging_config import setup_logging
+setup_logging()
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
 PURIFY_SYSTEM_PROMPT = """您是一位顶级循证医学科学家与大模型思维链（CoT）语料提纯专家。您的任务是净化并重写医学问答数据集中的 `<think>`（思维链）内容，使其达到顶尖的 Reasoning 模型（如 DeepSeek-R1、OpenAI o1）微调的冷启动标准。

@@ -26,7 +26,8 @@ sys.path.append(str(parent_dir))
 from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES
 from api_client import APIClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from utils.logging_config import setup_logging
+setup_logging()
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
 def get_system_directive(planner: str) -> str:

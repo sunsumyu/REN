@@ -57,13 +57,14 @@ for label, url in urls_to_test:
         if res.status_code == 200:
             print("  - 🎉 连接成功! 该域名可正常使用。")
             if "models" in url:
-                print("  - 支持的模型示例:")
                 try:
                     data = res.json()
-                    for item in data.get("data", [])[:3]:
-                        print(f"    * {item.get('id')}")
-                except Exception:
-                    pass
+                    models = [item.get('id') for item in data.get("data", []) if item.get('id')]
+                    print(f"  - 🎉 获取成功！共检测到 {len(models)} 个支持的模型:")
+                    for m in models:
+                        print(f"    * {m}")
+                except Exception as e:
+                    print(f"  - ❌ 解析模型列表与JSON失败: {e}")
         else:
             print(f"  - 连接失败: 状态码 {res.status_code}, 返回: {res.text[:100]}")
     except httpx.ConnectTimeout:

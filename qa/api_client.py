@@ -5,8 +5,6 @@ import logging
 from typing import List, Dict, Any, Tuple
 import config
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MedicalQA.APIClientProxy")
 
 # Re-export visual printing from utils
@@ -56,8 +54,8 @@ class APIClient:
     async def init_supported_models(self):
         await self.llm_service.init_supported_models()
 
-    def _resolve_model(self, model_pool: str, is_structured: bool = False) -> str:
-        return self.llm_service._resolve_model(model_pool, is_structured)
+    async def _resolve_model(self, model_pool: str, is_structured: bool = False) -> str:
+        return await self.llm_service._resolve_model(model_pool, is_structured)
 
     async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "") -> str:
         return await self.llm_service.call_llm(prompt, system_prompt, model_pool, stage)

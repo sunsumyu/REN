@@ -4,7 +4,13 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 PROJECT_DIR = Path(__file__).resolve().parent
-load_dotenv(PROJECT_DIR / ".env")
+load_dotenv(PROJECT_DIR / ".env", override=True)
+
+# 确保代理白名单配置被正确注入到全局环境变量中（兼容大小写敏感的底层网络库）
+_no_proxy_val = os.getenv("NO_PROXY", "").strip()
+if _no_proxy_val:
+    os.environ["NO_PROXY"] = _no_proxy_val
+    os.environ["no_proxy"] = _no_proxy_val
 
 # 医药知识图谱 API 配置
 GRAPH_API_URL = "https://ai.yzint.cn/api/knowledge/v1/graph/entity/random"
@@ -13,7 +19,7 @@ DEFAULT_ENTITY_COUNT = 2
 DEFAULT_HOP_COUNT = 2
 
 # 大模型 API 配置
-LLM_API_URL = "https://volley.yzint.cn/api/v1/chat/completions"
+LLM_API_URL = os.getenv("LLM_API_URL", "https://volley.yzint.cn/api/v1/chat/completions")
 # 从环境变量中读取 API Key
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 # 默认使用通用的大模型（支持同 GPT / 千问的调用）

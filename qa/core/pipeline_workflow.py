@@ -17,8 +17,8 @@ logger = logging.getLogger("MedicalQA.PipelineWorkflow")
 
 class PipelineWorkflow:
     """
-    Surgically re-engineered pipeline workspace representing the 
-    core Multi-round Generation Orchestrator in a clear Workflow architectural style.
+    核心多轮生成编排器的工作流架构类。
+    负责调度知识图谱检索、大模型推理、质量把控及冗余过滤等环节，完成多轮医疗问答数据的生成。
     """
     def __init__(
         self, 
@@ -26,30 +26,45 @@ class PipelineWorkflow:
         graph_service: IGraphService, 
         redundancy_filter: IRedundancyFilterStrategy
     ):
+        """
+        初始化 PipelineWorkflow 实例。
+        
+        :param llm_service: 大语言模型服务接口，用于调用各类大模型生成任务
+        :param graph_service: 知识图谱服务接口，用于获取图谱实体和关系数据
+        :param redundancy_filter: 冗余过滤策略接口，用于去除生成内容中的冗余切面
+        """
         self.llm_service = llm_service
         self.graph_service = graph_service
         self.redundancy_filter = redundancy_filter
 
     async def _prepare_context_and_refs(self, graph_data: Dict[str, Any], query: str = "") -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         """
-        Converts Knowledge Graph response into context and reference blocks, with Phase 4 Guideline Grounding.
+        将知识图谱响应数据转换为上下文列表(context_list)和参考引用块(refs)。
+        包含第四阶段的指南依据注入。
+        
+        :param graph_data: 包含实体和关系数据的字典，来源于知识图谱服务
+        :param query: 当前查询问题，用于分层检索匹配参考依据
+        :return: 元组，包含(上下文列表, 参考文献列表)
         """
+        # 提取实体和关系，若为空则默认空列表
         entities = graph_data.get("entities", []) or []
         relationships = graph_data.get("relationships", []) or []
         
         context_list = []
         refs = []
         
+        # 延迟导入检索管理器
         from retrieval.retrieval_manager import RetrievalManager
         retrieval_mgr = RetrievalManager()
         
-        # Format entities
+        # 格式化实体数据
         for entity in entities:
             name = entity.get("name", "未命名实体")
             ent_type = entity.get("type", "普通实体")
             description = entity.get("description", "暂无描述").strip()
             ent_id = entity.get("id", "")
             
+            # 构造上下文字符串和来源标识
             context_str = f"医疗实体【{name}】（类型: {ent_type}）：{description}"
             source_str = f"《图谱实体集:{name}》"
             
@@ -64,6 +79,7 @@ class PipelineWorkflow:
                 "source": f"refs:《实体库:{name}》"
             })
             
+            # 尝试获取分层检索依据，注入到参考引用中
             try:
                 tiered_refs, tier_label = await retrieval_mgr.get_grounding_references(query, name)
                 logger.info(f"Tiered Grounding match found for '{name}' via [{tier_label}]: injecting {len(tiered_refs)} reference items.")
@@ -72,13 +88,14 @@ class PipelineWorkflow:
             except Exception as e:
                 logger.error(f"Failed to fetch tiered retrieval grounding for entity '{name}': {e}")
             
-        # Format relationships
+        # 格式化关系数据
         for rel in relationships:
             src = rel.get("sourceName", "")
             tgt = rel.get("targetName", "")
             relation = rel.get("relationship", "")
             strength = rel.get("relationshipStrength", 10)
             
+            # 构造关系上下文字符串和来源标识
             context_str = f"关联关系：【{src}】与【{tgt}】之间存在关联【{relation}】（强度: {strength}）"
             source_str = f"《图谱关系集:{src}-{tgt}》"
             
@@ -92,34 +109,51 @@ class PipelineWorkflow:
                 "source": f"refs:《图谱关系:{src}-{tgt}》"
             })
             
+        # 关闭检索管理器释放资源
         retrieval_mgr.close()
         return context_list, refs
 
     async def generate_initial_question(self, context_list: List[Dict[str, str]], task_id_label: str = "") -> str:
         """
-        Generate multiple questions from context and pick one randomly (Routed to lightweight).
+        根据上下文列表生成多个问题，并随机选择其中一个作为初始问题。
+        路由至轻量级大模型执行。
+        
+        :param context_list: 上下文信息列表
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 被随机选中的初始问题字符串
+        :raises Exception: 如果未能从上下文中生成任何问题则抛出异常
         """
+        # 渲染问题生成提示词
         prompt = PromptRenderer.render(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+        # 调用轻量级大模型
         response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}初始问题生成")
         
+        # 安全解析JSON响应
         from pipeline import parse_json_safely
         questions = parse_json_safely(response, [])
         if not questions:
             raise Exception("Failed to generate questions from context.")
             
+        # 随机选择一个问题
         selected_q = random.choice(questions)
         logger.info(f"Generated {len(questions)} questions. Selected: '{selected_q}'")
         return selected_q
 
     async def plan_facets(self, query: str, task_id_label: str = "") -> List[str]:
         """
-        Plan answering perspectives (facets) using lightweight structured constraints.
+        使用轻量级结构化约束规划回答视角（切面/facets）。
+        
+        :param query: 当前查询问题
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 规划出的切面列表，若失败则返回默认切面["临床表现", "药理学机制"]
         """
+        # 渲染切面规划提示词
         prompt = PromptRenderer.render(prompts.FACET_PLANNER_TEMPLATE, query=query)
         messages = [{"role": "user", "content": prompt}]
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
         try:
+            # 调用轻量级大模型，返回结构化的切面计划
             result: FacetPlan = await self.llm_service.call_llm_structured(
                 messages, 
                 FacetPlan, 
@@ -131,46 +165,68 @@ class PipelineWorkflow:
             return facets
         except Exception as e:
             logger.error(f"Failed to plan facets: {e}. Falling back to default list.")
+            # 异常时返回默认切面
             return ["临床表现", "药理学机制"]
 
     async def preprocess_facets(self, query: str, facets: List[str], task_id_label: str = "") -> List[str]:
         """
-        Preprocess facets (Routed to lightweight).
+        对切面进行预处理（路由至轻量级大模型）。
+        根据切面数量执行不同的策略：>8则缩减，2~8则扩充，其余保持原样。
+        
+        :param query: 当前查询问题
+        :param facets: 原始切面列表
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 预处理后的切面列表
         """
         count = len(facets)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
         
         from pipeline import parse_json_safely
         if count > 8:
+            # 切面数量大于8，执行缩减操作
             logger.info(f"Facet count {count} > 8. Running Facet Reducer...")
             prompt = PromptRenderer.render(prompts.FACET_REDUCER_TEMPLATE, query=query, facets=facets)
             response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面视角缩减过滤")
             reduced_facets = parse_json_safely(response, [])
+            # 如果缩减成功且为8个则返回，否则强行截断前8个
             if len(reduced_facets) == 8:
                 return reduced_facets
             else:
                 return facets[:8]
         elif 2 < count < 8:
+            # 切面数量在2到8之间，执行扩充操作
             logger.info(f"Facet count {count} is between 2 and 8. Running Facet Expander...")
             prompt = PromptRenderer.render(prompts.FACET_EXPANDER_TEMPLATE, query=query, facets=facets)
             response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面视角丰富扩充")
             expanded_new = parse_json_safely(response, [])
             
+            # 合并扩充的切面，去重
             combined = list(facets)
             for f in expanded_new:
                 if f not in combined:
                     combined.append(f)
             return combined
         else:
+            # 切面数量 <= 2，直接返回
             return facets
 
     async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, task_id_label: str = "") -> Tuple[str, str]:
         """
-        Call the FacetGraph-QA Agent for a single perspective (Core generation: MUST stay in premium).
+        为单个视角（切面）调用图问答智能体进行深度问答。
+        核心生成步骤：必须路由至高级模型执行。
+        包含质量门控检查和降级容错机制。
+        
+        :param query: 当前查询问题
+        :param facet: 当前切面名称
+        :param refs: 参考文献列表
+        :param semaphore: 异步并发信号量，控制并发数
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 元组，包含(切面名称, 生成的回答内容)，若质量把控失败则回答内容为None
         """
         from strategies.quality_gate.answer_guard import check_answer_quality
         
         async with semaphore:
+            # 构造系统提示词和多层级的用户提示词
             system_prompt = PromptRenderer.get_l1_meta()
             task_prompt = PromptRenderer.get_l2_execution(facet)
             context_prompt = PromptRenderer.get_l3_context(query, refs, [])
@@ -189,7 +245,9 @@ class PipelineWorkflow:
                 is_passed = False
                 reason = ""
                 
+                # 结构化输出重试循环：最多尝试 max_quality_attempts + 1 次
                 for q_attempt in range(max_quality_attempts + 1):
+                    # 调用高级大模型获取结构化问答输出
                     result: FacetQAOutput = await self.llm_service.call_llm_structured(
                         messages, 
                         FacetQAOutput, 
@@ -197,6 +255,7 @@ class PipelineWorkflow:
                         stage=f"{stage_prefix}切面深度问答 - {facet}"
                     )
                     
+                    # 检查回答质量
                     is_passed, reason = check_answer_quality(
                         result.answer_body, 
                         getattr(result, "_reasoning_content", "")
@@ -205,14 +264,17 @@ class PipelineWorkflow:
                         break
                     logger.warning(f"Quality Guardrail FAILED on structured QA attempt {q_attempt} for facet '{facet}': {reason}. Retrying...")
                     
+                # 如果多次尝试仍未通过质量检查，抛出异常进入降级流程
                 if not is_passed:
-                    raise ValueError(f"Quality Guardrail failed repeatedly for structured output: {reason}")
+                    raise ValueError(f"Quality guardrail failed repeatedly for structured output: {reason}")
                 
+                # 处理推理过程内容
                 reasoning_content = getattr(result, "_reasoning_content", "")
                 if reasoning_content:
                     cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
                     think_block = f"<think><facet = {facet}>\n{cleaned_reasoning}\n</think>\n"
                 else:
+                    # 如果没有原生推理内容，则从结构化输出中提取证据、推理链等构造思考块
                     evidences_str = "\n".join([
                         f"[证据R{i+1}：来源={e.source}，定位={e.location}，要点={e.summary}]"
                         for i, e in enumerate(result.evidences)
@@ -232,10 +294,12 @@ class PipelineWorkflow:
                         f"</think>\n"
                     )
                 
+                # 组装最终响应：思考块 + 回答主体
                 response = think_block + result.answer_body
                 logger.info(f"Successfully generated structured and layered QA output for facet: {facet}")
                 
             except Exception as e:
+                # 结构化输出失败，触发降级方案：使用普通文本生成模式
                 logger.error(f"Structured QA call failed for facet '{facet}': {e}. Triggering fallback.")
                 fallback_prompt = f"{system_prompt}\n\n{user_prompt}"
                 raw_response = ""
@@ -243,13 +307,16 @@ class PipelineWorkflow:
                 is_passed = False
                 reason = ""
                 
+                # 降级生成重试循环
                 for fb_attempt in range(max_quality_attempts + 1):
+                    # 调用带推理输出的高级大模型
                     raw_response, reasoning_content = await self.llm_service.call_llm_with_reasoning(
                         fallback_prompt, 
                         model_pool="premium", 
                         stage=f"{stage_prefix}切面深度问答降级 - {facet}"
                     )
                     
+                    # 提取正文部分进行质量检查
                     check_body = raw_response
                     if "</think>" in raw_response:
                         check_body = raw_response.split("</think>")[-1].strip()
@@ -263,6 +330,7 @@ class PipelineWorkflow:
                         break
                     logger.warning(f"Quality Guardrail FAILED on fallback attempt {fb_attempt}: {reason}. Retrying...")
                 
+                # 降级后依然无法通过质量检查，丢弃该切面
                 if not is_passed:
                     logger.critical(f"Quality guard failed repeatedly for facet '{facet}'. DROPPING this facet.")
                     return facet, None
@@ -283,13 +351,23 @@ class PipelineWorkflow:
 
     async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
         """
-        Runs the QA Agent in parallel for all facets.
+        并发运行所有切面的问答智能体。
+        使用信号量控制最大并发数。
+        
+        :param query: 当前查询问题
+        :param facets: 切面列表
+        :param refs: 参考文献列表
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 包含各切面及其对应回答的字典列表，如: [{"planner": 切面, "answer": 回答}, ...]
         """
         semaphore = asyncio.Semaphore(config.CONCURRENT_QA_LIMIT)
+        # 创建并发任务列表
         tasks = [self.answer_single_facet(query, facet, refs, semaphore, task_id_label=task_id_label) for facet in facets]
+        # 并发执行所有任务
         results = await asyncio.gather(*tasks)
         
         planners = []
+        # 过滤掉被丢弃(返回None)的切面，组装结果
         for facet, answer in results:
             if answer is None:
                 continue
@@ -301,18 +379,26 @@ class PipelineWorkflow:
 
     async def synthesize_answers(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> str:
         """
-        Synthesize filtered answers into a single cohesive final summary answer (Routed to lightweight).
+        将过滤后的各切面回答综合凝练为单一的连贯最终摘要回答。
+        路由至轻量级大模型执行。
+        
+        :param query: 当前查询问题
+        :param planners: 包含各切面回答的字典列表
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 综合凝练后的最终摘要字符串
         """
         answers_clean = []
+        # 提取回答正文，去除思考块内容
         for p in planners:
             ans = p["answer"]
-            if "</think>" in ans:
-                parts = ans.split("</think>")
+            if "usse" in ans:
+                parts = ans.split("usse")
                 ans_body = parts[-1].strip()
             else:
                 ans_body = ans.strip()
             answers_clean.append(ans_body)
             
+        # 渲染综合凝练提示词并调用轻量级大模型
         prompt = PromptRenderer.render(prompts.MULTI_ANSWER_SYNTHESIS_TEMPLATE, query=query, answers=answers_clean)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
         summary = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面问答综合凝练")
@@ -321,8 +407,16 @@ class PipelineWorkflow:
 
     async def generate_next_question(self, context_list: List[Dict[str, str]], history: List[Dict[str, Any]], previous_summary: str, task_id_label: str = "") -> str:
         """
-        Generate the next question in a multi-round dialog (Routed to lightweight).
+        在多轮对话中生成下一个问题。
+        路由至轻量级大模型执行。
+        
+        :param context_list: 上下文信息列表
+        :param history: 历史对话记录
+        :param previous_summary: 上一轮的摘要回答
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 生成的下一轮问题字符串
         """
+        # 渲染下一问生成提示词
         prompt = PromptRenderer.render(
             prompts.NEXT_QUESTION_TEMPLATE,
             context_list=context_list,
@@ -330,7 +424,9 @@ class PipelineWorkflow:
             summary=previous_summary
         )
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+        # 调用轻量级大模型
         next_q = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}多轮对话下一问生成")
+        # 清理多余的引号和空格
         next_q = next_q.strip().strip('"').strip("'")
         return next_q
 
@@ -342,18 +438,28 @@ class PipelineWorkflow:
         task_id_label: str = ""
     ) -> Dict[str, Any]:
         """
-        Execute a complete single round QA generation.
+        执行一次完整的单轮问答生成流程。
+        包含：规划切面 -> 预处理切面 -> 并发生成回答 -> 冗余过滤 -> 综合凝练。
+        
+        :param query: 当前查询问题
+        :param refs: 参考文献列表
+        :param history: 历史对话记录，默认为None
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 单轮对话数据字典，包含 Q(问题), planners(切面回答), history(历史), summary(摘要)
         """
         logger.info(f"--- Starting Round QA for Q: '{query}' ---")
         
+        # 1. 规划初始切面
         initial_facets = await self.plan_facets(query, task_id_label=task_id_label)
         if not initial_facets:
             initial_facets = ["临床表现", "药理学机制"]
             
+        # 2. 预处理切面（缩减或扩充）
         final_facets = await self.preprocess_facets(query, initial_facets, task_id_label=task_id_label)
+        # 3. 并发生成各切面回答
         planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
         
-        # Strategies execution under strategy pattern
+        # 4. 使用策略模式执行冗余过滤
         non_redundant_planners = await self.redundancy_filter.filter_redundancy(
             query, 
             planners, 
@@ -362,8 +468,10 @@ class PipelineWorkflow:
         if not non_redundant_planners:
             non_redundant_planners = planners
             
+        # 5. 综合凝练最终摘要
         summary = await self.synthesize_answers(query, non_redundant_planners, task_id_label=task_id_label)
         
+        # 组装单轮结果数据
         round_data = {
             "Q": query,
             "planners": non_redundant_planners,
@@ -374,24 +482,33 @@ class PipelineWorkflow:
 
     async def generate_multi_round_dataset(self, intent: Dict[str, Any] = None, task_id_label: str = "") -> Dict[str, Any]:
         """
-        Orchestrates a robust Dialogue Generation Pipeline based on Graph-RAG Intention Guiding.
+        编排基于 Graph-RAG 意图引导的稳健对话生成流水线。
+        负责多轮对话的整体调度，包括意图注入、图谱获取、上下文准备及多轮迭代生成。
+        
+        :param intent: 意图字典，包含主题、种子实体和关系，用于引导生成。若为None则自动从图谱提取
+        :param task_id_label: 任务ID标签，用于日志追踪
+        :return: 最后一轮的对话数据字典，并附加上完整的参考文献(refs)
         """
         log_prefix = f"[{task_id_label}] " if task_id_label else ""
         num_rounds = int(config.NUM_ROUNDS) if hasattr(config, "NUM_ROUNDS") else 1
         logger.info(f"{log_prefix}=== Starting Multi-Round Generation: {num_rounds} Rounds ===")
         
+        # 1. 获取随机知识图谱数据
         try:
             graph_data = await self.graph_service.fetch_random_knowledge_graph(count=1)
         except Exception as e:
             logger.critical(f"{log_prefix}Failed to fetch random KG: {e}")
             graph_data = {"entities": [], "relationships": []}
             
+        # 保证图谱数据结构完整
         if "entities" not in graph_data or not graph_data["entities"]:
             graph_data["entities"] = []
         if "relationships" not in graph_data or not graph_data["relationships"]:
             graph_data["relationships"] = []
             
+        # 2. 确定对话主题，并根据意图注入种子数据
         if intent is not None:
+            # 存在外部意图，使用意图中的主题，并注入种子实体和关系到图谱数据中
             selected_theme = intent.get("theme", "临床医学研究")
             for seed in intent.get("seeds", []):
                 if not any(e.get("name") == seed["name"] for e in graph_data["entities"]):
@@ -405,6 +522,7 @@ class PipelineWorkflow:
                 if not any(r.get("sourceName") == rel["sourceName"] and r.get("targetName") == rel["targetName"] for r in graph_data["relationships"]):
                     graph_data["relationships"].append(rel)
         else:
+            # 无外部意图，根据图谱现有的关系或实体自动生成主题
             if graph_data.get("relationships"):
                 rel = random.choice(graph_data["relationships"])
                 src = rel.get("sourceName", "")
@@ -419,18 +537,23 @@ class PipelineWorkflow:
                 
         logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Theme: '{selected_theme}' ---")
         
+        # 3. 准备上下文和参考引用，生成初始问题
         context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
         q1 = await self.generate_initial_question(context_list, task_id_label=task_id_label)
         
         history = []
         current_q = q1
         
+        # 4. 多轮迭代生成
         for r in range(1, num_rounds + 1):
             logger.info(f"{log_prefix}=== Running Round {r} / {num_rounds} ===")
+            # 执行当前轮次的单轮生成
             round_result = await self.generate_single_round(current_q, refs, history, task_id_label=task_id_label)
             history.append(round_result)
             
+            # 如果不是最后一轮，准备下一轮的问题
             if r < num_rounds:
+                # 30%的概率扩展对话视野：额外获取新的图谱数据补充进上下文
                 if random.random() < 0.3:
                     try:
                         logger.info(f"{log_prefix}Expanding dialog horizon...")
@@ -441,8 +564,11 @@ class PipelineWorkflow:
                     except Exception as e:
                         logger.warning(f"Failed to fetch extra entities: {e}")
                         
+                # 生成下一轮问题
                 current_q = await self.generate_next_question(context_list, history, round_result["summary"], task_id_label=task_id_label)
                 
         logger.info(f"{log_prefix}=== Multi-Round Dialog Generation Completed! ===")
+        # 将参考文献附加到最后一轮的结果中并返回
         history[-1]["refs"] = refs
         return history[-1]
+

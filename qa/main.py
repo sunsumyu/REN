@@ -18,15 +18,8 @@ from tests.eval_models import ComprehensiveJudgeMetrics
 from dataset_db import save_dataset_record
 import config
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(os.path.dirname(__file__), "pipeline_execution.log"), encoding="utf-8")
-    ]
-)
+from utils.logging_config import setup_logging
+setup_logging(log_file=os.path.join(os.path.dirname(__file__), "pipeline_execution.log"))
 logger = logging.getLogger("MedicalQA.Main")
 
 # Global counter stats

@@ -180,32 +180,65 @@ class APIGatewayService:
             logger.info(f"Yaozhi API Cache HIT for drug: '{drug_name}'")
             return cached
 
-        # 在没有实际商业API密钥的情况下，系统启动高质量的医疗数据 Mock 发生器
-        mock_data = []
+        # 使用真实的网页实时抓取 (Web Scraping) 替代硬编码 Mock 
+        # 当没有 API Key 时，通过爬取公开网页获取真实文本
+        loop = asyncio.get_event_loop()
         
-        # 简单做一次硬编码或通用药品解析，确保回答完全真实，不产生幻觉
-        if "獾油" in drug_name:
-            mock_data = [{
-                "source": "药智网药品合理用药数据库-獾油搽剂",
-                "context": "【国家准字号药品注册信息】: 獾油搽剂的主要成分为獾油和冰片。性状为淡黄色半透明粘稠液体，具有辛凉的气味。功能主治：清热解毒，消肿止痛，用于烫伤、烧伤、皮肤肿痛等。医保分类: 地方医保乙类中成药。",
+        def scrape_drug_info():
+            import urllib.request
+            import urllib.parse
+            import re
+            
+            # 首选尝试抓取百度百科的药品描述，作为真实数据的来源
+            try:
+                url = f"https://baike.baidu.com/item/{urllib.parse.quote(drug_name)}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+                with urllib.request.urlopen(req, timeout=3.0) as r:
+                    html = r.read().decode('utf-8', errors='ignore')
+                    
+                    # 提取 meta description 作为药物简介
+                    match = re.search(r'<meta name="description" content="(.*?)">', html, re.IGNORECASE)
+                    if match:
+                        desc = match.group(1).strip()
+                        if desc:
+                            return [{
+                                "source": "在线医学百科数据库实时抓取",
+                                "context": f"【公开药品档案】: {desc}",
+                                "category": "药品信息",
+                                "metadata": {"drug_name": drug_name, "scrape_source": "baike"}
+                            }]
+            except Exception as e:
+                logger.warning(f"Baike scrape failed for '{drug_name}': {e}")
+                
+            # 如果百科失败，降级抓取 39健康网搜索页面的纯文本
+            try:
+                url_39 = f"https://yp.39.net/search/{urllib.parse.quote(drug_name)}.shtml"
+                req_39 = urllib.request.Request(url_39, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+                with urllib.request.urlopen(req_39, timeout=3.0) as r:
+                    html_39 = r.read().decode('gbk', errors='ignore') # 39健康网多数页面是 GB2312/GBK
+                    
+                    # 提取简单的页面标题和一点上下文
+                    title_match = re.search(r'<title>(.*?)</title>', html_39, re.IGNORECASE)
+                    title_text = title_match.group(1).strip() if title_match else ""
+                    if drug_name in title_text:
+                        return [{
+                            "source": "39健康网在线实时抓取",
+                            "context": f"【39健康网实时检索】: 检索到关于药物【{drug_name}】的相关条目。网页标题信息: {title_text}。请详细阅读原网页说明书或遵医嘱。",
+                            "category": "药品信息",
+                            "metadata": {"drug_name": drug_name, "scrape_source": "39net"}
+                        }]
+            except Exception as e:
+                logger.warning(f"39net scrape failed for '{drug_name}': {e}")
+                
+            # 如果抓取都被反爬虫拦截，为了防止大模型生成流水线崩溃，返回空数据或兜底说明
+            return [{
+                "source": "在线公开检索系统抓取异常",
+                "context": f"【未收录或网络异常】: 当前未能在公开在线网络(39健康/百科)中抓取到关于【{drug_name}】的详细真实数据，可能被防爬拦截，请参考医师建议。",
                 "category": "药品信息",
-                "metadata": {"approval_number": "国药准字Z20261188", "medical_insurance": "乙类"}
+                "metadata": {"drug_name": drug_name, "status": "scrape_failed"}
             }]
-        elif "愈肝片" in drug_name:
-            mock_data = [{
-                "source": "39健康网医学百科数据库-愈肝片",
-                "context": "【中成药大典收录】: 愈肝片主要由茵陈、板蓝根、当归、白芍、柴胡、郁金、五味子、猪胆粉组成。常用于急性肝炎、慢性迁延性肝炎及慢性活动性肝炎，可辅助保肝抗炎、改善ALT/AST转氨酶指标。",
-                "category": "药品信息",
-                "metadata": {"otc": "非处方药", "safety_level": "中"}
-            }]
-        else:
-            # 通用型高保真 Mock，根据药物特征解析
-            mock_data = [{
-                "source": "药智网在线合理用药分析库",
-                "context": f"【标准化学药物建档档案】: 药物【{drug_name}】目前主要在临床上用于辅助治疗，请严格根据临床主治执业医师处方用法和用量用药。服药期间需定期复查肝肾功及血常规指标。",
-                "category": "药品信息",
-                "metadata": {"drug_name": drug_name}
-            }]
+            
+        mock_data = await loop.run_in_executor(None, scrape_drug_info)
 
         self._save_cache_response(cache_key, drug_name, "yaozh_39", mock_data)
         return mock_data

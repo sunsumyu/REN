@@ -29,7 +29,8 @@ from core.purification_engine import PurificationEngine
 from services.healing_service import HealingService
 from strategies.quality_gate.llm_judge import LLMJudgeStrategy
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from utils.logging_config import setup_logging
+setup_logging()
 logger = logging.getLogger("MedicalQA.LLMPurifier")
 
 # 针对 Windows 控制台环境，强行配置标准输出为 UTF-8
