@@ -28,7 +28,7 @@ async def test_reasoning():
         print(f"\n--- Testing call_llm_structured ---")
         messages = [{"role": "user", "content": "为医疗问题 '阿司匹林在抗血小板治疗中的药理作用是什么？' 规划 3 个医学视角"}]
         result = await client.call_llm_structured(messages, FacetPlan, model_pool="lightweight")
-        print(f"Parsed Result Facets: {result.facets}")
+        print(f"Parsed Result Facets: {[facet.label for facet in result.facets]}")
         reasoning_content = getattr(result, "_reasoning_content", None)
         print(f"\nAttached Reasoning Content:\n{reasoning_content}")
         

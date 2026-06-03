@@ -38,7 +38,7 @@ class LLMJudgeStrategy(IEvaluationStrategy):
 请严格按照质检准则对净化后的思维链进行三维评分，并直接输出规范 of JSON 数据。"""
         try:
             stage_prefix = f"[{line_num}行] " if line_num else ""
-            response = await self.llm_service.call_llm(prompt, system_prompt=purifier_module.JUDGE_SYSTEM_PROMPT, model_pool="premium", stage=f"{stage_prefix}思维链三维质检 - {planner}")
+            response = await self.llm_service.call_llm(prompt, system_prompt=purifier_module.JUDGE_SYSTEM_PROMPT, model_pool="judge", stage=f"{stage_prefix}思维链三维质检 - {planner}")
             json_str = purifier_module.extract_json_block(response)
             scores = json.loads(json_str)
             
@@ -52,10 +52,11 @@ class LLMJudgeStrategy(IEvaluationStrategy):
                     
             return scores
         except Exception as e:
-            logger.warning(f"Judge LLM evaluation failed: {e}. Falling back to default high scores to bypass block.")
+            logger.warning(f"Judge LLM evaluation failed: {e}. Returning blocking low scores to force rollback.")
             return {
-                "semantic_purity_score": 90,
-                "medical_rigor_score": 95,
-                "logical_depth_score": 90,
-                "reason": f"Evaluation error: {e}"
+                "semantic_purity_score": 0,
+                "medical_rigor_score": 0,
+                "logical_depth_score": 0,
+                "reason": f"Evaluation error: {e}",
+                "is_passed": False,
             }

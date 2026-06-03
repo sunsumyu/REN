@@ -18,6 +18,37 @@ import core.purification_helper as purifier_module
 
 logger = logging.getLogger("MedicalQA.PurificationEngine")
 
+
+def strip_unsupported_official_identifiers(text: str, evidence_text: str = "") -> str:
+    """
+    Drop official-looking standard/approval identifiers from the source thought
+    if the confirmed evidence anchors do not contain the same identifier.
+    """
+    if not text:
+        return text
+
+    evidence_text = evidence_text or ""
+    if not evidence_text.strip():
+        return text
+    pattern = re.compile(
+        r"(?P<prefix>(?:国家[^，。；\n]{0,30})?(?:执行标准|标准代号|标准号|批准文号|注册号|药品标准|标准批件)"
+        r"[：:\s]*)?(?P<code>[A-Z][A-Z0-9()\-]{3,}\d{2,})"
+    )
+
+    def repl(match: re.Match) -> str:
+        code = match.group("code")
+        if code and code in evidence_text:
+            return match.group(0)
+        prefix = match.group("prefix") or ""
+        if prefix:
+            return ""
+        return ""
+
+    cleaned = pattern.sub(repl, text)
+    cleaned = re.sub(r"[，,；;]\s*[，,；;]+", "，", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
 class PurificationEngine:
     """
     Orchestrates the entire semantic purification and quality check process,
@@ -63,6 +94,7 @@ class PurificationEngine:
 
         # 🛡️ 【企业级刚性事实锚点解析注入】提取绝对正确的原始图谱或联网事实，强行阻断幻觉空间
         anchors_prompt = ""
+        anchors_text = ""
         if refs:
             anchors = []
             for r in refs:
@@ -80,11 +112,12 @@ class PurificationEngine:
 ### 确证医学文献事实与临床研究数据 (Confirmed Clinical & Literature Facts):
 {anchors_text}
 【⚠️ 确证事实对齐】：请注意，以上数据为临床确证事实，你的药理因果推演必须与之完全吻合，绝对禁止对其中任何药理关系、不良反应或用药禁忌进行任何否定、篡改或凭空编造！"""
+        stripped_think = strip_unsupported_official_identifiers(stripped_think, anchors_text)
         
         for attempt in range(max_retries):
             simplify_prompt_addition = ""
             if simplify:
-                simplify_prompt_addition = "\n【⚠️ 极简重构硬性要求】：该问题为简单事实查询，严禁脑补虚构复杂的分子机制或大样本临床试验。请直接用 2-3 步精炼的因果推导得出结论（禁止大段微观机制演绎），但必须保持流畅的探究性临床推理心流（至少 150 字），不能只写一句话结论或复读说明书条目。"
+                simplify_prompt_addition = "\n【⚠️ 极简重构硬性要求】：该问题为简单事实查询，严禁脑补虚构复杂的分子机制、受体通路、靶点、免疫机制或大样本临床试验。请直接用 2-3 步精炼的因果推导得出结论；若机制或相互作用依据不足，只能自然收束为“不能据此推断具体机制/通路”，禁止大段微观机制演绎，但必须保持流畅的探究性临床推理心流（至少 150 字），不能只写一句话结论或复读说明书条目。"
             
             prompt = f"""{few_shot}
 
@@ -92,7 +125,8 @@ class PurificationEngine:
 Please write an extremely raw, high-entropy clinical reasoning thought trace focusing on {directive}.
 CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
 In corporate with counterfactual checks, you should naturally integrate clinical self-questioning markers with a question mark at points of uncertainty or divergence (在遇到逻辑分叉或极限情况时，应自然融入探究性的自我提问，展现真实的解题反思与假说排查，例如以以“？”结尾的疑问句进行内部推演，但绝对禁止在文本尾部生硬塞入无意义的问号占位符).
-Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. You are strictly FORBIDDEN from using any meta-narrative terms indicating internal system implementations, such as 'refs', '图谱', '实体库', '关系库', '数据源', 'json_schema', 'answer_body', 'sub_questions' or 'reasoning_chains'. Output ONLY the purified thought chain. You are permitted and highly encouraged to naturally attribute facts using standard, professional references such as "根据药品说明书记载", "临床文献报道指出", or "根据临床研究数据".{anchors_prompt}
+Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. You are strictly FORBIDDEN from using any meta-narrative terms indicating internal system implementations, such as 'refs', '图谱', '实体库', '关系库', '数据源', 'json_schema', 'answer_body', 'sub_questions' or 'reasoning_chains'. Output ONLY the purified thought chain. You are permitted and highly encouraged to naturally attribute facts using standard, professional references such as "根据药品说明书记载", "临床文献报道指出", or "根据临床研究数据".
+CRITICAL factual boundary: never invent or preserve unsupported official standard numbers, approval numbers, registration numbers, receptor pathways, targets, immune mechanisms, pharmacokinetic parameters, or molecular pathways. If the confirmed facts do not explicitly support a mechanism/pathway/identifier, omit it or state in natural clinical language that no specific mechanism can be inferred from the available clinical facts.{anchors_prompt}
 
 问题: {q}
 原始思维链 (CoT) 内容:
@@ -225,6 +259,8 @@ Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the tex
                     feedback_msg = f"\n\n【前一次清洗尝试质量不达标反馈：语义纯净度={p_score}/100, 医学严谨度={r_score}/100, 逻辑深度={d_score}/100。】"
                     if p_score < THRESHOLD_PURITY:
                         feedback_msg += "\n【核心优化指令：你的前一次写入在“语义纯净度”上不符合规范。请确保全篇为完全连贯、自然流动的临床学术段落，绝对禁止提及或表露元数据结构。】"
+                    if r_score < THRESHOLD_RIGOR:
+                        feedback_msg += "\n【核心优化指令：你的前一次写入在“医学严谨度”上不符合规范。请删除任何未经确证事实支持的官方标准号、批准文号、注册号、受体通路、靶点、免疫机制或药代参数，不要保留原文中的高仿真编号。】"
                     if d_score < THRESHOLD_DEPTH:
                         feedback_msg += "\n【核心优化指令：你的前一次写入在“逻辑深度”上不符合规范，请避免平铺直叙，融入探究反思。】"
                     

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import datetime
 import json
 import random
 import re
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import config
 import prompts
@@ -14,6 +16,69 @@ from strategies.redundancy_filter.llm_filter import IRedundancyFilterStrategy
 from core.prompt_renderer import PromptRenderer
 
 logger = logging.getLogger("MedicalQA.PipelineWorkflow")
+GENERATION_AUDIT_PATH = Path(__file__).resolve().parent.parent / "logs" / "generation_audit.jsonl"
+
+
+FACET_FORBIDDEN_PATTERNS = [
+    r"示例\s*视角",
+    r"缺少医疗问题",
+    r"请提供",
+    r"请输入",
+    r"数据不足",
+    r"无法规划",
+    r"rigorous\s+data\s+processing\s+api",
+    r"json\s*schema",
+    r"\bschema\b",
+    r"\bjson\b",
+    r"\bapi\b",
+    r"\bsystem\b",
+    r"\bassistant\b",
+    r"\buser\b",
+    r"```",
+    r"\{|\}|\[|\]",
+]
+
+
+def validate_facet_label(facet: str) -> Tuple[bool, str]:
+    label = (facet or "").strip()
+    if not label:
+        return False, "empty facet"
+    if len(label) < 2 or len(label) > 16:
+        return False, "facet length must be 2-16 chars"
+    if "\n" in label or "\r" in label or "\t" in label:
+        return False, "facet must be one short phrase"
+    if len(re.findall(r"[A-Za-z]", label)) > 8:
+        return False, "facet contains too much English text"
+    if any(ch in label for ch in [":", "：", "。", "？", "?", "！", "!", "，", ","]):
+        return False, "facet contains sentence punctuation"
+    lowered = label.lower()
+    for pattern in FACET_FORBIDDEN_PATTERNS:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return False, f"facet contains forbidden pattern: {pattern}"
+    return True, ""
+
+
+def filter_valid_facets(facets: List[str]) -> Tuple[List[str], List[Dict[str, str]]]:
+    valid = []
+    invalid = []
+    for facet in facets or []:
+        label = str(facet).strip()
+        ok, reason = validate_facet_label(label)
+        if ok and label not in valid:
+            valid.append(label)
+        else:
+            invalid.append({"facet": label, "reason": reason or "duplicate facet"})
+    return valid, invalid
+
+
+def record_generation_audit(event: Dict[str, Any]) -> None:
+    try:
+        event.setdefault("time", datetime.datetime.now().isoformat(timespec="seconds"))
+        GENERATION_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(GENERATION_AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to write generation audit event: {e}")
 
 class PipelineWorkflow:
     """
@@ -146,27 +211,73 @@ class PipelineWorkflow:
         
         :param query: 当前查询问题
         :param task_id_label: 任务ID标签，用于日志追踪
-        :return: 规划出的切面列表，若失败则返回默认切面["临床表现", "药理学机制"]
+        :return: 规划出的切面列表；若多次校验失败则返回空列表，由上游隔离该样本
         """
         # 渲染切面规划提示词
-        prompt = PromptRenderer.render(prompts.FACET_PLANNER_TEMPLATE, query=query)
-        messages = [{"role": "user", "content": prompt}]
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        try:
-            # 调用轻量级大模型，返回结构化的切面计划
-            result: FacetPlan = await self.llm_service.call_llm_structured(
-                messages, 
-                FacetPlan, 
-                model_pool="lightweight", 
-                stage=f"{stage_prefix}视角切面规划"
-            )
-            facets = [f for f in result.facets]
-            logger.info(f"Planned initial facets: {facets}")
-            return facets
-        except Exception as e:
-            logger.error(f"Failed to plan facets: {e}. Falling back to default list.")
-            # 异常时返回默认切面
-            return ["临床表现", "药理学机制"]
+        audit_attempts = []
+
+        for attempt in range(3):
+            prompt = PromptRenderer.render(prompts.FACET_PLANNER_TEMPLATE, query=query)
+            if audit_attempts:
+                invalid_notes = "\n".join(
+                    f"- attempt {a['attempt']}: {a['reason']}" for a in audit_attempts
+                )
+                prompt += (
+                    "\n\n<previous_validation_failures>\n"
+                    f"{invalid_notes}\n"
+                    "请重新规划。不要输出占位符、提示语、Schema/System/API/JSON 文本；"
+                    "必须输出合法的医学 facet 候选对象。\n"
+                    "</previous_validation_failures>"
+                )
+            messages = [{"role": "user", "content": prompt}]
+
+            try:
+                result: FacetPlan = await self.llm_service.call_llm_structured(
+                    messages,
+                    FacetPlan,
+                    model_pool="lightweight",
+                    stage=f"{stage_prefix}视角切面规划 attempt-{attempt + 1}"
+                )
+                facets = []
+                invalid = []
+                for candidate in result.facets:
+                    label = candidate.label.strip()
+                    ok, reason = validate_facet_label(label)
+                    if ok and label not in facets:
+                        facets.append(label)
+                    else:
+                        invalid.append({"label": label, "reason": reason or "duplicate facet"})
+
+                if len(facets) >= 2:
+                    logger.info(f"Planned validated facets: {facets}")
+                    record_generation_audit({
+                        "stage": "facet_planning",
+                        "status": "success",
+                        "task_id": task_id_label,
+                        "query": query,
+                        "attempt": attempt + 1,
+                        "facets": facets,
+                    })
+                    return facets
+
+                reason = f"validated facet count < 2; invalid={invalid}"
+                audit_attempts.append({"attempt": attempt + 1, "reason": reason})
+                logger.warning(f"Facet plan validation failed: {reason}")
+            except Exception as e:
+                reason = str(e)
+                audit_attempts.append({"attempt": attempt + 1, "reason": reason})
+                logger.error(f"Failed to plan facets on attempt {attempt + 1}: {e}")
+
+        logger.critical(f"Facet planning failed after retries for query '{query}'. Attempts: {audit_attempts}")
+        record_generation_audit({
+            "stage": "facet_planning",
+            "status": "failed",
+            "task_id": task_id_label,
+            "query": query,
+            "attempts": audit_attempts,
+        })
+        return []
 
     async def preprocess_facets(self, query: str, facets: List[str], task_id_label: str = "") -> List[str]:
         """
@@ -178,6 +289,20 @@ class PipelineWorkflow:
         :param task_id_label: 任务ID标签，用于日志追踪
         :return: 预处理后的切面列表
         """
+        facets, invalid_initial = filter_valid_facets(facets)
+        if invalid_initial:
+            logger.warning(f"Invalid facets removed before preprocessing: {invalid_initial}")
+            record_generation_audit({
+                "stage": "facet_preprocess",
+                "status": "invalid_removed",
+                "task_id": task_id_label,
+                "query": query,
+                "invalid_facets": invalid_initial,
+            })
+        if len(facets) < 2:
+            logger.critical(f"Facet preprocessing aborted: fewer than 2 valid facets for query '{query}'.")
+            return []
+
         count = len(facets)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
         
@@ -188,6 +313,16 @@ class PipelineWorkflow:
             prompt = PromptRenderer.render(prompts.FACET_REDUCER_TEMPLATE, query=query, facets=facets)
             response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面视角缩减过滤")
             reduced_facets = parse_json_safely(response, [])
+            reduced_facets, invalid_reduced = filter_valid_facets(reduced_facets)
+            if invalid_reduced:
+                logger.warning(f"Invalid facets removed from reducer output: {invalid_reduced}")
+                record_generation_audit({
+                    "stage": "facet_reducer",
+                    "status": "invalid_removed",
+                    "task_id": task_id_label,
+                    "query": query,
+                    "invalid_facets": invalid_reduced,
+                })
             # 如果缩减成功且为8个则返回，否则强行截断前8个
             if len(reduced_facets) == 8:
                 return reduced_facets
@@ -199,6 +334,16 @@ class PipelineWorkflow:
             prompt = PromptRenderer.render(prompts.FACET_EXPANDER_TEMPLATE, query=query, facets=facets)
             response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面视角丰富扩充")
             expanded_new = parse_json_safely(response, [])
+            expanded_new, invalid_expanded = filter_valid_facets(expanded_new)
+            if invalid_expanded:
+                logger.warning(f"Invalid facets removed from expander output: {invalid_expanded}")
+                record_generation_audit({
+                    "stage": "facet_expander",
+                    "status": "invalid_removed",
+                    "task_id": task_id_label,
+                    "query": query,
+                    "invalid_facets": invalid_expanded,
+                })
             
             # 合并扩充的切面，去重
             combined = list(facets)
@@ -207,7 +352,7 @@ class PipelineWorkflow:
                     combined.append(f)
             return combined
         else:
-            # 切面数量 <= 2，直接返回
+            # 切面数量为2，直接返回两个最贴切且互补的切面
             return facets
 
     async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, task_id_label: str = "") -> Tuple[str, str]:
@@ -224,6 +369,19 @@ class PipelineWorkflow:
         :return: 元组，包含(切面名称, 生成的回答内容)，若质量把控失败则回答内容为None
         """
         from strategies.quality_gate.answer_guard import check_answer_quality
+
+        is_valid_facet, invalid_reason = validate_facet_label(facet)
+        if not is_valid_facet:
+            logger.critical(f"Facet hard gate rejected facet '{facet}' before answer generation: {invalid_reason}")
+            record_generation_audit({
+                "stage": "answer_facet_gate",
+                "status": "rejected",
+                "task_id": task_id_label,
+                "query": query,
+                "facet": facet,
+                "reason": invalid_reason,
+            })
+            return facet, None
         
         async with semaphore:
             # 构造系统提示词和多层级的用户提示词
@@ -361,6 +519,19 @@ class PipelineWorkflow:
         :return: 包含各切面及其对应回答的字典列表，如: [{"planner": 切面, "answer": 回答}, ...]
         """
         semaphore = asyncio.Semaphore(config.CONCURRENT_QA_LIMIT)
+        facets, invalid_facets = filter_valid_facets(facets)
+        if invalid_facets:
+            logger.critical(f"Invalid facets rejected before parallel answers: {invalid_facets}")
+            record_generation_audit({
+                "stage": "parallel_answer_gate",
+                "status": "invalid_rejected",
+                "task_id": task_id_label,
+                "query": query,
+                "invalid_facets": invalid_facets,
+            })
+        if len(facets) < 2:
+            logger.critical(f"Parallel answer generation aborted: fewer than 2 valid facets for query '{query}'.")
+            return []
         # 创建并发任务列表
         tasks = [self.answer_single_facet(query, facet, refs, semaphore, task_id_label=task_id_label) for facet in facets]
         # 并发执行所有任务
@@ -452,12 +623,17 @@ class PipelineWorkflow:
         # 1. 规划初始切面
         initial_facets = await self.plan_facets(query, task_id_label=task_id_label)
         if not initial_facets:
-            initial_facets = ["临床表现", "药理学机制"]
+            raise RuntimeError(f"Facet planning failed validation; sample quarantined for query: {query}")
             
         # 2. 预处理切面（缩减或扩充）
         final_facets = await self.preprocess_facets(query, initial_facets, task_id_label=task_id_label)
+        if len(final_facets) < 2:
+            raise RuntimeError(f"Facet preprocessing produced fewer than 2 valid facets; sample quarantined for query: {query}")
+
         # 3. 并发生成各切面回答
         planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
+        if not planners:
+            raise RuntimeError(f"No valid facet answers generated; sample quarantined for query: {query}")
         
         # 4. 使用策略模式执行冗余过滤
         non_redundant_planners = await self.redundancy_filter.filter_redundancy(
@@ -571,4 +747,3 @@ class PipelineWorkflow:
         # 将参考文献附加到最后一轮的结果中并返回
         history[-1]["refs"] = refs
         return history[-1]
-

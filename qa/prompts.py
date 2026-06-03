@@ -50,22 +50,48 @@ _BOOTSTRAP_FACET_PLANNER_TEMPLATE = """<role>
 </role>
 
 <task>
-用户会给出一个 query。你需要为这个 query 规划“回答的侧重点（facet）”，用于分发给下游多个 agent 进行角色扮演式的完整回答。
+用户会给出一个 query。你需要为这个 query 规划“回答的侧重点（facet）”，用于分发给下游多个 agent 进行角色扮演式的完整回答。你必须按结构化 schema 返回 facet 候选对象，而不是返回普通字符串数组。
 </task>
 
 <rule>
-- 你只输出“角度（facet）”，不输出真实答案、不展开解释。
+- 你只输出结构化 facet 候选对象，不输出真实答案、不展开长篇解释。
 - facet 不是把问题拆成多个子问题，而是“同一个问题的不同叙事重心/回答框架”。
 - 每一个 facet 都必须能引导出一篇**针对该 query 的完整回答**（而不是片面补充）。
 - facet 之间要尽量互相区分，避免同义重复。
 - facet 形式要尽量简短：**一个词或短词组**，不要一句话，更不要一段话。
-- facet 数量由你根据 query 复杂度决定：可以 1 个，也可以多个。
+- facet 数量必须为 2 到 8 个，简单问题也必须给出 2 个最贴切且互补的医学视角。
+- 严禁输出占位符、提示语、报错语、澄清问题、Schema/System/API/JSON 文本，例如：“示例视角1”、“提示：缺少医疗问题”、“请提供具体问题”、“You are a rigorous data processing API”等。
 </rule>
 
 <format>
-- 只输出一个 JSON 数组（不要额外文字、不要代码块标注、不要解释）。
-- 数组元素为字符串，每个字符串就是一个 facet。
-- 示例格式：[".....", ".....", "....."]
+- 只输出一个 JSON 对象（不要额外文字、不要代码块标注、不要解释）。
+- 对象字段必须为 `facets`。
+- `facets` 是 2 到 8 个对象组成的数组。
+- 每个对象必须包含：
+  - `label`: 2-16 个中文字符或短词组的医学视角名。
+  - `category`: 下列枚举之一：composition, efficacy, dosage, contraindication, adverse_reaction, pharmacokinetics, mechanism_boundary, storage_quality, population_safety, clinical_evidence, other_medical。
+  - `answer_scope`: 一句话说明该视角如何回答主问题。
+  - `why_relevant`: 一句话说明该视角与主问题的直接相关性。
+  - `risk_level`: low, medium, high。
+- 示例格式：
+{
+  "facets": [
+    {
+      "label": "成分构成",
+      "category": "composition",
+      "answer_scope": "围绕药物组成成分回答主问题",
+      "why_relevant": "主问题直接询问药物包含哪些主要成分",
+      "risk_level": "low"
+    },
+    {
+      "label": "功效关联",
+      "category": "efficacy",
+      "answer_scope": "在不扩展无依据事实的前提下说明成分与功效边界",
+      "why_relevant": "成分问题可用功效边界辅助组织回答",
+      "risk_level": "medium"
+    }
+  ]
+}
 </format>
 
 <strategy>
@@ -81,9 +107,9 @@ _BOOTSTRAP_FACET_PLANNER_TEMPLATE = """<role>
   - `诊断标准与鉴别诊断` (Diagnostic Criteria & Differential Diagnosis - 疾病筛查、指标异常与鉴别逻辑)
   - `循证临床疗效评价` (Evidence-based Efficacy Evaluation - 临床试验终点、多中心对比与临床效益)
 - 角度规划规则：
-  - 如果 query 很简单且事实较为局限：直接给出 2 个最核心的特异性切面（例如 `用药方案与滴定` 与 `不良反应预防与管理`）。
+  - 如果 query 很简单且事实较为局限：直接给出 2 个最核心的特异性切面。不要为了凑数加入会诱导无依据机制外推的视角。
   - 如果 query 复杂且信息面广：必须给出 3-8 个高度互斥、角度极为合理多样的专业切面，确保从机制到临床的全生命周期覆盖。
-- 不要提出反问或澄清问题，直接给出 facets 的 JSON 数组。
+- 不要提出反问或澄清问题，直接给出包含 `facets` 字段的 JSON 对象。
 </strategy>
 
 ## 输入

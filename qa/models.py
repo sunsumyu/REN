@@ -1,12 +1,95 @@
-from pydantic import BaseModel, Field
-from typing import List
-from enum import Enum
+import re
+from typing import List, Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+
+FACET_FORBIDDEN_PATTERNS = [
+    r"示例\s*视角",
+    r"缺少医疗问题",
+    r"请提供",
+    r"请输入",
+    r"数据不足",
+    r"无法规划",
+    r"rigorous\s+data\s+processing\s+api",
+    r"json\s*schema",
+    r"\bschema\b",
+    r"\bjson\b",
+    r"\bapi\b",
+    r"\bsystem\b",
+    r"\bassistant\b",
+    r"\buser\b",
+    r"```",
+    r"\{|\}|\[|\]",
+]
+
+
+class FacetCandidate(BaseModel):
+    label: str = Field(
+        description="短医学视角名，2-16个中文字符或短词组，不得包含提示语、示例、Schema、JSON/API/System等工程文本。",
+        min_length=2,
+        max_length=16,
+    )
+    category: Literal[
+        "composition",
+        "efficacy",
+        "dosage",
+        "contraindication",
+        "adverse_reaction",
+        "pharmacokinetics",
+        "mechanism_boundary",
+        "storage_quality",
+        "population_safety",
+        "clinical_evidence",
+        "other_medical",
+    ] = Field(description="该视角所属的医学/药理类别枚举。")
+    answer_scope: str = Field(
+        description="一句话说明该视角如何回答主问题，不得复述Schema或输出提示语。",
+        min_length=4,
+        max_length=80,
+    )
+    why_relevant: str = Field(
+        description="一句话说明该视角与主问题的直接相关性。",
+        min_length=4,
+        max_length=80,
+    )
+    risk_level: Literal["low", "medium", "high"] = Field(
+        description="该视角诱发无依据外推的风险等级。简单事实题的深机制视角通常为 medium/high。"
+    )
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        label = value.strip()
+        if label != value:
+            value = label
+        if "\n" in label or "\r" in label or "\t" in label:
+            raise ValueError("facet label must be a single short phrase")
+        if len(re.findall(r"[A-Za-z]", label)) > 8:
+            raise ValueError("facet label contains too much English text")
+        lowered = label.lower()
+        for pattern in FACET_FORBIDDEN_PATTERNS:
+            if re.search(pattern, lowered, flags=re.IGNORECASE):
+                raise ValueError(f"invalid facet label: forbidden pattern {pattern}")
+        if any(ch in label for ch in [":", "：", "。", "？", "?", "！", "!", "，", ","]):
+            raise ValueError("facet label must not contain sentence punctuation")
+        return label
+
+    @field_validator("answer_scope", "why_relevant")
+    @classmethod
+    def validate_explanation(cls, value: str) -> str:
+        text = value.strip()
+        lowered = text.lower()
+        for pattern in FACET_FORBIDDEN_PATTERNS:
+            if re.search(pattern, lowered, flags=re.IGNORECASE):
+                raise ValueError(f"facet explanation contains forbidden pattern {pattern}")
+        return text
 
 class FacetPlan(BaseModel):
-    facets: List[str] = Field(
-        description="为输入的医疗问题规划学术、临床与药理切面视角（数量必须在 2 到 8 个之间），请根据问题本身的专业特性定制化规划，不限制名称（如：分子机制、古籍收采、药代动力学、特殊人群安全等）。",
-        min_items=2,
-        max_items=8
+    facets: List[FacetCandidate] = Field(
+        description="为输入的医疗问题规划2到8个合法医学视角候选。每个候选必须是结构化对象，不能是普通字符串、提示语、示例占位符或Schema文本。",
+        min_length=2,
+        max_length=8,
     )
 
 class EvidenceItem(BaseModel):

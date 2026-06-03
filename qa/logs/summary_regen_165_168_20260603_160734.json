@@ -1,0 +1,40 @@
+[
+  {
+    "line": 165,
+    "Q": "达希纳-尼洛替尼胶囊的不常见不良反应中包括哪些眼部相关症状？",
+    "planners": [
+      "不良反应表现"
+    ],
+    "summary": "达希纳-尼洛替尼胶囊的不常见不良反应（发生率≥0.1%且<1%）中，眼部相关症状包括：视觉障碍、视物模糊、视敏度下降、眼睑水肿、眼睑炎、眼刺激、眼干/干眼病、眼痛、眼睛肿胀、眼表疾病、结膜出血、结膜炎、过敏性结膜炎、巩膜/结膜/眼部充血、眼瘙痒、闪光幻觉、复视、畏光、视神经乳头水肿和脉络膜视网膜炎。",
+    "note": "manual evidence-bound summary regeneration; raw backup was read only"
+  },
+  {
+    "line": 166,
+    "Q": "服用含蚕蛾的药物时，哪些人群需要在医师指导下使用？",
+    "planners": [
+      "常见不良反应"
+    ],
+    "summary": "服用含蚕蛾的药物时，需要在医师指导下使用的人群包括：肾功能不全者、血小板低下者、冠心病重症患者、高蛋白质过敏者、感冒发热病人、糖尿病患者，以及肝病、心脏病、高血压、肾病等慢性病严重者；孕妇、哺乳期妇女和年老体弱者也应在医师指导下服用。部分含蚕蛾制剂如蛮龙液含乙醇，服药后不得驾驶机、车、船，不得从事高空作业、机械作业或操作精密仪器。",
+    "note": "manual evidence-bound summary regeneration; raw backup was read only"
+  },
+  {
+    "line": 167,
+    "Q": "PIP2水解产生的DAG和IP3通过激活PRKC和CAMK参与了EGFR下游的哪些信号通路？",
+    "planners": [
+      "耐药性机制"
+    ],
+    "summary": "PIP2水解生成的DAG和IP3分别通过激活PRKC和CAMK，参与EGFR下游的三类信号通路：RAS-RAF-MAPK通路、PI3K/AKT通路和JAK/STAT通路。这些通路共同参与细胞分裂、存活及相关信号调控。",
+    "note": "manual evidence-bound summary regeneration; raw backup was read only"
+  },
+  {
+    "line": 168,
+    "Q": "成人服用阿莫西林颗粒的每日最大剂量是多少？",
+    "planners": [
+      "禁忌人群与慎用情况",
+      "常见不良反应谱",
+      "药代动力学特点"
+    ],
+    "summary": "成人服用阿莫西林颗粒时，一次0.5克（4袋，每袋0.125克），每6～8小时一次；每日剂量不超过4克，即最多32袋。相关安全边界包括：对青霉素过敏或青霉素皮肤试验阳性者禁用；孕妇仅在确有必要时使用；乳母服用后可能导致婴儿过敏；儿童和老年用药缺乏相关实验和可靠参考文献；阿莫西林过量可能引起肾功能不全、少尿，停药后肾功能损害通常可逆。",
+    "note": "manual evidence-bound summary regeneration; raw backup was read only"
+  }
+]

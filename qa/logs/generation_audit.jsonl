@@ -1,0 +1,5 @@
+{"stage": "facet_planning", "status": "success", "task_id": "Task-5", "query": "服用含蚕蛾的药物时，哪些人群需要在医师指导下使用？", "attempt": 1, "facets": ["常见不良反应", "禁忌人群"], "time": "2026-06-03T14:29:48"}
+{"stage": "facet_planning", "status": "success", "task_id": "Task-3", "query": "PIP2水解产生的DAG和IP3通过激活PRKC和CAMK参与了EGFR下游的哪些信号通路？", "attempt": 1, "facets": ["疗效证据", "耐药性机制"], "time": "2026-06-03T14:29:50"}
+{"stage": "facet_planning", "status": "success", "task_id": "Task-4", "query": "达希纳-尼洛替尼胶囊的不常见不良反应中包括哪些眼部相关症状？", "attempt": 1, "facets": ["不良反应表现", "禁忌人群"], "time": "2026-06-03T14:29:58"}
+{"stage": "facet_planning", "status": "success", "task_id": "Task-2", "query": "成人服用阿莫西林颗粒的每日最大剂量是多少？", "attempt": 1, "facets": ["活性成分与化学结构", "儿童退热疗效证据", "儿童给药剂量方案", "禁忌人群与慎用情况", "常见不良反应谱", "药代动力学特点", "婴幼儿人群安全性", "临床研究质量评价"], "time": "2026-06-03T14:30:01"}
+{"stage": "facet_planning", "status": "success", "task_id": "Task-1", "query": "北方地区习惯将哪种植物作为败酱草使用？", "attempt": 1, "facets": ["药代动力学参数", "毒性机制", "解毒剂用量", "不良反应谱"], "time": "2026-06-03T14:30:08"}

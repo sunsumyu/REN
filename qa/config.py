@@ -22,13 +22,53 @@ DEFAULT_HOP_COUNT = 2
 LLM_API_URL = os.getenv("LLM_API_URL", "https://volley.yzint.cn/api/v1/chat/completions")
 # 从环境变量中读取 API Key
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+
+# 大模型方案一键切换。显式设置 LLM_MODEL / MODEL_POOL_* 时仍优先生效。
+MODEL_PROFILE = os.getenv("MODEL_PROFILE", "deepseek").strip().lower()
+MODEL_PROFILES = {
+    "deepseek": {
+        "default": "deepseek-v4-pro",
+        "lightweight": "deepseek-v4-flash",
+        "premium": "deepseek-v4-pro",
+        "judge": "deepseek-v4-pro",
+        "audit": "deepseek-v4-pro",
+        "report": "deepseek-v4-flash",
+    },
+    "glm-audit": {
+        "default": "deepseek-v4-pro",
+        "lightweight": "deepseek-v4-flash",
+        "premium": "deepseek-v4-pro",
+        "judge": "glm-5.1",
+        "audit": "Pro/zai-org/GLM-5.1",
+        "report": "Pro/zai-org/GLM-4.7",
+    },
+    "glm-full": {
+        "default": "glm-5.1",
+        "lightweight": "glm-4.7",
+        "premium": "glm-5.1",
+        "judge": "glm-5.1",
+        "audit": "Pro/zai-org/GLM-5.1",
+        "report": "Pro/zai-org/GLM-4.7",
+    },
+}
+_active_model_profile = MODEL_PROFILES.get(MODEL_PROFILE, MODEL_PROFILES["deepseek"])
+_profile_locked = MODEL_PROFILE not in {"deepseek", "custom"}
+
+
+def _model_setting(env_name: str, profile_key: str) -> str:
+    if _profile_locked:
+        return _active_model_profile[profile_key]
+    return os.getenv(env_name, _active_model_profile[profile_key])
+
 # 默认使用通用的大模型（支持同 GPT / 千问的调用）
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-pro")
+LLM_MODEL = _model_setting("LLM_MODEL", "default")
 
 # 大模型池路由配置
-MODEL_POOL_LIGHTWEIGHT = os.getenv("MODEL_POOL_LIGHTWEIGHT", "deepseek-v4-flash")
-MODEL_POOL_PREMIUM = os.getenv("MODEL_POOL_PREMIUM", "deepseek-v4-pro")
-MODEL_POOL_JUDGE = os.getenv("MODEL_POOL_JUDGE", "deepseek-v4-pro")
+MODEL_POOL_LIGHTWEIGHT = _model_setting("MODEL_POOL_LIGHTWEIGHT", "lightweight")
+MODEL_POOL_PREMIUM = _model_setting("MODEL_POOL_PREMIUM", "premium")
+MODEL_POOL_JUDGE = _model_setting("MODEL_POOL_JUDGE", "judge")
+AUDIT_MODEL = _model_setting("AUDIT_MODEL", "audit")
+REPORT_MODEL = _model_setting("REPORT_MODEL", "report")
 
 # 流程控制配置
 MAX_RETRIES = 3  # 根据用户要求，大模型请求与网络重试次数严格限制在 3 次以内
@@ -70,4 +110,3 @@ if PURIFY_LINES_RAW:
         PURIFY_LINES = []
 else:
     PURIFY_LINES = []
-

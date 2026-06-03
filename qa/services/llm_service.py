@@ -6,6 +6,7 @@ import random
 import json
 import time
 import os
+import re
 from typing import List, Dict, Any, Tuple
 from abc import ABC, abstractmethod
 import config
@@ -31,6 +32,51 @@ class LLMService(ILLMService):
         self.client = http_client
         self.global_semaphore = global_semaphore
         self.supported_models: List[str] = []
+
+    STRUCTURED_LEAK_PATTERNS = [
+        r"rigorous\s+data\s+processing\s+api",
+        r"strictly\s+adheres?\s+to\s+the\s+following\s+json\s+schema",
+        r"valid\s+json\s+object\s+that\s+strictly\s+adheres?",
+        r"do\s+not\s+include\s+markdown\s+fences",
+        r"requested\s+json\s+schema",
+        r"pydantic\s+validation",
+        r"required\s+fields\s+are\s+filled\s+correctly",
+        r'"\$defs"\s*:',
+        r'"properties"\s*:',
+        r'"type"\s*:\s*"object"',
+    ]
+
+    @classmethod
+    def _find_structured_prompt_leak(cls, value: Any, path: str = "$") -> Tuple[str, str]:
+        if isinstance(value, str):
+            lowered = value.lower()
+            for pattern in cls.STRUCTURED_LEAK_PATTERNS:
+                if re.search(pattern, lowered, flags=re.IGNORECASE):
+                    return path, pattern
+            return "", ""
+        if isinstance(value, dict):
+            for key, child in value.items():
+                leak_path, pattern = cls._find_structured_prompt_leak(child, f"{path}.{key}")
+                if leak_path:
+                    return leak_path, pattern
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                leak_path, pattern = cls._find_structured_prompt_leak(child, f"{path}[{index}]")
+                if leak_path:
+                    return leak_path, pattern
+        return "", ""
+
+    @classmethod
+    def _assert_no_structured_prompt_leak(cls, obj: Any, response_model: type) -> None:
+        try:
+            payload = obj.model_dump(mode="json") if hasattr(obj, "model_dump") else obj
+        except Exception:
+            payload = obj
+        leak_path, pattern = cls._find_structured_prompt_leak(payload)
+        if leak_path:
+            raise ValueError(
+                f"{response_model.__name__} contains structured prompt/schema leakage at {leak_path}: {pattern}"
+            )
 
     async def init_supported_models(self, force: bool = False):
         """
@@ -109,6 +155,8 @@ class LLMService(ILLMService):
         # Map pool to configured model name
         if pool == "lightweight":
             model_candidate = config.MODEL_POOL_LIGHTWEIGHT
+        elif pool == "judge":
+            model_candidate = config.MODEL_POOL_JUDGE
         else:
             model_candidate = config.MODEL_POOL_PREMIUM
             
@@ -353,7 +401,12 @@ class LLMService(ILLMService):
             schema_str = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
             current_messages.insert(0, {
                 "role": "system", 
-                "content": f"You are a rigorous data processing API. You must output ONLY a valid JSON object that strictly adheres to the following JSON schema. Do not include markdown fences (like ```json), conversational text, or explanations.\n\nSchema:\n{schema_str}"
+                "content": (
+                    f"你是结构化函数调用参数生成器。请为虚拟函数 {response_model.__name__} 生成 arguments。\n"
+                    "只允许返回一个 JSON object，不要返回 Markdown、解释、对话前后缀或代码块。\n"
+                    "下面的 JSON Schema 只是字段约束，绝不能把 schema、字段说明、system/user/assistant 提示文本复制进任何字段值。\n\n"
+                    f"Function arguments JSON Schema:\n{schema_str}"
+                )
             })
             
         for attempt in range(max_healing_attempts + 1):
@@ -414,6 +467,7 @@ class LLMService(ILLMService):
                     clean_content = clean_content[start:end+1]
 
                 obj = response_model.model_validate_json(clean_content)
+                self._assert_no_structured_prompt_leak(obj, response_model)
                 object.__setattr__(obj, "_reasoning_content", reasoning_content.strip())
                 return obj
             except Exception as e:
@@ -432,10 +486,10 @@ class LLMService(ILLMService):
                 
                 error_desc = str(e)
                 feedback_prompt = (
-                    f"Your previous response failed Pydantic validation with the following error:\n"
-                    f"'{error_desc}'\n\n"
-                    f"Please output a corrected, valid JSON object that strictly adheres to the requested JSON schema. "
-                    f"Ensure all required fields are filled correctly and values match any defined Enums exactly. "
-                    f"Do not add any markup wrapping, markdown fences, or conversational prefix/suffix text."
+                    "上一轮函数参数 JSON 未通过程序校验，错误如下：\n"
+                    f"{error_desc}\n\n"
+                    "请重新输出一个可被解析的 JSON object。"
+                    "字段必须完整，枚举值必须精确匹配约束。"
+                    "不要输出 Markdown、解释、对话前后缀，也不要把校验错误、schema 或提示文本复制进任何字段值。"
                 )
                 current_messages.append({"role": "user", "content": feedback_prompt})
