@@ -1,0 +1,26 @@
+name: Gemini Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize] # 当PR创建或有新代码提交时触发
+  issue_comment:
+    types: [created] # 允许通过评论手动触发
+
+jobs:
+  review:
+    # 如果是PR事件，或者评论中包含 '/gemini-review' 则运行
+    if: ${{ github.event_name == 'pull_request' || contains(github.event.comment.body, '/gemini-review') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # 必须具备写权限才能发表评论
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        
+      - name: Gemini AI Code Reviewer
+        uses: truongnh1992/gemini-ai-code-reviewer@v9.2.1 # 社区开源的高赞审查Action
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }} # GitHub默认提供，无需手动配置
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: "gemini-2.5-pro" # 也可以换成 gemini-2.5-flash 以获取更快速度
