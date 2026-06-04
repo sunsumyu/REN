@@ -13,6 +13,7 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 from api_client import APIClient
 from pipeline import MedicalQAPipeline
+from core.pipeline_workflow import SampleQuarantineException
 from tests.run_evals import JUDGE_COMPREHENSIVE_PROMPT
 from tests.eval_models import ComprehensiveJudgeMetrics
 from dataset_db import save_dataset_record
@@ -368,6 +369,9 @@ async def generate_and_save_single_task(
             logger.info(f"{log_prefix}🎉 质检通过！数据已成功写盘入库 (current/raw JSONL / qa_datasets.db)")
             stats["total_passed"] += 1
             
+        except SampleQuarantineException as sqe:
+            logger.warning(f"{log_prefix}⚠️ 样本已安全隔离并跳过: {sqe}")
+            stats["total_failed"] += 1
         except Exception as e:
             logger.error(f"{log_prefix}❌ 任务运行期发生异常: {e}", exc_info=True)
             stats["total_failed"] += 1

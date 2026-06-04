@@ -19,6 +19,13 @@ logger = logging.getLogger("MedicalQA.PipelineWorkflow")
 GENERATION_AUDIT_PATH = Path(__file__).resolve().parent.parent / "logs" / "generation_audit.jsonl"
 
 
+class SampleQuarantineException(Exception):
+    """
+    当样本因前置治理过滤、切面不足或质量不合格而需被正常隔离（quarantine）时的业务级非致命异常。
+    """
+    pass
+
+
 FACET_FORBIDDEN_PATTERNS = [
     r"示例\s*视角",
     r"缺少医疗问题",
@@ -355,7 +362,7 @@ class PipelineWorkflow:
             # 切面数量为2，直接返回两个最贴切且互补的切面
             return facets
 
-    async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, task_id_label: str = "") -> Tuple[str, str]:
+    async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, simplify: bool = False, boundary_refs: List[Dict[str, str]] = None, task_id_label: str = "") -> Tuple[str, str]:
         """
         为单个视角（切面）调用图问答智能体进行深度问答。
         核心生成步骤：必须路由至高级模型执行。
@@ -365,6 +372,8 @@ class PipelineWorkflow:
         :param facet: 当前切面名称
         :param refs: 参考文献列表
         :param semaphore: 异步并发信号量，控制并发数
+        :param simplify: 是否启用极简推理模式
+        :param boundary_refs: 边界限制的参考文献列表
         :param task_id_label: 任务ID标签，用于日志追踪
         :return: 元组，包含(切面名称, 生成的回答内容)，若质量把控失败则回答内容为None
         """
@@ -384,11 +393,18 @@ class PipelineWorkflow:
             return facet, None
         
         async with semaphore:
-            # 构造系统提示词和多层级的用户提示词
+            # 构造系统提示词 and 多层级的用户提示词
             system_prompt = PromptRenderer.get_l1_meta()
             task_prompt = PromptRenderer.get_l2_execution(facet)
             context_prompt = PromptRenderer.get_l3_context(query, refs, [])
             user_prompt = f"{task_prompt}\n\n{context_prompt}"
+            
+            if simplify:
+                user_prompt += "\n\n【⚠️ 极简推理特别指令】：当前问题属于简单事实查询。你必须极度简化推理和回答。在 evidences、reasoning_chains 和 answer_body 中，严禁脑补复杂的生化机制、受体或分子通路，只列出直接相关的临床证据，进行 1-2 步极简因果推导即可。"
+                
+            if boundary_refs:
+                boundary_texts = "\n".join([f"- [{r.get('source')}] {r.get('context')}" for r in boundary_refs])
+                user_prompt += f"\n\n【⚠️ 边界限制事实对齐边界】：\n{boundary_texts}\n【⚠️ 边界限制硬性约束】：上述限制事实仅限在思考过程（Think）与最终答案（Answer）中各用最多一句话简要提及，严禁针对其展开长篇大论或虚构衍生逻辑分支！"
             
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -416,7 +432,8 @@ class PipelineWorkflow:
                     # 检查回答质量
                     is_passed, reason = check_answer_quality(
                         result.answer_body, 
-                        getattr(result, "_reasoning_content", "")
+                        getattr(result, "_reasoning_content", ""),
+                        simplify=simplify
                     )
                     if is_passed:
                         break
@@ -483,7 +500,7 @@ class PipelineWorkflow:
                             if len(parts) > 1:
                                 reasoning_content = parts[1].strip()
                         
-                    is_passed, reason = check_answer_quality(check_body, reasoning_content)
+                    is_passed, reason = check_answer_quality(check_body, reasoning_content, simplify=simplify)
                     if is_passed:
                         break
                     logger.warning(f"Quality Guardrail FAILED on fallback attempt {fb_attempt}: {reason}. Retrying...")
@@ -518,6 +535,11 @@ class PipelineWorkflow:
         :param task_id_label: 任务ID标签，用于日志追踪
         :return: 包含各切面及其对应回答的字典列表，如: [{"planner": 切面, "answer": 回答}, ...]
         """
+        from core.governance.facet_strategy import (
+            FacetGovernanceFilter, DropDirtyFacetStrategy, RenameAndRepairStrategy, RedirectToSimpleStrategy
+        )
+        from core.rag.evidence_scope_router import EvidenceScopeRouter
+
         semaphore = asyncio.Semaphore(config.CONCURRENT_QA_LIMIT)
         facets, invalid_facets = filter_valid_facets(facets)
         if invalid_facets:
@@ -532,8 +554,127 @@ class PipelineWorkflow:
         if len(facets) < 2:
             logger.critical(f"Parallel answer generation aborted: fewer than 2 valid facets for query '{query}'.")
             return []
-        # 创建并发任务列表
-        tasks = [self.answer_single_facet(query, facet, refs, semaphore, task_id_label=task_id_label) for facet in facets]
+
+        # 1. 🚦 Q-Facet 兼容过滤器治理
+        gov_filter = FacetGovernanceFilter(self.llm_service)
+        gov_context = {"audit_log": []}
+        governed_facets = []
+
+        for facet in facets:
+            decision = await gov_filter.evaluate_compatibility(query, facet)
+            
+            if decision.facet_action == "DROP" or decision.compatibility == "FORCED_SKIP":
+                strategy = DropDirtyFacetStrategy()
+                res = await strategy.apply(query, facet, gov_context)
+            elif decision.facet_action == "RENAME":
+                strategy = RenameAndRepairStrategy(decision.target_facet)
+                res = await strategy.apply(query, facet, gov_context)
+            elif decision.facet_action == "REDIRECT_SIMPLE" or decision.compatibility == "COMPATIBLE_SIMPLE":
+                strategy = RedirectToSimpleStrategy(decision.target_facet or facet)
+                res = await strategy.apply(query, facet, gov_context)
+            else: # KEEP
+                res = {"action": "keep", "facet": facet, "simplify": False}
+                
+            if res["action"] != "drop" and res["facet"]:
+                governed_facets.append({
+                    "facet": res["facet"],
+                    "simplify": res.get("simplify", False)
+                })
+
+        # 记录前置治理审计日志
+        if gov_context["audit_log"]:
+            logger.info(f"Facet governance audit for query '{query}': {gov_context['audit_log']}")
+            for log in gov_context["audit_log"]:
+                record_generation_audit({
+                    "stage": "facet_governance",
+                    "status": "governed",
+                    "task_id": task_id_label,
+                    "query": query,
+                    "log": log
+                })
+
+        if len(governed_facets) < 1:
+            logger.warning(f"No valid facets remain after initial governance for query '{query}'. Retrying with explicit negative examples...")
+            prompt = (
+                f"你是一个资深的医学多视角数据集设计专家。\n"
+                f"对于主问题：'{query}'\n"
+                f"我们之前规划的以下分析视角由于与问题不兼容/强套偏题已被丢弃：{facets}\n"
+                f"请重新为主问题规划 2-3 个合理、严谨且与问题强契合的规范分析视角/切面。\n"
+                f"只返回 JSON 数组格式，例如：[\"视角1\", \"视角2\"]，不要输出任何其他多余字符。"
+            )
+            try:
+                response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"[{task_id_label}] 视角切面紧急重新规划" if task_id_label else "视角切面紧急重新规划")
+                from pipeline import parse_json_safely
+                new_facets = parse_json_safely(response, [])
+                new_facets, _ = filter_valid_facets(new_facets)
+                if len(new_facets) >= 1:
+                    logger.info(f"Successfully replanned new facets: {new_facets} for query '{query}'")
+                    # 对新的 facets 再次执行一次 evaluate_compatibility 治理
+                    for facet in new_facets:
+                        decision = await gov_filter.evaluate_compatibility(query, facet)
+                        if decision.facet_action == "DROP" or decision.compatibility == "FORCED_SKIP":
+                            strategy = DropDirtyFacetStrategy()
+                            res = await strategy.apply(query, facet, gov_context)
+                        elif decision.facet_action == "RENAME":
+                            strategy = RenameAndRepairStrategy(decision.target_facet)
+                            res = await strategy.apply(query, facet, gov_context)
+                        elif decision.facet_action == "REDIRECT_SIMPLE" or decision.compatibility == "COMPATIBLE_SIMPLE":
+                            strategy = RedirectToSimpleStrategy(decision.target_facet or facet)
+                            res = await strategy.apply(query, facet, gov_context)
+                        else: # KEEP
+                            res = {"action": "keep", "facet": facet, "simplify": False}
+                            
+                        if res["action"] != "drop" and res["facet"]:
+                            governed_facets.append({
+                                "facet": res["facet"],
+                                "simplify": res.get("simplify", False)
+                            })
+            except Exception as e:
+                logger.error(f"Failed to replan facets for query '{query}': {e}")
+
+        if len(governed_facets) < 1:
+            logger.critical(f"Parallel answer generation aborted: no valid facets remain after governance for query '{query}'.")
+            return []
+
+        # 2. 🚦 证据域 RAG 检索分级路由过滤
+        router = EvidenceScopeRouter()
+        from core.governance.facet_strategy import classify_intent_by_rule
+        intent = classify_intent_by_rule(query)
+        routed_refs = router.route_references(query, intent, refs or [])
+        
+        # 隔离物理屏蔽与无用证据，只保留 CORE 和 BOUNDARY
+        active_refs = routed_refs["CORE"] + routed_refs["BOUNDARY"]
+        boundary_refs = routed_refs["BOUNDARY"]
+        
+        # 记录 RAG 路由审计日志
+        blocked_count = len(routed_refs["BLOCKED"])
+        unused_count = len(routed_refs["UNUSED"])
+        if blocked_count > 0 or unused_count > 0:
+            log_msg = f"EvidenceScopeRouter: filtered out {blocked_count} blocked and {unused_count} unused refs."
+            logger.info(log_msg)
+            record_generation_audit({
+                "stage": "evidence_scope_routing",
+                "status": "routed",
+                "task_id": task_id_label,
+                "query": query,
+                "blocked_count": blocked_count,
+                "unused_count": unused_count,
+                "log": log_msg
+            })
+
+        # 创建并发任务列表，分发治理后属性及过滤后 refs
+        tasks = [
+            self.answer_single_facet(
+                query, 
+                f_info["facet"], 
+                active_refs, 
+                semaphore, 
+                simplify=f_info["simplify"], 
+                boundary_refs=boundary_refs,
+                task_id_label=task_id_label
+            ) 
+            for f_info in governed_facets
+        ]
         # 并发执行所有任务
         results = await asyncio.gather(*tasks)
         
@@ -623,17 +764,17 @@ class PipelineWorkflow:
         # 1. 规划初始切面
         initial_facets = await self.plan_facets(query, task_id_label=task_id_label)
         if not initial_facets:
-            raise RuntimeError(f"Facet planning failed validation; sample quarantined for query: {query}")
+            raise SampleQuarantineException(f"Facet planning failed validation; sample quarantined for query: {query}")
             
         # 2. 预处理切面（缩减或扩充）
         final_facets = await self.preprocess_facets(query, initial_facets, task_id_label=task_id_label)
         if len(final_facets) < 2:
-            raise RuntimeError(f"Facet preprocessing produced fewer than 2 valid facets; sample quarantined for query: {query}")
+            raise SampleQuarantineException(f"Facet preprocessing produced fewer than 2 valid facets; sample quarantined for query: {query}")
 
         # 3. 并发生成各切面回答
         planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
         if not planners:
-            raise RuntimeError(f"No valid facet answers generated; sample quarantined for query: {query}")
+            raise SampleQuarantineException(f"No valid facet answers generated; sample quarantined for query: {query}")
         
         # 4. 使用策略模式执行冗余过滤
         non_redundant_planners = await self.redundancy_filter.filter_redundancy(

@@ -10,7 +10,7 @@ import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
-from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE, PURIFY_CONCURRENCY
+from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE, PURIFY_CONCURRENCY, PURIFY_STRICT_RIGOR
 from services.llm_service import ILLMService
 from services.healing_service import IHealingService
 from strategies.quality_gate.llm_judge import IEvaluationStrategy
@@ -69,6 +69,7 @@ class PurificationEngine:
         q: str, 
         planner: str, 
         raw_think: str, 
+        purified_answer: str,
         line_num: int = None,
         refs: List[Dict[str, Any]] = None,
         simplify: bool = False
@@ -92,12 +93,20 @@ class PurificationEngine:
         system_prompt = purifier_module.get_purify_system_prompt(smoothed_planner, simplify=simplify)
         directive = purifier_module.get_system_directive(smoothed_planner)
 
+        # 🛡️ 【企业级证据作用域分级路由与过滤】
+        from core.rag.evidence_scope_router import EvidenceScopeRouter
+        from core.governance.facet_strategy import classify_intent_by_rule
+        router = EvidenceScopeRouter()
+        intent = classify_intent_by_rule(q)
+        routed_refs = router.route_references(q, intent, refs or [])
+        active_refs = routed_refs["CORE"] + routed_refs["BOUNDARY"]
+
         # 🛡️ 【企业级刚性事实锚点解析注入】提取绝对正确的原始图谱或联网事实，强行阻断幻觉空间
         anchors_prompt = ""
         anchors_text = ""
-        if refs:
+        if active_refs:
             anchors = []
-            for r in refs:
+            for r in active_refs:
                 if isinstance(r, dict):
                     src = r.get("source", "")
                     ctx = r.get("context", "")
@@ -181,14 +190,18 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                 p_score = purifier_module.safe_int(scores.get("semantic_purity_score", 90))
                 r_score = purifier_module.safe_int(scores.get("medical_rigor_score", 90))
                 d_score = purifier_module.safe_int(scores.get("logical_depth_score", scores.get("logical_coherence_score", 90)))
+                factual_errors = scores.get("factual_errors", [])
                 reason = str(scores.get("reason", "No reason provided"))
                 
-                logger.info(f"   └─ Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Depth: {d_score}/100] | Reason: {reason}")
+                has_fact_err = len(factual_errors) > 0
+                is_rigor_passed = (r_score >= THRESHOLD_RIGOR) and (not has_fact_err if PURIFY_STRICT_RIGOR else True)
+                
+                logger.info(f"   └─ Attempt {attempt+1}: [Purity: {p_score}/100, Rigor: {r_score}/100, Depth: {d_score}/100, Fact Errors: {len(factual_errors)}] | Reason: {reason}")
                 
                 # 🌟 [方案四 - 语义提纯网关触发]
-                if p_score < THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
+                if p_score < THRESHOLD_PURITY and is_rigor_passed and d_score >= THRESHOLD_DEPTH:
                     logger.info("   🛡️ [方案四 - 语义提纯网关触发] 检测到医学及逻辑达标，但纯净度偏低。启动企业级语义重构...")
-                    purifier_prompt = f"""你是一个顶级循证医学学术编辑。你的任务是将一段混有“开场废话”、“视角扮演宣告”和“元叙事噪声”的医疗推理思维链（CoT），重构为一段完全连贯、自然流动且绝对纯净的临床专家学术推理心流。
+                    purifier_prompt = f"""你是一个顶级循证医学学术编辑。你的任务是将一段混有“开场废话”、“视角扮演宣告”和“元叙事噪声”的医疗推理思维链（CoT），重构为一段完全连贯、自然流动且绝对纯净的临床学术推理心流。
 
 ### 🛠️ 重构与平滑红线：
 1. ❌ 彻底移除任何元叙事废话与开场白（如：“好的”、“我们被要求以...视角”、“问题是...”、“我的分析是...”）。
@@ -230,7 +243,7 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                     except Exception as e_smooth:
                         logger.error(f"   ⚠️ [方案四 - 提纯发生异常]: {e_smooth}")
 
-                if p_score >= THRESHOLD_PURITY and r_score >= THRESHOLD_RIGOR and d_score >= THRESHOLD_DEPTH:
+                if p_score >= THRESHOLD_PURITY and is_rigor_passed and d_score >= THRESHOLD_DEPTH:
                     logger.info(f"   🎉 Quality Gate PASSED on attempt {attempt+1}! Healing academic entities...")
                     purified = await self.healing_service.verify_and_repair_academic_entities(
                         purified, 
@@ -260,9 +273,13 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                     if p_score < THRESHOLD_PURITY:
                         feedback_msg += "\n【核心优化指令：你的前一次写入在“语义纯净度”上不符合规范。请确保全篇为完全连贯、自然流动的临床学术段落，绝对禁止提及或表露元数据结构。】"
                     if r_score < THRESHOLD_RIGOR:
-                        feedback_msg += "\n【核心优化指令：你的前一次写入在“医学严谨度”上不符合规范。请删除任何未经确证事实支持的官方标准号、批准文号、注册号、受体通路、靶点、免疫机制或药代参数，不要保留原文中的高仿真编号。】"
+                        feedback_msg += "\n【核心优化指令：你的前一次写入在“医学严谨度”分数上不符合规范，请注意确证事实的对齐。】"
+                    if factual_errors:
+                        feedback_msg += "\n【核心优化指令：质检审查裁判发现的具体医学事实/化学术语/学术错误清单如下，请在本次重写中予以彻底纠正】：\n" + "\n".join(f"- {err}" for err in factual_errors)
                     if d_score < THRESHOLD_DEPTH:
                         feedback_msg += "\n【核心优化指令：你的前一次写入在“逻辑深度”上不符合规范，请避免平铺直叙，融入探究反思。】"
+                    if reason and reason != "No explanation provided" and not factual_errors:
+                        feedback_msg += f"\n【质检审查裁判的具体评审意见：{reason}】"
                     
                     feedback_msg = feedback_msg.replace('[', '【').replace(']', '】')
                     feedback_prompt = feedback_msg

@@ -18,28 +18,26 @@ import copy
 from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
-# 将当前目录与项目根目录加入系统路径以确保 import 正常
-current_dir = Path(__file__).resolve().parent
-parent_dir = current_dir.parent
-sys.path.append(str(current_dir))
-sys.path.append(str(parent_dir))
-
-from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE, PURIFY_CONCURRENCY
-from api_client import APIClient
-from core.purification_engine import PurificationEngine
-from services.healing_service import HealingService
-from strategies.quality_gate.llm_judge import LLMJudgeStrategy
-
-from utils.logging_config import setup_logging
-setup_logging()
-logger = logging.getLogger("MedicalQA.LLMPurifier")
-
-# 针对 Windows 控制台环境，强行配置标准输出为 UTF-8
 try:
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
 except Exception:
     pass
+
+# 导入当前目录及父目录，以便正常进行 import
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
+sys.path.append(str(current_dir))
+sys.path.append(str(parent_dir))
+
+from config import LLM_MODEL, PURIFY_LIMIT, PURIFY_LINES, PURIFY_START_LINE, PURIFY_DELETE_ON_FAIL, PURIFY_CONCURRENCY
+from api_client import APIClient
+from core.purification_engine import PurificationEngine
+from services.healing_service import HealingService
+from strategies.quality_gate.llm_judge import LLMJudgeStrategy
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("MedicalQA.LLMPurifier")
 
 async def verify_facet_by_small_model(client: APIClient, facet: str) -> bool:
     """
@@ -151,11 +149,10 @@ async def check_semantic_compatibility(client: APIClient, question: str, facet: 
         logger.error(f"⚠️ 视角适配网关校验异常: {e}，默认完全兼容。")
         return "COMPATIBLE"
 
-async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None, simplify: bool = False) -> Tuple[str, Dict[str, Any]]:
+async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, purified_answer: str, line_num: int = None, refs: List[Dict[str, Any]] = None, simplify: bool = False) -> Tuple[str, Dict[str, Any]]:
+    """    Surgically delegate single thought trace purification to modularized PurificationEngine (reusing injected engine).
     """
-    Surgically delegate single thought trace purification to modularized PurificationEngine (reusing injected engine).
-    """
-    return await engine.purify_single_think(q, planner, raw_think, line_num, refs, simplify)
+    return await engine.purify_single_think(q, planner, raw_think, purified_answer, line_num, refs, simplify)
 
 async def generate_diff_analysis(llm_service, item: dict) -> str:
     """
@@ -276,6 +273,45 @@ def extract_answer_body(answer: str) -> str:
         return ""
     match = re.match(r"^\s*<think>[\s\S]*?</think>\s*([\s\S]*)$", answer)
     return match.group(1).strip() if match else answer.strip()
+
+
+async def rewrite_answer_body(
+    llm_service,
+    q: str,
+    original_answer: str,
+    refs: List[Dict[str, Any]],
+) -> str:
+    """
+    Calls lightweight LLM to rewrite and narrow the answer body, removing off-topic and overreached facts.
+    """
+    refs_text = json.dumps(refs or [], ensure_ascii=False)
+    prompt = f"""你是一个专业的医学学术编辑。你的任务是净化并重写医学回答的正文（Answer Body），使其高度聚焦于主问题 Q，并剔除由于视角规划偏题而脑补的冗余/越界内容。
+    
+### 🛠️ 重写红线与指令：
+1. 🎯 窄域聚焦：仔细阅读主问题 Q，只保留直接回答 Q 的临床事实。如果正文包含与 Q 无关的诊断、药代动力学、禁忌症、分子通路或大篇幅的不良反应，请坚决予以剔除。
+2. 🔗 证据对齐：保留的所有事实必须由 references 事实支持。严禁保留任何虚构或无依据的声称。
+3. ❌ 彻底移除任何元叙事废话与工程噪声（如：根据参考资料、RAG、refs等）。
+4. 📤 仅输出重构后的干净回答正文本身，保持段落清晰、排版专业，不要包含任何 <think> 块，也不要有任何前后缀解释。
+
+主问题 Q:
+{q}
+
+原始回答正文:
+{original_answer}
+
+参考文献依据 refs:
+{refs_text[:6000]}
+"""
+    try:
+        purified = await llm_service.call_llm(
+            prompt,
+            model_pool="lightweight",
+            stage="Answer正文窄域化重写"
+        )
+        return purified.strip()
+    except Exception as e:
+        logger.warning(f"Failed to rewrite answer body: {e}. Falling back to original.")
+        return original_answer
 
 
 async def regenerate_summary_after_purification(
@@ -587,7 +623,7 @@ async def main():
                         "question": original_data.get("Q", ""),
                         **raw_mapping_meta,
                     })
-                    return line_str
+                    return None if PURIFY_DELETE_ON_FAIL else line_str
 
                 if not refs and raw_record.get("refs"):
                     refs = raw_record.get("refs", [])
@@ -663,6 +699,17 @@ async def main():
                         raw_think = think_match.group(1).strip()
                         answer_body = think_match.group(2).strip()
                             
+                        # 1. Answer rewrite and narrowing
+                        purified_answer_body = await rewrite_answer_body(
+                            client.llm_service,
+                            q,
+                            answer_body,
+                            refs
+                        )
+                        original_answer_body = answer_body
+                        answer_body_after_leakage_scrub = scrub_engineering_leakage(purified_answer_body)
+                        purified_answer_body = scrub_unsupported_official_identifiers(answer_body_after_leakage_scrub, refs)
+
                         facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
                         if facet_match:
                             facet_tag = facet_match.group(1).strip()
@@ -678,7 +725,7 @@ async def main():
                         async with sem:
                             logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
                             purified_think, score_dict = await purify_single_think(
-                                engine, q, planner_name, actual_raw_think, 
+                                engine, q, planner_name, actual_raw_think, purified_answer_body,
                                 line_num=line_idx+1, refs=refs, simplify=simplify
                             )
                             
@@ -694,10 +741,7 @@ async def main():
                             
                         p_new = copy.deepcopy(p)
                         p_new["planner"] = planner_name
-                        original_answer_body = answer_body
-                        answer_body_after_leakage_scrub = scrub_engineering_leakage(answer_body)
-                        answer_body = scrub_unsupported_official_identifiers(answer_body_after_leakage_scrub, refs)
-                        purified_full_answer = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{answer_body}"
+                        purified_full_answer = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{purified_answer_body}"
                         p_new["answer"] = purified_full_answer
 
                         operations = [
@@ -708,9 +752,11 @@ async def main():
                             operations.append(f"repair_planner_name:{raw_planner_name}->{planner_name}")
                         if simplify:
                             operations.append("apply_simplified_reasoning_mode")
-                        if answer_body_after_leakage_scrub != original_answer_body:
+                        if purified_answer_body != original_answer_body:
+                            operations.append("rewrite_and_narrow_answer_body")
+                        if answer_body_after_leakage_scrub != purified_answer_body:
                             operations.append("scrub_engineering_leakage_from_answer_body")
-                        if answer_body != answer_body_after_leakage_scrub:
+                        if purified_answer_body != answer_body_after_leakage_scrub:
                             operations.append("scrub_unsupported_official_identifiers_from_answer_body")
                             
                         diff_log = {
@@ -769,7 +815,7 @@ async def main():
                     "pruned_count": pruned_count,
                     "planners": planner_audit,
                 })
-                return line_str
+                return None if PURIFY_DELETE_ON_FAIL else line_str
 
             if not local_diff_logs and pruned_count == 0:
                 record_audit_event({
@@ -806,7 +852,7 @@ async def main():
                     "pruned_count": pruned_count,
                     "planners": planner_audit,
                 })
-                return line_str
+                return None if PURIFY_DELETE_ON_FAIL else line_str
 
             for item in local_diff_logs:
                 item["original_summary"] = original_summary
@@ -839,7 +885,7 @@ async def main():
                 "run_status": "error",
                 "reason": str(e),
             })
-            return line_str
+            return None if PURIFY_DELETE_ON_FAIL else line_str
             
     purify_counter = 0
     tasks = []
@@ -891,6 +937,33 @@ async def main():
         tasks.append(process_record(i, line, should_purify, skip_reason))
         
     processed_results = await asyncio.gather(*tasks)
+
+    # 计算旧行号到新行号的映射（过滤掉被丢弃的 None 行）
+    old_to_new_line = {}
+    current_new_idx = 1
+    for i in range(len(lines)):
+        old_line = i + 1
+        if processed_results[i] is not None:
+            old_to_new_line[old_line] = current_new_idx
+            current_new_idx += 1
+        else:
+            old_to_new_line[old_line] = None
+
+    # 更新 purified_diff_logs 和 audit_events 的 line_number 为新行号
+    for item in purified_diff_logs:
+        old_ln = item["line_number"]
+        new_ln = old_to_new_line.get(old_ln)
+        if new_ln is not None:
+            item["line_number"] = new_ln
+            
+    for event in audit_events:
+        old_ln = event.get("line_number")
+        if old_ln is not None:
+            new_ln = old_to_new_line.get(old_ln)
+            if new_ln is None and event.get("run_status") in {"rollback", "error"}:
+                event["is_deleted"] = True
+            elif new_ln is not None:
+                event["line_number"] = new_ln
     
     # 🌟 [企业级安全并发合并写回机制 - 防止 Lost Update 并发覆盖]
     # 在写回磁盘前，重新读取一次磁盘上最新的数据集。防止在提纯大模型调用期间（通常长达数十秒至数分钟）
@@ -906,8 +979,88 @@ async def main():
     except Exception as e:
         logger.error(f"⚠️ [并发写冲突拦截] 读取最新数据进行合并失败: {e}。退回默认覆盖写。")
         
+    final_dataset_lines = []
+    final_raw_lines = []
+    
+    try:
+        if backup_path.exists():
+            with open(backup_path, 'r', encoding='utf-8') as f:
+                current_raw_lines = f.readlines()
+        else:
+            current_raw_lines = []
+    except Exception as e:
+        logger.error(f"Failed to read raw backup lines for sync: {e}")
+        current_raw_lines = []
+
+    any_deleted = any(res is None for res in processed_results[:len(lines)])
+    if any_deleted:
+        failures_jsonl_path = logs_dir / "purification_failures.jsonl"
+        failures_backup_path = logs_dir / "purification_failures_backup.jsonl"
+        if failures_jsonl_path.exists():
+            try:
+                shutil.copy2(failures_jsonl_path, failures_backup_path)
+                logger.info(f"🛡️ Backed up failures JSONL records to: {failures_backup_path.name}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to backup failures JSONL: {e}")
+
+    for i, res in enumerate(processed_results[:len(lines)]):
+        if res is not None:
+            final_dataset_lines.append(res)
+            if i < len(current_raw_lines):
+                final_raw_lines.append(current_raw_lines[i])
+        else:
+            logger.info(f"🗑️ [物理删除行] 过滤并同步删除原始数据集和 raw 备份中的第 {i+1} 行")
+            try:
+                original_line_str = lines[i]
+                if original_line_str.strip():
+                    original_data = json.loads(original_line_str)
+                    timestamp_str = datetime.datetime.now().isoformat()
+                    
+                    reason = "purification failed or rolled back"
+                    for event in audit_events:
+                        if event.get("line_number") == i + 1 and event.get("run_status") in {"rollback", "error"}:
+                            reason = event.get("reason", reason)
+                            break
+                            
+                    failure_event = {
+                        "timestamp": timestamp_str,
+                        "original_line_number": i + 1,
+                        "reason": reason,
+                        "data": original_data
+                    }
+                    
+                    failures_jsonl_path = logs_dir / "purification_failures.jsonl"
+                    with open(failures_jsonl_path, "a", encoding="utf-8") as jf:
+                        jf.write(json.dumps(failure_event, ensure_ascii=False) + "\n")
+                    logger.info(f"📝 Appended line {i+1} failure metadata to global graveyard: {failures_jsonl_path.name}")
+                    
+                    failures_md_path = logs_dir / "purification_failures.md"
+                    write_header = not failures_md_path.exists()
+                    with open(failures_md_path, "a", encoding="utf-8") as mf:
+                        if write_header:
+                            mf.write("# 🩺 医疗问答思维链提纯净化「历史失败/隔离行」汇总墓地\n\n")
+                            mf.write("本描述文件记录了在数据集提纯净化阶段中因语义不兼容、格式崩溃或质检评分未通过而被**物理丢弃隔离**的所有样本，作为后续诊断和微调优化的依据。\n\n")
+                            mf.write("| 时间戳 | 原始行号 | 失败原因 | 主问题 (Q) | 视角 (Facets) |\n")
+                            mf.write("| :--- | :--- | :--- | :--- | :--- |\n")
+                        
+                        planners = [p.get("planner", "") for p in original_data.get("planners", [])]
+                        q_text = original_data.get("Q", "N/A")
+                        mf.write(f"| {timestamp_str} | {i+1} | {reason} | `{q_text}` | {', '.join(planners)} |\n")
+                    logger.info(f"📝 Appended line {i+1} failure report to global graveyard: {failures_md_path.name}")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to log failure details for line {i+1}: {e}")
+
+    if len(processed_results) > len(lines):
+        extra_lines = processed_results[len(lines):]
+        final_dataset_lines.extend(extra_lines)
+        final_raw_lines.extend(extra_lines)
+
     with open(dataset_path, 'w', encoding='utf-8') as f:
-        f.writelines(processed_results)
+        f.writelines(final_dataset_lines)
+        
+    if backup_path.exists() and final_raw_lines:
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.writelines(final_raw_lines)
         
     from collections import defaultdict
     grouped_logs = defaultdict(list)
@@ -968,8 +1121,9 @@ async def main():
         if failed_events:
             lf.write("## ⚠️ 回滚/失败行详情\n\n")
             for event in sorted(failed_events, key=lambda x: x.get("line_number", 0)):
+                del_suffix = " (已物理删除)" if event.get("is_deleted") else ""
                 lf.write(
-                    f"- **第 {event.get('line_number')} 行** | 状态: `{event.get('run_status')}` | "
+                    f"- **第 {event.get('line_number')} 行{del_suffix}** | 状态: `{event.get('run_status')}` | "
                     f"原因: {event.get('reason', 'N/A')}"
                 )
                 if event.get("raw_mapping_status"):
@@ -1131,7 +1285,7 @@ async def main():
     if purified_diff_logs and not PURIFY_LINES:
         blocking_events = [
             e for e in audit_events
-            if e.get("run_status") in {"rollback", "error"} and e.get("line_number")
+            if e.get("run_status") in {"rollback", "error"} and e.get("line_number") and not e.get("is_deleted")
         ]
         if blocking_events:
             next_start_line = min(e["line_number"] for e in blocking_events)

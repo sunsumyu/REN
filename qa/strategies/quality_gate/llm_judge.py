@@ -45,10 +45,22 @@ class LLMJudgeStrategy(IEvaluationStrategy):
             if not isinstance(scores, dict):
                 raise ValueError("Parsed output is not a JSON object")
                 
-            required_keys = ["semantic_purity_score", "medical_rigor_score", "logical_depth_score", "reason"]
+            required_keys = ["semantic_purity_score", "medical_rigor_score", "logical_depth_score", "factual_errors", "reason"]
             for key in required_keys:
                 if key not in scores:
-                    scores[key] = 90 if key != "reason" else "No explanation provided"
+                    if key == "factual_errors":
+                        scores[key] = []
+                    elif key == "reason":
+                        scores[key] = "No explanation provided"
+                    else:
+                        scores[key] = 90
+                        
+            # Ensure factual_errors is a list of strings
+            if not isinstance(scores.get("factual_errors"), list):
+                if isinstance(scores.get("factual_errors"), str):
+                    scores["factual_errors"] = [scores["factual_errors"]]
+                else:
+                    scores["factual_errors"] = []
                     
             return scores
         except Exception as e:

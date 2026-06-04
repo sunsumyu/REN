@@ -95,6 +95,12 @@ PURIFY_LIMIT = int(PURIFY_LIMIT_RAW) if PURIFY_LIMIT_RAW and PURIFY_LIMIT_RAW.is
 # 提纯进程在全链路大并发时的最大并发度限制
 PURIFY_CONCURRENCY = int(os.getenv("PURIFY_CONCURRENCY", "25"))
 
+# 严格医疗事实/化学推演质检开关，开启时轻微幻觉或错词扣分将直接触发回滚
+PURIFY_STRICT_RIGOR = os.getenv("PURIFY_STRICT_RIGOR", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# 提纯失败时是否物理删除并隔离数据
+PURIFY_DELETE_ON_FAIL = os.getenv("PURIFY_DELETE_ON_FAIL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
 # 净化起始行号 (1-based index)
 PURIFY_START_LINE_RAW = os.getenv("PURIFY_START_LINE", "").strip()
 PURIFY_START_LINE = int(PURIFY_START_LINE_RAW) if PURIFY_START_LINE_RAW and PURIFY_START_LINE_RAW.isdigit() else None
