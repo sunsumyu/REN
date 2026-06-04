@@ -9,3 +9,5 @@
 | 2026-06-04T09:53:45.172978 | 194 | planner purification failed or planner count changed | `龙燕补肾酒的包装应如何贮藏？有效期是多久？` | 贮藏条件 |
 | 2026-06-04T09:53:45.174159 | 195 | planner purification failed or planner count changed | `罗浮山百草油用于治疗哪些症状？` | 功能主治 |
 | 2026-06-04T09:53:45.175182 | 196 | planner purification failed or planner count changed | `塞来昔布如何发挥抗炎、镇痛和解热作用？` | 药理机制 |
+| 2026-06-04T12:02:03.605897 | 222 | planner purification failed or planner count changed | `长春烫伤膏属于哪一类药物？` | 功能主治分类 |
+| 2026-06-04T12:02:03.621792 | 231 | planner purification failed or planner count changed | `索磷布韦维帕他韦片可用于治疗哪些基因型的慢性丙型肝炎感染？` | 适应症 |
