@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 第一级：本地私有 RAG 模块。
-采用内置的 SQLite3 FTS5 (Full-Text Search) 作为零依赖的高性能检索引擎，
-将本地说明书与指南进行切片并建立倒排索引，确保 80% 的常见药物回答具备最高级的权威性。
+集成 hsa-agent 优秀设计：惰性单例模式、余弦相似度检索（L2归一化 + IndexFlatIP）。
+安全退避设计：在环境损坏/模型损坏时自适应关闭向量通道，退化至倒排或 LIKE 检索。
 """
 
 import os
@@ -12,28 +12,83 @@ import logging
 from typing import List, Dict, Any
 from retrieval.schemas import NormalizedClinicalRef
 
+# 1. 动态尝试导入向量计算依赖，保证插拔无害性
+try:
+    import faiss
+    import numpy as np
+    from sentence_transformers import SentenceTransformer
+    VECTOR_RAG_AVAILABLE = True
+except ImportError:
+    VECTOR_RAG_AVAILABLE = False
+    class SentenceTransformer: pass # 虚类防报错
+
 logger = logging.getLogger("MedicalQA.LocalRAG")
 
+
+class LocalEmbeddingEngine:
+    """
+    单例模式大模型编码管理器，支持惰性加载。
+    """
+    _instance = None
+    _model = None
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(LocalEmbeddingEngine, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self, model_name: str = "shibing624/text2vec-base-chinese"):
+        self.model_name = model_name
+
+    def get_model(self):
+        if self._model is None:
+            # 允许加载失败抛出异常，以便外层调用捕捉并关闭向量通道
+            logger.info(f"Loading SentenceTransformer: '{self.model_name}'...")
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+
 class LocalRAGService:
-    def __init__(self, db_path: str = ":memory:"):
-        """
-        初始化本地 RAG 服务。默认使用内存型数据库，便于多进程安全和零文件冲突。
-        """
-        self.db_path = db_path
+    def __init__(self, workspace_dir: str = "."):
+        self.workspace_dir = workspace_dir
+        self.db_path = os.path.join(self.workspace_dir, os.getenv("LOCAL_RAG_SQLITE_DB_PATH", "local_rag.db"))
+        self.vector_index_path = os.path.join(self.workspace_dir, os.getenv("LOCAL_RAG_VECTOR_INDEX_PATH", "local_rag_vector.index"))
+        self.embedding_model_name = os.getenv("LOCAL_RAG_EMBEDDING_MODEL", "shibing624/text2vec-base-chinese")
+        self.similarity_threshold = float(os.getenv("LOCAL_RAG_SIMILARITY_THRESHOLD", "0.45"))
+        
+        # 依赖与开关共同决定是否开启向量模式
+        self.vector_enabled = VECTOR_RAG_AVAILABLE and os.getenv("LOCAL_RAG_VECTOR_ENABLED", "true").lower() in ("true", "1")
+        self.embedding_engine = None
+        self.vector_index = None
+        self.metadata_store = {}
+
+        # 建立 SQLite3 持久化连接
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
-        self._initialize_index()
-        self._load_seed_data()
+        self._ensure_sqlite_schemas()
 
-    def _initialize_index(self):
-        """
-        初始化 SQLite3 FTS5 虚表，提供专业的 BM25 分词全文检索能力
-        """
+        # 尝试惰性唤醒向量模式
+        if self.vector_enabled:
+            self._init_vector_components()
+        else:
+            logger.info("Local RAG Mode: Standard Mode (SQLite3 FTS5 / SQL LIKE).")
+
+    def _ensure_sqlite_schemas(self):
         cursor = self.conn.cursor()
-        # 创建 FTS5 虚拟表以支持全文检索，包含源、段落内容及关键字字段
+        # 普通物理事实表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS local_rag_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_name TEXT,
+                source TEXT,
+                context TEXT,
+                category TEXT
+            );
+        """)
+        # FTS5 虚拟表（带 unicode61 字符感知分词）
         try:
             cursor.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS local_rag_index USING fts5(
+                CREATE VIRTUAL TABLE IF NOT EXISTS local_rag_fts_index USING fts5(
                     source,
                     context,
                     entity_name,
@@ -41,136 +96,148 @@ class LocalRAGService:
                     tokenize="unicode61"
                 );
             """)
-            self.conn.commit()
-            logger.info("Successfully initialized SQLite3 FTS5 virtual table for local RAG indexing.")
-        except Exception as e:
-            logger.error(f"Failed to create FTS5 table, falling back to standard table: {e}")
-            # Fallback to standard table with LIKE search if FTS5 is not compiled in host Python
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS local_rag_index (
-                    source TEXT,
-                    context TEXT,
-                    entity_name TEXT,
-                    category TEXT
-                );
-            """)
-            self.conn.commit()
-
-    def _load_seed_data(self):
-        """
-        从本地 guideline_db.py 动态加载权威说明书与指南种子数据，实现自动 Grounding。
-        """
-        try:
-            from guideline_db import GUIDELINE_DATA
-        except ImportError:
-            logger.warning("guideline_db.py not found. Local RAG index will start empty.")
-            return
-
-        cursor = self.conn.cursor()
-        # 清理旧数据，防止重复加载
-        try:
-            cursor.execute("DELETE FROM local_rag_index;")
-        except Exception:
-            pass
-
-        count = 0
-        for entity_name, ref_items in GUIDELINE_DATA.items():
-            for item in ref_items:
-                source = item.get("source", "refs:《未知说明书》")
-                context = item.get("context", "")
-                
-                # 简单解析医学切面门类
-                category = "通用"
-                if "说明书" in source:
-                    if "适应症" in source or "主治" in source:
-                        category = "药理机制"
-                    elif "用药剂量" in source or "用法用量" in source:
-                        category = "用药方案"
-                    elif "不良反应" in source or "禁忌" in source:
-                        category = "安全禁忌"
-                elif "指南" in source:
-                    category = "指南推荐"
-
-                # 插入虚表
-                cursor.execute(
-                    "INSERT INTO local_rag_index (source, context, entity_name, category) VALUES (?, ?, ?, ?);",
-                    (source, context, entity_name, category)
-                )
-                count += 1
-
+        except sqlite3.OperationalError:
+            logger.warning("FTS5 extension not compiled in host python. Virtual table creation bypassed.")
         self.conn.commit()
-        logger.info(f"Loaded {count} seed clinical reference items into Tier 1 Local RAG index.")
 
-    def search(self, query: str, entity_name: str, threshold: float = 0.3) -> List[NormalizedClinicalRef]:
-        """
-        混合式全文检索。通过匹配实体词与自然语言查询，提取高可信度段落。
-        """
+    def _init_vector_components(self):
+        try:
+            if not os.path.exists(self.vector_index_path):
+                raise FileNotFoundError(f"FAISS index file missing at '{self.vector_index_path}'")
+            
+            # 使用单例加载器惰性加载
+            self.embedding_engine = LocalEmbeddingEngine(self.embedding_model_name)
+            
+            # 预热加载模型，检测是否抛出 OOM 或模型加载错误
+            self.embedding_engine.get_model()
+            
+            # 读取物理 FAISS 索引
+            self.vector_index = faiss.read_index(self.vector_index_path)
+            
+            # 从 SQLite 数据表加载对齐的 Metadata
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id, source, context, category FROM local_rag_index;")
+            for row in cursor.fetchall():
+                # SQLite3 自增自 1 开始，FAISS 数组索引自 0 开始，故做减 1 转换映射
+                self.metadata_store[row["id"] - 1] = {
+                    "source": row["source"],
+                    "context": row["context"],
+                    "category": row["category"]
+                }
+            logger.info(f"🎉 Local RAG Vector Mode initialized. Registered {self.vector_index.ntotal} vectors.")
+        except Exception as e:
+            # 当任何一环出错时，直接失效向量模式，确保后续 search 绝不执行向量分支
+            logger.error(f"Failed to load vector storage: {e}. Automatically falling back to standard mode.")
+            self.vector_enabled = False
+            self.embedding_engine = None
+            self.vector_index = None
+            self.metadata_store = {}
+
+    def _fts_search(self, query: str, limit: int = 5) -> List[NormalizedClinicalRef]:
         cursor = self.conn.cursor()
         results = []
+        clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
+        words = [w for w in clean_query.split() if len(w) > 1]
         
-        # 1. 优先进行实体词的完全与子串检索（精准锚定）
-        cursor.execute(
-            "SELECT source, context, entity_name, category FROM local_rag_index WHERE entity_name LIKE ? OR ? LIKE '%' || entity_name || '%';",
-            (f"%{entity_name}%", query)
-        )
-        rows = cursor.fetchall()
-        
-        # 转换为规范实体
-        for row in rows:
+        if words:
+            search_term = " OR ".join(words)
+            try:
+                cursor.execute("""
+                    SELECT source, context, category 
+                    FROM local_rag_fts_index 
+                    WHERE local_rag_fts_index MATCH ? LIMIT ?;
+                """, (search_term, limit))
+                for row in cursor.fetchall():
+                    results.append(NormalizedClinicalRef(
+                        source=row["source"],
+                        context=row["context"],
+                        category=row["category"],
+                        metadata={"retrieval_method": "fts5_match"}
+                    ))
+            except Exception as e:
+                logger.debug(f"FTS5 Search execution failed: {e}")
+        return results
+
+    def _like_search(self, entity_name: str, limit: int = 3) -> List[NormalizedClinicalRef]:
+        cursor = self.conn.cursor()
+        results = []
+        cursor.execute("""
+            SELECT source, context, category 
+            FROM local_rag_index 
+            WHERE entity_name LIKE ? OR context LIKE ? LIMIT ?;
+        """, (f"%{entity_name}%", f"%{entity_name}%", limit))
+        for row in cursor.fetchall():
             results.append(NormalizedClinicalRef(
                 source=row["source"],
                 context=row["context"],
                 category=row["category"],
-                metadata={"entity_name": row["entity_name"], "retrieval_method": "entity_like_match"}
+                metadata={"retrieval_method": "sql_like_match"}
             ))
-
-        # 2. 如果实体词未命中，则降级为 FTS5 全文模糊检索（支持 BM25 全文分词）
-        if not results:
-            # 清洗查询词，去除符号，构建 FTS5 查询短语
-            clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
-            # 拼接词项进行模糊匹配
-            words = [w for w in clean_query.split() if len(w) > 1]
-            if words:
-                search_term = " OR ".join(words)
-                try:
-                    cursor.execute(
-                        "SELECT source, context, entity_name, category FROM local_rag_index WHERE local_rag_index MATCH ? LIMIT 5;",
-                        (search_term,)
-                    )
-                    fts_rows = cursor.fetchall()
-                    for row in fts_rows:
-                        results.append(NormalizedClinicalRef(
-                            source=row["source"],
-                            context=row["context"],
-                            category=row["category"],
-                            metadata={"entity_name": row["entity_name"], "retrieval_method": "fts5_match"}
-                        ))
-                except Exception as e:
-                    logger.debug(f"FTS5 MATCH failed or bypassed: {e}")
-                    # 如果 FTS5 抛出异常，降级为常规关键字扫描
-                    for word in words[:3]:
-                        cursor.execute(
-                            "SELECT source, context, entity_name, category FROM local_rag_index WHERE context LIKE ? LIMIT 3;",
-                            (f"%{word}%",)
-                        )
-                        like_rows = cursor.fetchall()
-                        for row in like_rows:
-                            # 避免重复
-                            if not any(r.context == row["context"] for r in results):
-                                results.append(NormalizedClinicalRef(
-                                    source=row["source"],
-                                    context=row["context"],
-                                    category=row["category"],
-                                    metadata={"entity_name": row["entity_name"], "retrieval_method": "keyword_like_match"}
-                                ))
-
-        logger.info(f"Tier 1 (Local RAG) search completed. Query: '{query}', Found items: {len(results)}")
         return results
 
+    def search(self, query: str, entity_name: str) -> List[NormalizedClinicalRef]:
+        """
+        本地私有 RAG 统一检索入口 (三级自愈退让)
+        """
+        # --- 通道一：FAISS 余弦相似度语义检索 ---
+        if self.vector_enabled and self.embedding_engine and self.vector_index:
+            try:
+                # 获取并使用模型编码
+                model = self.embedding_engine.get_model()
+                raw_vector = model.encode([query], show_progress_bar=False)
+                query_vector = np.array(raw_vector).astype('float32')
+                
+                # 强制归一化以支持 IndexFlatIP 内积计算余弦相似度
+                faiss.normalize_L2(query_vector)
+                
+                # 相似度召回 (k=5)
+                scores, indices = self.vector_index.search(query_vector, 5)
+                
+                results = []
+                for score, idx in zip(scores[0], indices[0]):
+                    # 校验余弦相似度分值是否大于硬限额阈值，且在 metadata 列表中
+                    if idx in self.metadata_store and score >= self.similarity_threshold:
+                        meta = self.metadata_store[idx]
+                        results.append(NormalizedClinicalRef(
+                            source=meta["source"],
+                            context=meta["context"],
+                            category=meta["category"],
+                            metadata={
+                                "entity_name": entity_name, 
+                                "similarity_score": float(score),
+                                "retrieval_method": "vector_cosine_match"
+                            }
+                        ))
+                if results:
+                    logger.info(f"Tier 1 Vector HIT for entity '{entity_name}' ({len(results)} items retrieved)")
+                    return results
+            except Exception as e:
+                # 向量执行失败：报错并直接绕过，降级到 FTS5，防止异常向上抛出中断程序
+                logger.error(f"Vector RAG runtime search failed: {e}. Transitioning to FTS5...")
+
+        # --- 通道二：SQLite FTS5 倒排匹配 ---
+        try:
+            fts_results = self._fts_search(query)
+            if fts_results:
+                logger.info(f"Tier 1 FTS5 HIT for entity '{entity_name}'")
+                return fts_results
+        except Exception as e:
+            logger.error(f"FTS5 Search execution crashed: {e}. Transitioning to SQL LIKE...")
+
+        # --- 通道三：SQL LIKE 字符模糊对撞 ---
+        try:
+            like_results = self._like_search(entity_name)
+            if like_results:
+                logger.info(f"Tier 1 SQL LIKE HIT for entity '{entity_name}'")
+                return like_results
+        except Exception as e:
+            logger.error(f"SQL LIKE search failed: {e}")
+
+        # 均未命中，返回空触发 Tier 2 外网 PubMed 检索
+        logger.info(f"Tier 1 RAG missed entirely for entity '{entity_name}'.")
+        return []
+
     def close(self):
-        """
-        释放资源
-        """
         try:
             self.conn.close()
         except Exception:

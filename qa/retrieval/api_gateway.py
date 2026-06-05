@@ -44,12 +44,25 @@ class AsyncRateLimiter:
                     wait_time = (1.0 - self.tokens) * (self.time_period / self.max_rate)
                     await asyncio.sleep(wait_time)
 
+# 通道一：静态中英医学词典对照表
+STATIC_TRANSLATION_MAP = {
+    "布洛芬": "Ibuprofen",
+    "甲氨蝶呤": "Methotrexate",
+    "西尼莫德": "Siponimod",
+    "肾脏": "Kidney",
+    "有机阴离子转运体（hoat家族）": "Organic Anion Transporters",
+    "hoat家族": "OAT transporter",
+    "hOAT家族": "OAT transporter",
+    "螺旋藻胶囊": "Spirulina capsule",
+}
+
 class APIGatewayService:
-    def __init__(self, db_dir: str = "."):
+    def __init__(self, db_dir: str = ".", llm_service: Any = None):
         """
         初始化专业医学接口 Gateway。在指定目录下创建本地持久化缓存。
         """
         self.db_dir = db_dir
+        self.llm_service = llm_service
         os.makedirs(self.db_dir, exist_ok=True)
         self.db_path = os.path.join(self.db_dir, "medical_cache.db")
         self._initialize_cache_db()
@@ -59,6 +72,53 @@ class APIGatewayService:
         pubmed_rate_limit = float(os.getenv("PUBMED_RATE_LIMIT", "10"))
         self.rate_limiter = AsyncRateLimiter(max_rate=pubmed_rate_limit, time_period=1.0)
         logger.info(f"Initialized APIGatewayService with PubMed Rate Limit: {pubmed_rate_limit} rps (Key configured: {bool(self.pubmed_api_key)})")
+
+    async def translate_entity_to_english(self, entity_name: str) -> str:
+        """
+        双通道中英医疗术语对齐：
+        1. 优先检索本地静态高频词表
+        2. 词表未命中时，如果提供 llm_service，调用轻量大模型翻译为标准英文医学术语
+        3. 兜底：若无 llm_service 或翻译失败，过滤掉中文，仅保留英文/字母
+        """
+        clean_name = entity_name.strip()
+        if not clean_name:
+            return ""
+            
+        # 通道一：本地对照映射
+        if clean_name in STATIC_TRANSLATION_MAP:
+            translated = STATIC_TRANSLATION_MAP[clean_name]
+            logger.info(f"Translation HIT: Local Map matched '{clean_name}' -> '{translated}'")
+            return translated
+            
+        # 通道二：LLM 医疗术语路由器对齐
+        if self.llm_service is not None:
+            prompt = f"""你是一个专业的医学翻译助手。
+请将中文医学实体翻译为 PubMed 文献数据库检索最常用、最标准的英文医学术语（如标准通用药物英文名、疾病 MeSH 词或基因/转运体缩写符号）。
+【⚠️输出硬性要求】：你必须且只能输出翻译后的英文词，严禁包含任何中文、解释、拼音、括号、引号或标点符号。
+
+待翻译实体：【{clean_name}】
+翻译英文词："""
+            try:
+                response = await self.llm_service.call_llm(
+                    prompt,
+                    model_pool="lightweight",
+                    stage=f"PubMed检索实体学术对齐: {clean_name}"
+                )
+                translated = response.strip().strip('"').strip("'").strip()
+                # 过滤可能残留的多余文本或解释
+                import re
+                translated = re.sub(r'[^a-zA-Z0-9\s\-\*\/]', '', translated).strip()
+                if translated:
+                    logger.info(f"Translation LLM: Aligned '{clean_name}' -> '{translated}'")
+                    return translated
+            except Exception as e:
+                logger.error(f"Failed to translate entity '{clean_name}' via LLM: {e}")
+
+        # 异常安全退避：提取英文字符
+        import re
+        english_only = "".join(re.findall(r'[a-zA-Z0-9\s\-\*\/]+', clean_name)).strip()
+        logger.warning(f"Translation Fallback: Strip Chinese from '{clean_name}' -> '{english_only}'")
+        return english_only if english_only else clean_name
 
     def _initialize_cache_db(self):
         """
@@ -134,10 +194,14 @@ class APIGatewayService:
             logger.info(f"PubMed API persistent Cache HIT for term: '{term}'")
             return cached
 
+        # 首先对检索词进行中英文医学术语对齐/翻译
+        english_term = await self.translate_entity_to_english(term)
+        logger.info(f"PubMed searching term alignment: '{term}' -> '{english_term}'")
+
         # 1. 组装搜索与摘要提取的基本参数，注入 API Key (如果配置)
         search_params = {
             "db": "pubmed",
-            "term": term,
+            "term": english_term,
             "retmode": "json",
             "retmax": limit
         }

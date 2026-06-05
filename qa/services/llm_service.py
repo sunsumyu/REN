@@ -143,6 +143,20 @@ class LLMService(ILLMService):
                 f"{response_model.__name__} contains structured prompt/schema leakage at {leak_path}: {pattern}"
             )
 
+    @staticmethod
+    def _models_url(chat_url: str) -> str:
+        return chat_url.replace("/chat/completions", "/models")
+
+    @staticmethod
+    def _format_http_exception(error: Exception) -> str:
+        if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+            body = (error.response.text or "")[:1000].replace("\n", " ")
+            return (
+                f"{type(error).__name__}: HTTP {error.response.status_code}; "
+                f"body={body!r}; message={str(error)}"
+            )
+        return f"{type(error).__name__}: {str(error)}"
+
     async def init_supported_models(self, force: bool = False):
         """
         动态从网关获取支持的模型列表。
@@ -169,7 +183,7 @@ class LLMService(ILLMService):
             headers["Authorization"] = "Bearer dummy"
             
         # Dynamically build standard OpenAI models endpoint
-        url = config.LLM_API_URL.replace("/chat/completions", "/models")
+        url = self._models_url(config.LLM_API_URL)
         try:
             response = await self.client.get(url, headers=headers, timeout=10.0)
             if response.status_code == 200:
@@ -185,7 +199,7 @@ class LLMService(ILLMService):
                     raise je
                 if isinstance(res_data, dict) and "data" in res_data:
                     self.supported_models = [item.get("id") for item in res_data["data"] if item.get("id")]
-                    logger.info(f"Successfully loaded {len(self.supported_models)} supported models dynamically from gateway!")
+                    logger.info(f"Successfully loaded {len(self.supported_models)} supported models dynamically from gateway: {url}")
                     # Write to local cache
                     try:
                         with open(cache_file, "w", encoding="utf-8") as f:
@@ -195,9 +209,9 @@ class LLMService(ILLMService):
                         logger.warning(f"Failed to save supported models to cache: {cache_err}")
                     return
             else:
-                logger.warning(f"Failed to query supported models from {url}: HTTP {response.status_code}")
+                logger.warning(f"Failed to query supported models from {url}: HTTP {response.status_code}, body={response.text[:500]!r}")
         except Exception as e:
-            logger.warning(f"Error querying supported models from {url}: {e}")
+            logger.warning(f"Error querying supported models from {url}: {self._format_http_exception(e)}")
             
         # Fallback to local cache if query failed or gateway was unreachable
         if os.path.exists(cache_file):
@@ -290,6 +304,7 @@ class LLMService(ILLMService):
         """
         retries = 0
         backoff = 2.0
+        last_error = None
         
         while True:
             req_start_time = time.time()
@@ -322,7 +337,11 @@ class LLMService(ILLMService):
                     return res_json
             except (httpx.HTTPStatusError, httpx.HTTPError, httpx.NetworkError) as e:
                 elapsed = time.time() - req_start_time
-                logger.error(f"HTTP/API error on request {method} {url} (elapsed: {elapsed:.2f}s): {e}")
+                last_error = e
+                logger.error(
+                    f"HTTP/API error on request {method} {url} (elapsed: {elapsed:.2f}s): "
+                    f"{self._format_http_exception(e)}"
+                )
                 # 🚨 [504 Gateway Timeout 退避重试]：
                 # 如果是网关对大模型超时未返回强行进行了 HTTP 504 关闭，改为允许退避重试以增加容错性
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code == 504:
@@ -330,8 +349,9 @@ class LLMService(ILLMService):
             
             retries += 1
             if retries > config.MAX_RETRIES:
-                logger.critical(f"Max retries ({config.MAX_RETRIES}) reached for {url}. Raising error.")
-                raise Exception(f"Failed to fetch from {url} after {config.MAX_RETRIES} attempts.")
+                detail = self._format_http_exception(last_error) if last_error else "unknown error"
+                logger.critical(f"Max retries ({config.MAX_RETRIES}) reached for {url}. Last error: {detail}")
+                raise Exception(f"Failed to fetch from {url} after {config.MAX_RETRIES} attempts. Last error: {detail}") from last_error
             
             sleep_time = (backoff ** retries) + random.uniform(0.1, 0.5)
             logger.info(f"Sleeping for {sleep_time:.2f} seconds before retry {retries}...")
@@ -534,7 +554,9 @@ class LLMService(ILLMService):
         current_messages = list(messages)
         resolved_model = await self._resolve_model(model_pool, is_structured=True)
         
-        is_openai = resolved_model.lower().startswith("gpt")
+        model_name = resolved_model.lower()
+        is_openai = model_name.startswith("gpt")
+        supports_json_object = any(name in model_name for name in ["deepseek", "qwen", "glm"])
         
         if is_openai:
             response_format = {
@@ -546,7 +568,7 @@ class LLMService(ILLMService):
                 }
             }
         else:
-            response_format = None
+            response_format = {"type": "json_object"} if supports_json_object else None
             schema_str = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
             current_messages.insert(0, {
                 "role": "system", 
@@ -562,7 +584,7 @@ class LLMService(ILLMService):
             data = {
                 "model": resolved_model,
                 "messages": current_messages,
-                "temperature": config.LLM_TEMPERATURE,
+                "temperature": getattr(config, "LLM_STRUCTURED_TEMPERATURE", 0.0),
                 "top_p": config.LLM_TOP_P,
                 "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
             }

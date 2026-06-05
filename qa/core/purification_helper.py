@@ -237,12 +237,32 @@ def post_strip_structural_transitions(text: str) -> str:
     return repaired.strip()
 
 def is_catastrophic_format_collapse(text: str) -> bool:
-    """后置硬性网关：检测是否残留 JSON 语法废墟或元描述穿透，使用精确正则以阻断误判"""
-    invalid_chars = ['{', '}', '[', ']', '",', '我决定构建', '步骤1', '阶段一']
-    if any(char in text for char in invalid_chars):
+    """后置硬性网关：升级为结构感知网关，解禁正常方括号，检测是否残留 JSON 语法废墟"""
+    if not text:
+        return False
+        
+    # 1. 物理检查是否包含 JSON 键值对废墟（如 "sub_questions": 或 "step_id":）
+    json_ruin_patterns = [
+        r'"sub_questions"\s*:',
+        r'"evidences"\s*:',
+        r'"reasoning_chains"\s*:',
+        r'"step_id"\s*:',
+        r'"logic"\s*:'
+    ]
+    if any(re.search(pattern, text) for pattern in json_ruin_patterns):
         return True
-    
-    # 🧠 精细化 RAG 工程泄露与元叙述硬网关
+
+    # 2. 仅当文本能被成功解析为字典且首尾为大括号时才拦截（退化为纯数据结构，未重构为学术推理流）
+    if text.strip().startswith("{") and text.strip().endswith("}"):
+        try:
+            import ast
+            parsed = ast.literal_eval(text.strip())
+            if isinstance(parsed, dict):
+                return True
+        except Exception:
+            pass
+
+    # 3. 🧠 精细化 RAG 工程泄露与元叙述硬网关
     leakage_patterns = [
         r'根据(参考|提供|背景|检索)?(资料|上下文|数据|文本|信息)(显示|指出|表明|提供|描述)',
         r'数据源(中|显示|提到|记录)',

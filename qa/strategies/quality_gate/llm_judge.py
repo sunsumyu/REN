@@ -2,7 +2,7 @@
 import json
 import logging
 import re
-from typing import Dict, Any
+from typing import Dict, Any, List
 from services.llm_service import ILLMService
 import core.purification_helper as purifier_module
 
@@ -12,19 +12,33 @@ from abc import ABC, abstractmethod
 
 class IEvaluationStrategy(ABC):
     @abstractmethod
-    async def evaluate(self, q: str, planner: str, raw_think: str, purified_think: str, line_num: int = None) -> Dict[str, Any]:
+    async def evaluate(self, q: str, planner: str, raw_think: str, purified_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         pass
 
 class LLMJudgeStrategy(IEvaluationStrategy):
     def __init__(self, llm_service: ILLMService):
         self.llm_service = llm_service
 
-    async def evaluate(self, q: str, planner: str, raw_think: str, purified_think: str, line_num: int = None) -> Dict[str, Any]:
+    async def evaluate(self, q: str, planner: str, raw_think: str, purified_think: str, line_num: int = None, refs: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Evaluate the purified thought chain under strict three-dimensional quality gates.
         """
+        # 格式化原始数据源（剔除工程标签，保留纯净的循证事实供 Judge 核验）
+        cleaned_facts_text = ""
+        if refs:
+            cleaned_facts_text = "\n### 原始循证医学事实依据 (Ground Truth Cleaned Facts):\n"
+            for idx, r in enumerate(refs, start=1):
+                if isinstance(r, dict):
+                    ctx = r.get('context', 'N/A')
+                    # 清理可能携带的 RAG 抱怨和工程词头
+                    clean_ctx = ctx.replace("【互联网权威医疗站快讯】:", "").replace("【互联网权威医疗数据通报】:", "").strip()
+                    cleaned_facts_text += f"- fact_{idx:03d}: {clean_ctx}\n"
+
         prompt = f"""问题: {q}
 切面视角: {planner}
+
+{cleaned_facts_text}
+
 原始思维链 (包含噪声):
 \"\"\"
 {raw_think}

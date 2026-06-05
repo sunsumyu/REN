@@ -19,7 +19,7 @@ DEFAULT_ENTITY_COUNT = 2
 DEFAULT_HOP_COUNT = 2
 
 # 大模型 API 配置
-LLM_API_URL = os.getenv("LLM_API_URL", "https://volley.yzint.cn/api/v1/chat/completions")
+LLM_API_URL = os.getenv("LLM_API_URL", "https://volley.inner.yzint.cn/v1/chat/completions")
 # 从环境变量中读取 API Key
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
@@ -85,6 +85,7 @@ SOFT_DELAY_BEFORE_JUDGE = float(os.getenv("SOFT_DELAY_BEFORE_JUDGE", "3.0"))
 
 # LLM 生成超参数
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+LLM_STRUCTURED_TEMPERATURE = float(os.getenv("LLM_STRUCTURED_TEMPERATURE", "0.0"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
 LLM_FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.2"))
 
@@ -120,4 +121,3 @@ else:
 # PubMed (NCBI API) 访问与限流控制配置
 PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "").strip()
 PUBMED_RATE_LIMIT = float(os.getenv("PUBMED_RATE_LIMIT", "10"))
-

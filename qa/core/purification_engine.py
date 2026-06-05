@@ -106,14 +106,13 @@ class PurificationEngine:
         anchors_text = ""
         if active_refs:
             anchors = []
-            for r in active_refs:
+            for idx, r in enumerate(active_refs, start=1):
                 if isinstance(r, dict):
-                    src = r.get("source", "")
                     ctx = r.get("context", "")
                     if ctx:
                         # 剥离多余的工程前缀，提取纯粹的事实陈述
                         clean_ctx = ctx.replace("【互联网权威医疗站快讯】:", "").replace("【互联网权威医疗数据通报】:", "").strip()
-                        anchors.append(f"- [{src}] {clean_ctx}")
+                        anchors.append(f"- [文献_{idx:02d}] {clean_ctx}")
             if anchors:
                 anchors_text = "\n".join(anchors)
                 anchors_prompt = f"""
@@ -128,6 +127,15 @@ class PurificationEngine:
             if simplify:
                 simplify_prompt_addition = "\n【⚠️ 极简重构硬性要求】：该问题为简单事实查询，严禁脑补虚构复杂的分子机制、受体通路、靶点、免疫机制或大样本临床试验。请直接用 2-3 步精炼的因果推导得出结论；若机制或相互作用依据不足，只能自然收束为“不能据此推断具体机制/通路”，禁止大段微观机制演绎，但必须保持流畅的探究性临床推理心流（至少 150 字），不能只写一句话结论或复读说明书条目。"
             
+            # 显式拼接已缩窄的 Answer Body 限制生成边界，确保 Think 宽度绝不宽于 Answer
+            answer_boundary_prompt = ""
+            if purified_answer:
+                answer_boundary_prompt = f"""
+
+### 已提纯的回答正文 (Purified Answer Body Boundary):
+{purified_answer}
+【⚠️ 思考链事实边界硬对齐红线】：上文为该行提纯后的唯一最终回答正文。你的 CoT 思考流（Think）必须全程且仅围绕本正文中包含的事实展开。绝对禁止在思考链中讨论或推导演答正文未提及的任何旁路药物成分、次要机制、或临床研究！"""
+
             prompt = f"""{few_shot}
 
 ### 系统指令 (System Directive)：
@@ -135,7 +143,7 @@ Please write an extremely raw, high-entropy clinical reasoning thought trace foc
 CRITICAL红线：You MUST write in a live EXPLORATORY CoT style. Do NOT write a textbook article or explanation (绝对禁止以教科书平铺直叙或说明书废话体写作). 
 In corporate with counterfactual checks, you should naturally integrate clinical self-questioning markers with a question mark at points of uncertainty or divergence (在遇到逻辑分叉或极限情况时，应自然融入探究性的自我提问，展现真实的解题反思与假说排查，例如以以“？”结尾的疑问句进行内部推演，但绝对禁止在文本尾部生硬塞入无意义的问号占位符).
 Do NOT output the word 'facet' or the facet name '{smoothed_planner}' in the text. You are strictly FORBIDDEN from using any meta-narrative terms indicating internal system implementations, such as 'refs', '图谱', '实体库', '关系库', '数据源', 'json_schema', 'answer_body', 'sub_questions' or 'reasoning_chains'. Output ONLY the purified thought chain. You are permitted and highly encouraged to naturally attribute facts using standard, professional references such as "根据药品说明书记载", "临床文献报道指出", or "根据临床研究数据".
-CRITICAL factual boundary: never invent or preserve unsupported official standard numbers, approval numbers, registration numbers, receptor pathways, targets, immune mechanisms, pharmacokinetic parameters, or molecular pathways. If the confirmed facts do not explicitly support a mechanism/pathway/identifier, omit it or state in natural clinical language that no specific mechanism can be inferred from the available clinical facts.{anchors_prompt}
+CRITICAL factual boundary: never invent or preserve unsupported official standard numbers, approval numbers, registration numbers, receptor pathways, targets, immune mechanisms, pharmacokinetic parameters, or molecular pathways. If the confirmed facts do not explicitly support a mechanism/pathway/identifier, omit it or state in natural clinical language that no specific mechanism can be inferred from the available clinical facts.{anchors_prompt}{answer_boundary_prompt}
 
 问题: {q}
 原始思维链 (CoT) 内容:
@@ -183,7 +191,7 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                         "reason": "检测到提纯后的文本发生了大面积死循环与复读退化。"
                     }
                 else:
-                    scores = await self.evaluator.evaluate(q, smoothed_planner, raw_think, purified, line_num=line_num)
+                    scores = await self.evaluator.evaluate(q, smoothed_planner, raw_think, purified, line_num=line_num, refs=active_refs)
                 
                 last_scores = scores
                 
@@ -230,7 +238,7 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                         pass
                         
                         # 重新运行裁判打分校验
-                        scores_smooth = await self.evaluator.evaluate(q, smoothed_planner, raw_think, purified_smooth, line_num=line_num)
+                        scores_smooth = await self.evaluator.evaluate(q, smoothed_planner, raw_think, purified_smooth, line_num=line_num, refs=active_refs)
                         p_score_smooth = purifier_module.safe_int(scores_smooth.get("semantic_purity_score", 90))
                         
                         logger.info(f"   └─ 提纯后重校验: [Purity: {p_score_smooth}/100] | Reason: {scores_smooth.get('reason', 'N/A')}")

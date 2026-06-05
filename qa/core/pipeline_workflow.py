@@ -127,7 +127,7 @@ class PipelineWorkflow:
         
         # 延迟导入检索管理器
         from retrieval.retrieval_manager import RetrievalManager
-        retrieval_mgr = RetrievalManager()
+        retrieval_mgr = RetrievalManager(llm_service=self.llm_service)
         
         # 格式化实体数据
         for entity in entities:
