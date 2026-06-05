@@ -116,3 +116,8 @@ if PURIFY_LINES_RAW:
         PURIFY_LINES = []
 else:
     PURIFY_LINES = []
+
+# PubMed (NCBI API) 访问与限流控制配置
+PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "").strip()
+PUBMED_RATE_LIMIT = float(os.getenv("PUBMED_RATE_LIMIT", "10"))
+

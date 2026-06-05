@@ -11,6 +11,9 @@ graph TD
     A[阶段一：Pydantic 强类型约束升级] --> B[阶段二：提示词极简化与临床锚定]
     B --> C[阶段三：动态自愈循环与过滤网]
     C --> D[阶段四：意图引导式 Graph-RAG]
+    D --> E[阶段五：智能意图路由与语义缓存]
+    E --> F[阶段六：七维度循证质量评估体系]
+    F --> G[阶段七：外部文献API限流防御与自愈]
 ```
 
 ---
@@ -201,6 +204,18 @@ graph TD
 *   **拒答过滤**：正则检测 `r"(抱歉|无法协助|不符合安全规定|作为一个AI)"`，若触发，废弃该样本。
 *   **提示词污染检测**：若正文中包含 `"Step A"`、`"推理链"`、`"证据清单"`、`"法律合规"` 等元提示词词汇，判定为跑题，自动废弃该样本并启动重新生成。
 
+### 3.3 确定性事实指针本地对撞校验（Deterministic Fact-Checking）
+借鉴 `hsa-agent` 的证据溯源比对思路，在调用大模型裁判（LLM-as-Judge）之前，提取生成内容中的专有名词、推荐药物、数值剂量等核心指针，在 CPU 本地对检索出的 `refs` 事实库执行快速的布尔或轻量级向量碰撞：
+*   **物理拦截机制**：如果提纯结果中出现了未在 references 中包含的“全新”药物名或异常的医学剂量，直接在本地秒级拦截并判定为“幻觉外推”，拒绝其进入后续昂贵的大模型裁判评分环节，极大降低 Token 调用开销。
+
+### 3.4 带诊断反馈意见的自愈重试环路（Feedback-driven Healing）
+传统的自愈重试仅是将 Prompt 再次调用，缺乏针对性的指导信息。我们将其升级为“带反馈诊断”的自愈模式：
+*   **错误对齐注入**：当 Pydantic 校验或本地事实校验失败时，将具体的失败意见（如：“Grounding 评分过低，未包含 refs 中的核心实体 A”或“检测到违禁词 JSON”）格式化为诊断文本，动态注入重试 Prompt，确保模型进行针对性纠偏，大幅度提升重试成功率。
+
+### 3.5 智能客套话容错切除与轻量语义洗牌（Neutral Semantic Wash）
+*   **前置物理切除**：针对开头的“好的，为您解答如下”等前导过渡废话，不直接报错重试，而是利用正则直接将其剔除，保留后续专业医学内容，实现“容错处理”，节省 API 重生成 Token。
+*   **中性语义替换表**：升级 [services/healing_service.py](file:///d:/REN/qa/services/healing_service.py) 中的替换映射。杜绝将“实体库/数据源”粗暴改写为“说明书”等越界行为，统一采取学术中性词汇（如 `临床参考数据`、`文献记录`）进行平滑转译，防止伪造信源。
+
 ---
 
 ## 阶段四：意图引导式精准 Graph-RAG 与 Guideline 混合检索
@@ -214,10 +229,71 @@ graph TD
 
 ---
 
+## 阶段五：基于知识经验的智能路由与多级分流（Smart Routing & Semantic Memory）
+
+为了控制大规模生成阶段时的 API 成本和延迟，结合 `hsa-agent` 在性能优化维度的实践，我们引入动态路由与语义缓存层：
+
+### 5.1 智能意图路由与多级模型分流
+*   **复杂度估算器**：对输入的问题及 context 进行复杂度识别（例如包含“趋势分析、联合用药、配伍禁忌”等核心词为复杂问题，仅包含单一适应症/实体查询为简单事实问题）。
+*   **路由分发**：
+    *   **复杂问题**：保留现有的 8 切面拆分，并发调用 premium 级别的模型生成。
+    *   **简单事实问题**：自动降级为单切面分析，直接指派给 lightweight 级别的模型生成，或者走标准的“问答模板路由直通车”，跳过 LLM 规划阶段，降低 API 耗时和成本。
+
+### 5.2 基于 FAISS 的认知记忆与动作缓存（Episodic Memory）
+*   **优秀范式库（Positive Prompts）**：当生成样本通过质检且得分极高（例如分流打分 $>9.0$）时，自动将其入库。后续在处理相似主题的生成时，通过 FAISS 向量检索召回类似优质样本作为 Dynamic Few-Shot 注入 Prompt，使生成质量逐步演进且愈发稳定。
+*   **黑名单过滤器（Negative Prompts）**：将高频引发 LLM 幻觉、拒答或工程词泄漏的特征实体与问答范式固化，作为负向提示词注入模型，规避同类错误的二次发生。
+
+---
+
+## 阶段六：七维度循证质量评估体系（7-Metrics Evaluation System）
+
+将 `qa` 目前相对主观的五维综合打分体系，重构并对齐到工业级 7 维度循证打分体系，以增强评估的精细度与鲁棒性：
+
+| 评估维度 | 评估重点说明 | qa 对齐与升级价值 |
+| :--- | :--- | :--- |
+| **Success** (成功度) | 评估模型输出格式、JSON 结构、必要字段的完整合规率。 | **将硬拦截升级为评测维度的分数沉淀**。允许在打分体系中体现格式缺陷，而不直接暴力丢弃优质内容。 |
+| **Recall** (查全率/召回率) | 审查在“无发现/无相关指南”等拒答场景下，模型是否输出了合理的扫描证据排查线索。 | **严控无脑拒答**。若模型说“我不知道”，须评估其是否排查了 refs 事实包中的事实后才得出结论，而不是敷衍式推卸。 |
+| **Precision** (查准率) | 评估在基于 refs 的前提下，医学推论、剂量匹配或药效陈述是否百分百精确无误。 | **高分辨率事实核验**。与 Grounding 解耦，专门针对临床逻辑精细度进行物理质检，过滤逻辑推理错误。 |
+| **Faithfulness** (事实忠实度) | 评估生成的回答内容是否 100% 忠实于给定的 `refs` 事实包。 | 即现有的 **Grounding** 维度，确保绝不外推或编造 refs 之外的事实。 |
+| **Relevance** (相关性) | 回答是否直击核心诉求，过滤前置及后置的无意义客套话。 | 即原有的 **Relevance** 指标，强化输出纯净度。 |
+| **Professionalism** (专业度) | 评估术语规范、是否符合国家级诊疗规范、中国药典标准或明确的医学术语规范（如使用标准疾病名称）。 | **刚性评估标准**。从原有的主观评估升级为是否有权威术语、标准指南对照等刚性扣分项。 |
+| **Interpretability** (可解释性) | 逻辑推导是否清晰，是否对特定任务输出了可视化辅助（如 Mermaid 拓扑图、ASCII 药代动力学步骤）。 | **强化可视化推理**。在解释复杂的联合用药禁忌、时序病程演变时，要求输出 ASCII 图表以提升可读性。 |
+
+## 阶段七：外部文献 API 限流防御与自愈（External API Throttling & Auto-Healing）
+
+在数据生成与提纯的 RAG 检索阶段，高频并发调用 PubMed API 极易触发 **HTTP 429 (Too Many Requests)** 报错，导致整个流水线因数据原料缺失而熔断。我们引入以下全链路控频与自愈机制：
+
+### 7.1 双层限流与客户端控频 (Double-Layer Throttling)
+*   **NCBI API Key 授权绑定**：通过环境变量 `PUBMED_API_KEY` 绑定官方密钥，将限流阈值从 3 rps 物理提升至 10 rps。
+*   **Token-Bucket 异步限流器 (AsyncRateLimiter)**：在 [api_gateway.py](file:///d:/REN/qa/retrieval/api_gateway.py) 中内置基于令牌桶算法的无依赖异步限流器，将全局并发访问严格限定在 `PUBMED_RATE_LIMIT`（配置为 10）以下，实现请求在客户端的均匀调度与削峰填谷。
+
+### 7.2 429 自愈重试与指数退避 (429 Self-Healing Retry)
+*   **指数退避重试 (Exponential Backoff)**：拦截 `urllib.error.HTTPError`，当返回 429 时，挂起当前请求并执行等待。重试间隔时间按倍数递增（如 1s, 2s, 4s, 8s），防止重试过密导致被封禁时间延长。
+*   **Retry-After 协议自愈**：解析服务器 Response Header 中的 `Retry-After` 字段，严格按照 NCBI 建议的秒数进行精确等待避让，最大程度降低请求失败率。
+
+### 7.3 中文检索词翻译与学术对齐机制 (Chinese Query Translation & Academic Alignment)
+*   **PubMed 检索中文漂移痛点**：由于 PubMed 不支持中文索引，若直接将中文实体名（如“有机阴离子转运体（hOAT家族）”）送入 PubMed，NCBI 官方解析器会丢弃中文，仅以英文片段“hOAT”发起匹配。这会导致产生极大的检索漂移和无关噪音（例如：匹配到包含 "Hoat DM" 的作者的文章，或名为 "puhoatensis" 的越南蜥蜴新种，与医学转运体无关）。
+*   **双通道翻译对齐方案**：
+    *   **通道一（本地静态对照词表）**：在系统检索网关内预置一份高频医学实体中英对照词表（如“布洛芬” -> “Ibuprofen”，“甲氨蝶呤” -> “Methotrexate”），实现秒级、零成本的精准映射。
+    *   **通道二（LLM 医疗翻译路由器）**：针对对照表未命中的新实体或复杂词汇，调用轻量大模型（`Lightweight` 级别）进行翻译映射。设定 Prompt 约束模型只输出英文标准医学通用名、MeSH 词或基因/转运体缩写符号（如将“螺旋藻胶囊”对齐为“Spirulina capsule”），从源头切断由于字符泄漏导致的乱配和空配问题。
+
+---
+
 ## 🛠️ 下一阶段落地实施路线
 
 建议按照以下优先级分步落地：
 
-1.  **第一步（本日完成）**：将本项目 `qa/prompts.py` 和 `qa/main.py` 中的绝对硬编码路径完全修改为动态相对路径，确保前端看板完美实时展示。
-2.  **第二步（本周任务）**：重构 `qa/pipeline.py` 和 `qa/api_client.py`，全链路接入 `pydantic` 并对接 Structured Outputs 接口，重构 `FACET_PLANNER_TEMPLATE` 以强制输出标准的医学维度。
-3.  **第三步（下周任务）**：升级 Graph-RAG 模块，由“随机实体”拉取升级为“特定疾病意图路径”拉取，并注入本地药品说明书库进行 Grounding 融合。
+1.  **第一步（止血阶段）**：
+    *   重构 `qa/core/purification_helper.py` 中的 `is_catastrophic_format_collapse` 检测，移除对方括号的硬拦截以避免误杀。
+    *   在 [verify_purification.py](file:///d:/REN/qa/scripts/verify_purification.py) 中将禁词表扩展扫描范围至 `think`、`answer_body` 和 `summary` 等所有字段。
+2.  **第二步（事实边界与本地对撞）**：
+    *   构建 `FactPack Builder`，分离 `CleanedFact` 与 `ProvenanceMap`，使生成模型和 Judge 模型只接触纯净事实。
+    *   在 [api_client.py](file:///d:/REN/qa/api_client.py) 中接入 Pydantic Structured Outputs 并实现三层 Prompt 分离。
+    *   在本地增加 CPU 级事实指针碰撞拦截模块，前置校验实体一致性，阻断幻觉外推，降低大模型裁判调用开销。
+3.  **第三步（带反馈的自愈与局部事务管理）**：
+    *   重构重试机制，提取 Pydantic / 本地事实校验失败的报错内容（Diagnostic Feedback）并反挂回 context，实现带诊断反馈的定向重试。
+    *   重构 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py)，将“一票否决”行回滚升级为局部切面事务管理（partial_success），局部固化成功结果，隔离失败切面。
+4.  **第四步（智能路由、记忆缓存与 7-Metrics 系统）**：
+    *   引入复杂度路由机制，根据输入问题长短与意图决定模型分流（Lightweight / Premium）或单/多切面规划。
+    *   构建 FAISS 优秀范式缓存库与 Negative Prompts 黑名单机制，实现模型越生越稳定。
+    *   将 Judge 打分机制重构对齐至 Success, Recall, Precision, Faithfulness, Relevance, Professionalism, Interpretability 7-Metrics 循证质检体系。

@@ -13,11 +13,36 @@ import hashlib
 import logging
 import urllib.request
 import urllib.parse
+import urllib.error
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 from retrieval.schemas import NormalizedClinicalRef
 
 logger = logging.getLogger("MedicalQA.APIGateway")
+
+class AsyncRateLimiter:
+    def __init__(self, max_rate: float, time_period: float = 1.0):
+        self.max_rate = max_rate
+        self.time_period = time_period
+        self.tokens = max_rate
+        self.last_update = asyncio.get_event_loop().time()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            while True:
+                now = asyncio.get_event_loop().time()
+                elapsed = now - self.last_update
+                self.tokens = min(self.max_rate, self.tokens + elapsed * (self.max_rate / self.time_period))
+                self.last_update = now
+
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                else:
+                    wait_time = (1.0 - self.tokens) * (self.time_period / self.max_rate)
+                    await asyncio.sleep(wait_time)
 
 class APIGatewayService:
     def __init__(self, db_dir: str = "."):
@@ -28,6 +53,12 @@ class APIGatewayService:
         os.makedirs(self.db_dir, exist_ok=True)
         self.db_path = os.path.join(self.db_dir, "medical_cache.db")
         self._initialize_cache_db()
+        
+        # 从环境变量读取 PubMed 配置并初始化限流器
+        self.pubmed_api_key = os.getenv("PUBMED_API_KEY", "").strip()
+        pubmed_rate_limit = float(os.getenv("PUBMED_RATE_LIMIT", "10"))
+        self.rate_limiter = AsyncRateLimiter(max_rate=pubmed_rate_limit, time_period=1.0)
+        logger.info(f"Initialized APIGatewayService with PubMed Rate Limit: {pubmed_rate_limit} rps (Key configured: {bool(self.pubmed_api_key)})")
 
     def _initialize_cache_db(self):
         """
@@ -95,7 +126,7 @@ class APIGatewayService:
     async def fetch_pubmed_abstracts(self, term: str, limit: int = 3) -> List[Dict[str, Any]]:
         """
         异步调用美国国立生物技术信息中心 (NCBI) PubMed 公开文献检索 API (e-utilities)
-        获取相关的最新学术研究摘要。无需 API Key，天然免授权。
+        获取相关的最新学术研究摘要。支持通过 API Key 进行速率限制。
         """
         cache_key = self._get_cache_key("pubmed", term)
         cached = self._get_cached_response(cache_key)
@@ -103,46 +134,65 @@ class APIGatewayService:
             logger.info(f"PubMed API persistent Cache HIT for term: '{term}'")
             return cached
 
-        # 1. 搜索 PMID 列表
-        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        # 1. 组装搜索与摘要提取的基本参数，注入 API Key (如果配置)
         search_params = {
             "db": "pubmed",
             "term": term,
             "retmode": "json",
             "retmax": limit
         }
-        
+        if self.pubmed_api_key:
+            search_params["api_key"] = self.pubmed_api_key
+
         loop = asyncio.get_event_loop()
+
+        # 定义带限流和 HTTP 429 自愈重试的通用 HTTP 获取器
+        async def fetch_url_with_retry(base_url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+            max_retries = 3
+            backoff = 1.0
+            for attempt in range(max_retries):
+                # 客户端控频锁止
+                await self.rate_limiter.acquire()
+                try:
+                    def do_request():
+                        url = f"{base_url}?{urllib.parse.urlencode(params)}"
+                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=3.0) as r:
+                            return json.loads(r.read().decode('utf-8'))
+                    return await loop.run_in_executor(None, do_request)
+                except urllib.error.HTTPError as he:
+                    if he.code == 429:
+                        # 429 专属自愈等待：根据 Retry-After 避让或执行指数退避
+                        retry_after = he.headers.get("Retry-After")
+                        wait_sec = float(retry_after) if (retry_after and retry_after.isdigit()) else backoff
+                        logger.warning(f"PubMed API HTTP 429 (Too Many Requests). Attempt {attempt+1}/{max_retries}. Waiting {wait_sec}s before retry...")
+                        await asyncio.sleep(wait_sec)
+                        backoff *= 2.0
+                    else:
+                        raise he
+            raise Exception("Failed to fetch from PubMed API due to persistent HTTP 429 rate limit errors.")
+
         try:
-            # 异步执行 HTTP 请求，防止阻塞生成任务的主事件循环
-            def run_search():
-                url = f"{search_url}?{urllib.parse.urlencode(search_params)}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=3.0) as r:
-                    return json.loads(r.read().decode('utf-8'))
-            
-            search_res = await loop.run_in_executor(None, run_search)
+            # 1. 检索 PMID 列表
+            search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+            search_res = await fetch_url_with_retry(search_url, search_params)
             id_list = search_res.get("esearchresult", {}).get("idlist", [])
             
             if not id_list:
                 logger.info(f"PubMed Search yielded 0 results for term '{term}'")
                 return []
 
-            # 2. 提取 PMID 文献摘要 (Summary)
+            # 2. 批量合并提取 PMID 文献摘要 (Summary)
             summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
             summary_params = {
                 "db": "pubmed",
                 "id": ",".join(id_list),
                 "retmode": "json"
             }
-            
-            def run_summary():
-                url = f"{summary_url}?{urllib.parse.urlencode(summary_params)}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=3.0) as r:
-                    return json.loads(r.read().decode('utf-8'))
+            if self.pubmed_api_key:
+                summary_params["api_key"] = self.pubmed_api_key
 
-            summary_res = await loop.run_in_executor(None, run_summary)
+            summary_res = await fetch_url_with_retry(summary_url, summary_params)
             uid_results = summary_res.get("result", {})
             
             extracted_refs = []

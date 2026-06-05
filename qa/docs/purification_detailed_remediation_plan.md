@@ -312,12 +312,18 @@ raw_think optional
 
 Judge 不直接输入 raw source。raw source 只用于审计。
 
-评分规则：
+评分规则 (对齐工业级七维度评估体系)：
 
-- purified_think 中新增事实若被 CleanedFact 支撑，不判幻觉。
-- purified_think 中新增事实若没有 CleanedFact 支撑，判事实外推。
-- 若 Think 覆盖范围宽于 narrowed_answer，判 Think/Answer 不一致。
-- 若 Think 少于 Answer 必要推导，判 reasoning insufficient。
+- **Success** (格式合规度)：对格式规范、JSON 括号对齐等进行显式量化评估，将单纯的外部硬拦截升级为评测维度的分数沉淀。
+- **Recall** (查全率/召回率)：审查在“无发现/无相关指南”等拒答场景下，模型是否输出了合理的扫描证据排查线索，防止敷衍式拒答。
+- **Precision** (查准率)：评估在基于 refs 的前提下，医学推论、剂量剂量或药效陈述是否百分百精确无误，与 Grounding 解耦，专门针对临床逻辑精细度进行物理质检。
+- **Faithfulness** (事实忠实度)：即 Grounding 评估，判定 purified_think 中新增事实是否完全被 CleanedFact 支撑。
+- **Relevance** (问题相关性)：回答是否直击核心诉求，过滤前置及后置的无意义客套话。
+- **Professionalism** (专业度)：评估术语规范、是否符合国家级诊疗规范、中国药典标准或明确的医学术语规范（如使用标准疾病名称）。
+- **Interpretability** (可解释性)：逻辑推导是否清晰，是否对特定任务输出了可视化辅助（如 Mermaid 拓扑图、ASCII 药代动力学步骤）。
+
+- ❌ 若 Think 覆盖范围宽于 narrowed_answer，扣除 Faithfulness/Precision 分数并判为 Think/Answer 不一致。
+- ❌ 若 Think 少于 Answer 必要推导，判为 reasoning insufficient。
 
 Judge 输出必须包含：
 
@@ -516,6 +522,73 @@ planner_status:
 - 灰度期保留原始行备份。
 - 对 partial_success 行建立重试队列。
 
+### 4.10 CPU-based Deterministic Fact Pre-check (CPU 级确定性前置质检)
+
+目标：
+在调用大模型裁判前，提取生成内容中的专有名词、推荐药物、数值剂量等核心指针，在 CPU 本地对 `refs` 事实库进行快速的布尔或轻量级向量碰撞。
+
+逻辑：
+*   **物理拦截机制**：如果提纯结果中出现了未在 references 中包含的“全新”药物名或异常的医学剂量，直接在本地秒级拦截并判定为“幻觉外推”，拒绝其进入后续昂贵的大模型裁判评分环节，极大降低 Token 调用开销。
+*   **同义词库辅助**：结合轻量级医学同义词表（如“吉三代”对撞“索磷布韦维帕他韦”），防范因学术缩写或别名导致的布尔校验误报。
+
+---
+
+### 4.11 Feedback-driven Self-Healing Retry Loop (带反馈诊断的自愈重试环路)
+
+目标：
+将传统的“盲目重新生成”重试机制，升级为“带反馈诊断”的自愈模式。
+
+逻辑：
+*   **错误对齐注入**：当 Pydantic 校验、本地事实校验或 Judge 质检失败时，将具体的失败意见（如：“Grounding 评分过低，未包含 refs 中的核心实体 A”或“检测到违禁词 JSON”）格式化为诊断反馈，动态注入重试 Prompt，确保模型进行针对性纠偏，大幅度提升重试成功率。
+
+---
+
+### 4.12 Episodic Memory & Action Cache (认知经验沉淀与语义缓存)
+
+目标：
+构建自适应、可演进的记忆缓存机制，避免同类幻觉/格式残留的重复发生。
+
+逻辑：
+*   **优秀范式缓存库**：当生成/提纯样本通过质检且得分极高（例如分流打分 $>9.0$）时，自动将其入库。后续在处理相似主题的生成时，通过 FAISS 向量检索召回类似优质样本作为 Dynamic Few-Shot 注入 Prompt，使生成质量逐步演进且愈发稳定。
+*   **黑名单过滤器（Negative Prompts）**：将高频引发 LLM 幻觉、拒答或工程词泄漏的特征实体与问答范式固化，作为负向提示词注入模型，规避同类错误的二次发生。
+
+---
+
+### 4.13 Complexity-based Routing & Model Dispatch (智能意图路由与分流)
+
+目标：
+对输入问题进行复杂度识别与模型分流，控制 API 成本和生成延迟。
+
+逻辑：
+*   **复杂度估算**：对输入的问题及 context 进行复杂度识别（例如包含“趋势分析、联合用药、配伍禁忌”等核心词为复杂问题，仅包含单一适应症/实体查询为简单事实问题）。
+*   **路由分发**：
+    *   **复杂问题**：保留现有的 8 切面拆分，并发调用 premium 级别的模型生成。
+    *   **简单事实问题**：自动降级为单切面分析，直接指派给 lightweight 级别的模型生成，或者走标准的“问答模板路由直通车”，跳过 LLM 规划阶段，降低 API 耗时和成本。
+
+---
+
+### 4.14 PubMed API 限流防御与自愈机制 (External API Throttling & Auto-Healing)
+
+目标：
+在数据生成与提纯的 RAG 检索阶段，防范由于并发请求量过大而频繁触发 PubMed 接口 HTTP 429 报错造成的管线熔断。
+
+逻辑：
+*   **NCBI API Key 授权绑定**：通过环境变量 `PUBMED_API_KEY` 将官方 Key (`81ec27eefbffe61380b13b5c6a26e545cf09`) 绑定入系统，将 PubMed 的访问速率上限由 3 rps 物理提升至 10 rps。
+*   **Token-Bucket 客户端限流**：在 API 调度层实现无依赖的令牌桶限流器 `AsyncRateLimiter`，并在 `env` 中读取并发控制频率 `PUBMED_RATE_LIMIT=10`，限制客户端发出请求的节奏，实现平滑削峰。
+*   **429 专属自愈避让重试**：网络请求抛出 HTTP 429 错误时，拦截并挂起当前请求。解析 Header 中的 `Retry-After` 属性进行精确规避；若缺失则按指数退避算法（如 1s, 2s, 4s, 8s）挂起线程等待，达到最大 3 次重试后方触发灾备降级，防止污染后续请求。
+
+---
+
+### 4.15 中文检索实体翻译与学术对齐机制 (Chinese Query Translation Alignment)
+
+目标：
+解决 PubMed 不支持中文，且直接拼入英文（如“有机阴离子转运体（hOAT家族）”）导致 PubMed 误匹配无关论文的问题（例如匹配到 "Hoat DM" 作者相关的量子点物理论文或 "puhoatensis" 越南蜥蜴物种论文）。
+
+逻辑：
+*   **本地中英对照表映射**：维护常用医学概念、靶点和药物的中英对照表，在本地对实体名进行秒级翻译映射，零延迟且不消耗 Token。
+*   **LLM 医疗术语翻译路由器**：对照表未命中时，调用轻量大模型将中文实体翻译为最常用、最泛化的英文医学术语通用名、MeSH 词或基因/转运体缩写。
+*   **输入流过滤**：翻译完毕后进行格式校验，过滤任何无关标点、中文解释与噪声，只保留纯英文检索词传入 PubMed。
+
 ---
 
 ## 5. 灰度与回滚策略
@@ -678,39 +751,38 @@ latency_p95 增幅 <= 20%
 
 ## 9. 推荐落地顺序
 
-### 阶段一：止血
+### 阶段一：止血（极轻量本地拦截）
 
-1. Structure Gate 去掉方括号硬拦截。
-2. Leakage Scanner 扩展为全字段扫描。
-3. 禁词表版本化。
+1. **Structure Gate** 移除对正常方括号的硬拦截以避免误杀。
+2. **Leakage Scanner** 扩展为 think、answer_body 和 summary 全字段扫描。
+3. 禁词表版本化，拦截词前置切除与中性替换。
 
-风险低，收益快。
+### 阶段二：事实边界与本地对撞
 
-### 阶段二：事实边界
+1. 建立 **FactPack Builder**，物理分离 CleanedFact 与 ProvenanceMap，大模型只接触自然语言事实。
+2. 部署 **CPU 级确定性前置事实碰撞**，秒级拦截由于 refs 外推产生的低级事实幻觉，降低 Token 开销。
 
-1. 建立 FactPack Builder。
-2. 生成 prompt 不再注入 raw source。
-3. Answer Rewriter 使用 CORE facts。
-4. Answer 先过 fact check，再进入 CoT boundary。
+### 阶段三：带反馈自愈与局部事务管理
 
-这是核心工程改造。
+1. 重构重试机制，提取 Pydantic / 本地事实校验失败的报错内容，实现带诊断反馈意见的定向重试。
+2. 将整行一票否决升级为局部切面事务管理（`partial_success`），局部固化成功结果，隔离失败切面。
 
-### 阶段三：循证裁判
+### 阶段四：循证裁判与 7-Metrics 打分系统
 
-1. Judge 接入 CleanedFact。
-2. 新旧 Judge 影子运行。
-3. 对分歧样本做人审抽样。
+1. 部署 **Reference-Guided Judge (基于信源引导的裁判机制)**，在 Judge 输入中增加 `CleanedFact` 事实包。
+2. 重构 Judge 评估细则，正式对齐 Success, Recall, Precision, Faithfulness, Relevance, Professionalism, Interpretability 七维度打分体系。
 
-### 阶段四：局部事务
+### 阶段五：智能路由与语义缓存层
 
-1. partial_success 先只写审计日志。
-2. 下游兼容后再写入数据集。
-3. 建立 quarantined_planners 和重试队列。
+1. 引入复杂度路由机制，根据输入问题长短与意图决定模型分流（Lightweight / Premium）或单/多切面规划。
+2. 构建 FAISS 优秀范式缓存库与 Negative Prompts 黑名单机制，实现模型越生越稳定。
 
-### 阶段五：证据路由精细化
+### 阶段六：外部文献 API 双层限流与 429 自愈避让
 
-1. 路由规则从关键词升级为 intent + scope + fact 支撑关系。
-2. 对简单题默认屏蔽旁路机制/药代/安全性证据。
+1. 在 `.env` 配置文件中配置 `PUBMED_API_KEY=81ec27eefbffe61380b13b5c6a26e545cf09` 和速率限制 `PUBMED_RATE_LIMIT=10`。
+2. 引入 `AsyncRateLimiter` 令牌桶限流类至 [api_gateway.py](file:///d:/REN/qa/retrieval/api_gateway.py)，实现客户端物理控频。
+3. 部署带 `Retry-After` 和指数退避自愈的 `fetch_url_with_retry` 网络重试机制，自愈 429 报错，熔断灾备降级。
+4. 部署“本地中英对照表 + LLM 医疗翻译路由器”双通道翻译对齐机制，阻断由于中文实体字符泄漏导致 PubMed 抓取无关量子点/石龙子文献的 Bug 产生。
 
 ---
 

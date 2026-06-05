@@ -365,3 +365,293 @@ def is_catastrophic_format_collapse(text: str) -> bool:
                     **raw_mapping_meta
                 })
 ```
+
+---
+
+### 方案 8. CPU 本地前置事实碰撞与幻觉查杀器 (Deterministic CPU-based Fact Pre-check)
+在调用大模型裁判前，提取生成内容中的专有医药名词、推荐药物、数值剂量等核心指针，在 CPU 本地对 `refs` 事实库进行快速的布尔碰撞与轻量向量核验，前置拦截幻觉。
+
+#### 💡 代码层修改 blueprint (core/purification_helper.py)：
+```python
+def check_factual_grounding(text: str, refs: List[Dict[str, Any]]) -> Tuple[bool, str]:
+    """
+    CPU 级确定性前置事实校验：
+    1. 提取生成内容中的药物实体及数值剂量。
+    2. 硬比对 refs 事实包，若出现 refs 以外的幻觉药物实体，直接秒级拦截。
+    """
+    if not text or not refs:
+        return True, ""
+        
+    # 提取 refs 中的所有纯文本事实
+    raw_refs_pool = " ".join([r.get("context", "") for r in refs if isinstance(r, dict)]).lower()
+    
+    # 提取 text 中的潜在医学药物实体 (这里可以使用预设的药物词表或正则)
+    # 示例：快速提取常见高频专有名词
+    extracted_entities = re.findall(r'[a-zA-Z\u4e00-\u9fa5]+(?:片|注射液|胶囊|颗粒|软膏)', text)
+    
+    # 同义词对撞表
+    SYNONYM_MAP = {
+        "吉三代": "索磷布韦维帕他韦",
+        "艾恒平": "布比卡因脂质体"
+    }
+    
+    for entity in extracted_entities:
+        entity_lower = entity.lower()
+        # 转换为标准词或原词进行碰撞
+        standard_entity = SYNONYM_MAP.get(entity_lower, entity_lower)
+        if standard_entity not in raw_refs_pool and entity_lower not in raw_refs_pool:
+            return False, f"检测到幻觉实体 '{entity}' 未在参考资料中出现，拒绝进入裁判打分。"
+            
+    return True, ""
+```
+
+---
+
+### 方案 9. 带向诊断反馈的自愈重试机制 (Feedback-driven Self-Healing Retry Loop)
+重构 `purify_single_think` 极其重试调用链，在 structured output 重试或 Judge 失败时，捕获异常与具体扣分维度原因，作为 Diagnostic Feedback 注入重试 Prompt，实现带反馈的有向纠偏。
+
+#### 💡 代码层修改 blueprint (core/purification_engine.py)：
+```python
+# core/purification_engine.py
+
+         # 局部带诊断反馈的重试机制
+         feedback_log = ""
+         for attempt in range(max_retries):
+             feedback_prompt_addition = ""
+             if feedback_log:
+                 feedback_prompt_addition = f"\n\n【⚠️ 上一轮重写失败反馈】：\n{feedback_log}\n请针对性修正上述问题，避免再次犯错！"
+                 
+             prompt = f"""{few_shot}
+             
+             ### 系统指令：
+             ... {feedback_prompt_addition}"""
+             
+             # 调用生成...
+             # 如果裁判打分不合格：
+             if not is_passed:
+                 feedback_log = f"裁判打分未通过。原因: {judge_reason}. 扣分维度: {failed_dimensions}."
+                 # 循环进入下一轮带 feedback 重试
+```
+
+---
+
+### 方案 10. 智能复杂度路由与多级分流 (Smart Intent Routing)
+重构 pipeline 任务规划器，识别问题意图与事实覆盖度，为简单 facts 题自动降级单切面并分流至 lightweight 模型，减少 premium API 的冗余消耗。
+
+#### 💡 代码层修改 blueprint (core/pipeline_workflow.py)：
+```python
+# core/pipeline_workflow.py
+
+    def _estimate_complexity(self, q: str, refs: List[Dict[str, Any]]) -> str:
+        """
+        根据 Query 及事实包估算问题复杂度：
+        - 包含“趋势、机制、诊断、联合用药、相互作用”为 HIGH
+        - 仅包含单一适应症、贮藏、包装等事实查询为 LOW
+        """
+        complexity_keywords = ["机制", "药理", "联合", "相互作用", "代谢", "通路", "不良反应"]
+        if any(kw in q for kw in complexity_keywords):
+            return "HIGH"
+        if len(refs) <= 2:
+            return "LOW"
+        return "HIGH"
+
+    async def route_task(self, q: str, refs: List[Dict[str, Any]]):
+        complexity = self._estimate_complexity(q, refs)
+        if complexity == "LOW":
+            # 路由至简单模式：跳过 8-facet 并行规划，指派给轻量级模型快速生成单切面
+            return await self.api_client.call_lightweight_model(q, refs)
+        else:
+            # 路由至复杂模式：进入多切面 premium 并发
+            return await self.api_client.call_premium_model_pipeline(q, refs)
+```
+
+---
+
+### 方案 11. 基于 FAISS 的认知经验与动作缓存 (Episodic Memory & Action Cache)
+引入本地向量库，缓存高评分提纯动作。在新样本生成时进行语义相似度检索，召回做 Dynamic Few-Shot。
+
+#### 💡 代码层修改 blueprint (services/healing_service.py)：
+```python
+# services/healing_service.py
+import faiss
+import numpy as np
+
+class ActionCacheManager:
+    def __init__(self):
+        # 初始化 FAISS 本地向量库
+        self.dimension = 768
+        self.index = faiss.IndexFlatL2(self.dimension)
+        self.cache_data = [] # 存放 {q: ..., purified_think: ..., score: ...}
+
+    def add_to_memory(self, q: str, purified_think: str, score: float, vector: np.ndarray):
+        """仅在提纯得分 > 9.0 时，才允许固化进长期认知经验库"""
+        if score >= 9.0:
+            self.index.add(np.array([vector]))
+            self.cache_data.append({
+                "q": q,
+                "purified_think": purified_think,
+                "score": score
+            })
+
+    def retrieve_few_shot(self, query_vector: np.ndarray, top_k: int = 1) -> List[Dict[str, Any]]:
+        if self.index.ntotal == 0:
+            return []
+        distances, indices = self.index.search(np.array([query_vector]), top_k)
+        results = []
+        for idx in indices[0]:
+            if idx != -1 and idx < len(self.cache_data):
+                results.append(self.cache_data[idx])
+        return results
+```
+
+---
+
+### 方案 12. 外部文献 API 双层限流与 429 自愈重试机制 (PubMed API Dual-Layer Throttling & 429 Self-Healing Retry)
+针对 PubMed 等外部医学数据库的高频并发请求极易导致 HTTP 429 (Too Many Requests) 熔断的问题，我们引入双层控频防御与自动避让自愈算法，保护链路稳定性。
+
+#### 💡 代码层修改 blueprint (retrieval/api_gateway.py)：
+```python
+# retrieval/api_gateway.py
+import asyncio
+import urllib.request
+import urllib.parse
+import urllib.error
+import json
+from typing import Dict, Any, List
+
+class AsyncRateLimiter:
+    def __init__(self, max_rate: float, time_period: float = 1.0):
+        self.max_rate = max_rate
+        self.time_period = time_period
+        self.tokens = max_rate
+        self.last_update = asyncio.get_event_loop().time()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            while True:
+                now = asyncio.get_event_loop().time()
+                elapsed = now - self.last_update
+                # 动态补充令牌
+                self.tokens = min(self.max_rate, self.tokens + elapsed * (self.max_rate / self.time_period))
+                self.last_update = now
+
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                else:
+                    wait_time = (1.0 - self.tokens) * (self.time_period / self.max_rate)
+                    await asyncio.sleep(wait_time)
+
+# 在 APIGatewayService 中调用：
+# self.pubmed_api_key = os.getenv("PUBMED_API_KEY", "").strip()
+# pubmed_rate_limit = float(os.getenv("PUBMED_RATE_LIMIT", "10"))
+# self.rate_limiter = AsyncRateLimiter(max_rate=pubmed_rate_limit, time_period=1.0)
+
+async def fetch_url_with_retry(base_url: str, params: Dict[str, Any], rate_limiter: AsyncRateLimiter) -> Dict[str, Any]:
+    max_retries = 3
+    backoff = 1.0
+    loop = asyncio.get_event_loop()
+    
+    for attempt in range(max_retries):
+        # 客户端令牌桶速率限流锁止 (硬限额，如 10 rps)
+        await rate_limiter.acquire()
+        try:
+            def do_request():
+                url = f"{base_url}?{urllib.parse.urlencode(params)}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=3.0) as r:
+                    return json.loads(r.read().decode('utf-8'))
+            return await loop.run_in_executor(None, do_request)
+        except urllib.error.HTTPError as he:
+            if he.code == 429:
+                # 429 专属自愈等待：优先解析 Header 中的 Retry-After 避让时间，否则按指数退避递增
+                retry_after = he.headers.get("Retry-After")
+                wait_sec = float(retry_after) if (retry_after and retry_after.isdigit()) else backoff
+                logger.warning(f"PubMed API HTTP 429 (Too Many Requests). Attempt {attempt+1}/{max_retries}. Waiting {wait_sec}s...")
+                await asyncio.sleep(wait_sec)
+                backoff *= 2.0
+            else:
+                raise he
+    raise Exception("Failed to fetch from PubMed API due to persistent HTTP 429 rate limit errors.")
+```
+
+---
+
+### 方案 13. 中文检索实体翻译与学术对齐 (Chinese Query Translation Alignment)
+针对 PubMed 不支持中文导致检索落空，或者字符半部分泄漏导致匹配无关量子点/蜥蜴论文的问题，我们设计并实现双通道翻译对齐机制。
+
+#### 💡 代码层修改 blueprint (retrieval/api_gateway.py)：
+```python
+# retrieval/api_gateway.py
+import os
+import re
+import logging
+from typing import Dict, Any, List
+
+logger = logging.getLogger("MedicalQA.APIGateway")
+
+# 1. 通道一：静态中英医学词典对照表
+STATIC_TRANSLATION_MAP = {
+    "布洛芬": "Ibuprofen",
+    "甲氨蝶呤": "Methotrexate",
+    "西尼莫德": "Siponimod",
+    "肾脏": "Kidney",
+    "有机阴离子转运体（hoat家族）": "Organic Anion Transporters",
+    "hoat家族": "OAT transporter",
+    "hOAT家族": "OAT transporter",
+    "螺旋藻胶囊": "Spirulina capsule",
+}
+
+async def translate_entity_to_english(entity_name: str, api_client: Any = None) -> str:
+    """
+    双通道中英医疗术语对齐：
+    1. 优先检索本地静态高频词表
+    2. 词表未命中时，调用轻量大模型翻译为标准英文医学术语（通用药名/疾病名/基因符号）
+    """
+    clean_name = entity_name.strip()
+    if not clean_name:
+        return ""
+        
+    # 通道一：本地对照映射
+    if clean_name in STATIC_TRANSLATION_MAP:
+        translated = STATIC_TRANSLATION_MAP[clean_name]
+        logger.info(f"Translation HIT: Local Map matched '{clean_name}' -> '{translated}'")
+        return translated
+        
+    # 通道二：LLM 医疗术语路由器对齐
+    if api_client is None:
+        # 降级：如果未传入 api_client，剔除所有中文仅保留英文字符作为安全检索词
+        english_only = "".join(re.findall(r'[a-zA-Z0-9\s\-\*\/]+', clean_name)).strip()
+        logger.warning(f"Translation Fallback: No LLM client. Strip Chinese from '{clean_name}' -> '{english_only}'")
+        return english_only
+
+    prompt = f"""你是一个专业的医学翻译助手。
+请将中文医学实体翻译为 PubMed 文献数据库检索最常用、最标准的英文医学术语（如标准通用药物英文名、疾病 MeSH 词或基因/转运体缩写符号）。
+【⚠️输出硬性要求】：你必须且只能输出翻译后的英文词，严禁包含任何中文、解释、拼音、括号、引号或标点符号。
+
+待翻译实体：【{clean_name}】
+翻译英文词："""
+
+    try:
+        # 使用 lightweight 级别大模型完成秒级学术对齐
+        response = await api_client.call_llm(
+            prompt,
+            model_pool="lightweight",
+            stage=f"PubMed检索实体学术对齐: {clean_name}"
+        )
+        translated = response.strip().strip('"').strip("'").strip()
+        
+        # 过滤可能残留的多余文本或解释
+        translated = re.sub(r'[^a-zA-Z0-9\s\-\*\/]', '', translated).strip()
+        
+        logger.info(f"Translation LLM: Aligned '{clean_name}' -> '{translated}'")
+        return translated if translated else clean_name
+    except Exception as e:
+        logger.error(f"Failed to translate entity '{clean_name}' via LLM: {e}")
+        # 异常安全退避：提取英文字符
+        return "".join(re.findall(r'[a-zA-Z0-9\s\-\*\/]+', clean_name)).strip()
+```
+
+
+

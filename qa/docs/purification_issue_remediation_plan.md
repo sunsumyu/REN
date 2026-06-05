@@ -290,7 +290,7 @@ Judge 评估必须有确凿的事实依据（Grounding）。判定“外推/幻�
 ### 建议方案
 
 1. **输入增强（Grounding Context）**：
-   在 Judge LLM 的 Evaluation Prompt 中，除了提供提纯前的 `raw_think` 和提纯后的 `think`，必须**显式传入原始的 `refs` / 科学事实包（Confirmed Clinical & Literature Facts）**。
+   In Judge LLM 的 Evaluation Prompt 中，除了提供提纯前的 `raw_think` 和提纯后的 `think`，必须**显式传入原始的 `refs` / 科学事实包（Confirmed Clinical & Literature Facts）**。
 
 2. **三方比对 Rubric（三方裁判细则）**：
    细化 Judge 对“幻觉”与“合理提纯/知识对齐”的定义：
@@ -305,34 +305,62 @@ Judge 评估必须有确凿的事实依据（Grounding）。判定“外推/幻�
 
 ---
 
-## 7. 推荐落地顺序
+## 7. 外部文献 API 限流防御、学术对齐与自愈 (External API Throttling, Academic Alignment & Auto-Healing)
 
-### 第一阶段：止血（极轻量本地拦截）
+### 问题
+在高频并发调用 PubMed API 进行文献检索时，极易触发 NCBI 官方的 **HTTP 429 (Too Many Requests)** 报错限制，若无 API Key 时默认限制为 3 rps。没有合理的限流避让自愈机制，将导致整个 RAG 检索管线因请求熔断而获取不到数据。
+此外，当直接使用包含中文的实体词（如“有机阴离子转运体（hOAT家族）”）或纯中文（如“布洛芬”）直接调用 PubMed 时，由于 PubMed 仅支持英文索引，解析器会过滤中文或返回空值，进而可能通过匹配残留的英文字符片段（如“hOAT”）错误关联到无关论文（如作者为 "Hoat DM" 的材料物理论文或 "puhoatensis" 蜥蜴新种论文），引发严重的检索漂移 Bug。
 
-1. 扩展 Validator 本地禁词黑名单。
-2. 引入 Trie-Tree / Aho-Corasick 匹配，同时对 `think`、`answer_body` 和 `summary` 字段执行高速本地正则/字面量拦截。
-3. 对 source 做生成前剥离，只给模型纯事实。
+### 治理原则
+引入客户端硬性控频与 429 报错避让重试自愈机制，辅以中文检索实体的中英文标准医学术语翻译与学术对齐。
 
-### 第二阶段：减少误杀（引入信源裁判）
-
-1. 部署 **Reference-Guided Judge (基于信源引导的裁判机制)**，在 Judge 输入中增加 `refs` 事实，调整裁判 Prompt 消除合法补充细节导致的幻觉误判（False Positives）。
-2. 将整行回滚改为 planner 级局部失败隔离，支持局部重试与局部隔离。
-3. 审计日志区分 `partial_success` 与 `rollback`。
-
-### 第三阶段：减少跑偏（路由与语义分流）
-
-1. 重构证据路由。简单题只允许 CORE 事实进入 prompt，将旁路机制、剂量、不良反应等证据默认置为 BLOCKED。
-2. 将复杂的“语义泄漏/元叙述”检测，从本地 Validator 规则层剥离，正式融入 Judge LLM 纯净度评估细则（Purity Rubric）中，实现零本地额外耗时的复杂残留识别。
-
-### 第四阶段：根治提示词冲突（动态推理深度）
-
-1. 增加证据覆盖度自动判断，识别 `HIGH_EVIDENCE` 与 `LOW_EVIDENCE`。
-2. 低证据题强制 simplify。
-3. 深推理要求仅在高证据题启用，且问号反思从硬门槛改为软加分项。
+### 建议方案
+1. **环境变量 Key 绑定**：在 `.env` 中配置 `PUBMED_API_KEY=81ec27eefbffe61380b13b5c6a26e545cf09`，将官方限流值从 3 rps 物理提高到 10 rps；并在 `.env` 中硬限频 `PUBMED_RATE_LIMIT=10`。
+2. **令牌桶客户端控频限流**：使用基于 asyncio 的令牌桶算法限流器 `AsyncRateLimiter` 动态生成令牌，对 NCBI 的所有搜索和摘要请求进行硬性调度，确保不超过每秒 10 次。
+3. **429 指数退避与 Retry-After 自愈**：捕捉 HTTP 429 异常。若 Header 中包含 `Retry-After` 则严格按照其指定秒数挂起协程进行避让；若没有则执行指数退避延迟（1s, 2s, 4s），进行 3 次自愈重试，最大程度避免请求失败崩溃。
+4. **双通道中英翻译学术对齐**：
+   - **本地对照词表**：对高频核心词建立静态中英映射字典，直接映射，零延迟且零成本。
+   - **LLM 医疗术语翻译路由器**：对词表未命中的新词，调用轻量大模型翻译，限定仅输出标准英文医学通用名、MeSH 词或基因/转运体缩写符号（如将“螺旋藻胶囊”对齐为“Spirulina capsule”），从源头阻断因字符泄漏带来的检索漂移。
 
 ---
 
-## 8. 验收标准
+## 8. 推荐落地顺序
+
+### 第一阶段：止血（极轻量本地拦截）
+
+1. **Structure Gate** 去掉方括号硬性拦截，避免误杀正常医学表达。
+2. **Leakage Scanner** 扩展为 think、answer_body、summary 全字段扫描。
+3. 禁词表版本化，并在本地实现智能客套话前置切除与中性替换。
+
+### 第二阶段：事实边界与本地对撞
+
+1. 建立 **FactPack Builder**，物理分离 CleanedFact 与 ProvenanceMap，阻断 RAG Source 泄露。
+2. 部署 **CPU 级确定性前置事实碰撞**，提取生成内容中的药物实体与数值，在本地对 refs 进行秒级碰撞，直接拦截低级幻觉以降低 API 开销。
+
+### 第三阶段：带反馈自愈与局部事务管理
+
+1. 重构重试机制，提取校验/Judge 失败原因作为 **Diagnostic Feedback** 定向注入重试 Prompt，实现有向自愈。
+2. 将整行一票否决升级为局部切面事务管理（`partial_success`），固化成功结果，隔离失败切面。
+
+### 第四阶段：循证裁判与 7-Metrics 打分系统
+
+1. 部署 **Reference-Guided Judge (基于信源引导的裁判机制)**，在 Judge 输入中增加 `CleanedFact` 事实包，打消合法知识补充导致的幻觉误判。
+2. 重构 Judge 评估细则，正式对齐 **Success** (格式)、**Recall** (查全率/拒答控制)、**Precision** (查准率/推理精细度)、**Faithfulness** (事实忠实度/Grounding)、**Relevance** (相关性), **Professionalism** (专业度), **Interpretability** (可解释性) 七维度打分体系。
+
+### 第五阶段：智能路由与语义缓存层
+
+1. 引入复杂度意图路由机制，对于简单事实查询自动降级为单切面规划，分流指派给 Lightweight 模型，对于复杂机制题才启用 8 切面并发与 Premium 模型。
+2. 构建 FAISS 优秀范式缓存库与 Negative Prompts 黑名单机制，实现模型越生越稳定。
+
+### 第六阶段：外部文献 API 限流、对齐与 429 自愈
+
+1. 配置 `.env` 中的 `PUBMED_API_KEY` 与 `PUBMED_RATE_LIMIT=10`。
+2. 实现 `AsyncRateLimiter` 异步限流器锁止与 `fetch_url_with_retry` 的 `Retry-After` 指数退避自愈，拦截 429 并避让重试。
+3. 部署“本地中英对照表 + LLM 医疗翻译路由器”双通道翻译对齐机制，切断由于中文实体直接检索导致的匹配漂移 Bug，稳定 Tier 2 的文献检索获取源。
+
+---
+
+## 9. 验收标准
 
 治理后应满足：
 
