@@ -59,13 +59,25 @@ class LLMJudgeStrategy(IEvaluationStrategy):
             if not isinstance(scores, dict):
                 raise ValueError("Parsed output is not a JSON object")
                 
-            required_keys = ["semantic_purity_score", "medical_rigor_score", "logical_depth_score", "factual_errors", "reason"]
+            required_keys = [
+                "semantic_purity_score", "medical_rigor_score", "logical_depth_score", 
+                "factual_errors", "reason", "improvement_suggestions",
+                "conflict_detected", "conflict_description", "conflict_details"
+            ]
             for key in required_keys:
                 if key not in scores:
                     if key == "factual_errors":
                         scores[key] = []
                     elif key == "reason":
                         scores[key] = "No explanation provided"
+                    elif key == "improvement_suggestions":
+                        scores[key] = "No suggestions provided"
+                    elif key == "conflict_detected":
+                        scores[key] = False
+                    elif key == "conflict_description":
+                        scores[key] = ""
+                    elif key == "conflict_details":
+                        scores[key] = None
                     else:
                         scores[key] = 90
                         
@@ -85,4 +97,7 @@ class LLMJudgeStrategy(IEvaluationStrategy):
                 "logical_depth_score": 0,
                 "reason": f"Evaluation error: {e}",
                 "is_passed": False,
+                "conflict_detected": False,
+                "conflict_description": "",
+                "conflict_details": None,
             }

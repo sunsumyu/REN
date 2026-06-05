@@ -24,6 +24,7 @@ except ImportError:
 
 logger = logging.getLogger("MedicalQA.LocalRAG")
 
+_ACTIVE_RAG_SERVICES = []
 
 class LocalEmbeddingEngine:
     """
@@ -72,6 +73,8 @@ class LocalRAGService:
             self._init_vector_components()
         else:
             logger.info("Local RAG Mode: Standard Mode (SQLite3 FTS5 / SQL LIKE).")
+            
+        _ACTIVE_RAG_SERVICES.append(self)
 
     def _ensure_sqlite_schemas(self):
         cursor = self.conn.cursor()
@@ -238,7 +241,26 @@ class LocalRAGService:
         return []
 
     def close(self):
+        global _ACTIVE_RAG_SERVICES
+        if self in _ACTIVE_RAG_SERVICES:
+            try:
+                _ACTIVE_RAG_SERVICES.remove(self)
+            except ValueError:
+                pass
         try:
             self.conn.close()
         except Exception:
             pass
+
+    @classmethod
+    def clear_all_caches(cls):
+        global _ACTIVE_RAG_SERVICES
+        logger.info(f"🔄 Clearing all caches for {len(_ACTIVE_RAG_SERVICES)} active LocalRAGService instances.")
+        for service in list(_ACTIVE_RAG_SERVICES):
+            try:
+                service.metadata_store.clear()
+                if service.vector_enabled:
+                    service._init_vector_components()
+                logger.info("  - Cache cleared and components re-initialized successfully.")
+            except Exception as e:
+                logger.error(f"Error clearing cache for service instance: {e}")

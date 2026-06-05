@@ -242,11 +242,21 @@ class LLMService(ILLMService):
             logger.info("Structured call detected in lightweight pool. Routing to premium pool for schema compatibility.")
             pool = "premium"
             
+        # 如果传入的 pool 就是一个已验证支持的具体模型 ID，直接使用它
+        if self.supported_models:
+            for m in self.supported_models:
+                if m.lower() == pool:
+                    return m
+            
         # Map pool to configured model name
         if pool == "lightweight":
             model_candidate = config.MODEL_POOL_LIGHTWEIGHT
         elif pool == "judge":
             model_candidate = config.MODEL_POOL_JUDGE
+        elif pool == "audit":
+            model_candidate = config.AUDIT_MODEL
+        elif pool == "report":
+            model_candidate = config.REPORT_MODEL
         else:
             model_candidate = config.MODEL_POOL_PREMIUM
             
@@ -556,7 +566,7 @@ class LLMService(ILLMService):
         
         model_name = resolved_model.lower()
         is_openai = model_name.startswith("gpt")
-        supports_json_object = any(name in model_name for name in ["deepseek", "qwen", "glm"])
+        supports_json_object = any(name in model_name for name in ["deepseek", "qwen", "glm-5.1", "glm-5"])
         
         if is_openai:
             response_format = {

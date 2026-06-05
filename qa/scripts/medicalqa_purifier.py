@@ -157,7 +157,7 @@ async def purify_single_think(engine: PurificationEngine, q: str, planner: str, 
 async def generate_diff_analysis(llm_service, item: dict) -> str:
     """
     使用轻量级大模型对单个视角的提纯差异进行智能分析，生成
-    "原始 CoT 存在的问题" 与 "提纯改动说明" 两段结构化叙述。
+    "原始 CoT 存在的问题"、"提纯改动说明" 与 "后续改进建议" 三段结构化叙述。
     """
     original = item.get("original_think", "")
     purified = item.get("purified_think", "")
@@ -173,7 +173,7 @@ async def generate_diff_analysis(llm_service, item: dict) -> str:
     elif compatibility == "FORCED_SKIP":
         mode_hint = "（注：本视角已被语义网关拦截丢弃，未进入提纯流程。）"
 
-    prompt = f"""你是医疗 CoT 数据集提纯质检专家。请对以下思维链的"原始版本"与"提纯后版本"进行简明差异分析。
+    prompt = f"""你是医疗 CoT 数据集提纯质检专家。请对以下思维链的"原始版本"与"提纯后版本"进行简明差异分析，并给出后续优化建议。
 {mode_hint}
 主问题: {question}
 临床视角: {facet}
@@ -191,7 +191,8 @@ async def generate_diff_analysis(llm_service, item: dict) -> str:
 
 请严格按以下格式输出，每项2-4句话，中文简洁叙述，不加任何 Markdown 标题或额外说明：
 【原始问题】: （列举原始思维链中存在的具体质量缺陷，如：工程词汇泄露、RAG引用痕迹、结构化标题、元叙述废话、推理平铺直叙、字数不足等）
-【改动说明】: （说明提纯过程的主要改动内容及效果，若有信息损失或过度简化也需指出）"""
+【改动说明】: （说明提纯过程的主要改动内容及效果，若有信息损失或过度简化也需指出）
+【改进建议】: （针对该数据条目在提纯后可能存在的信息局限性、或未来的微调训练/评估提出具体的改进与优化建议，如是否需要补充特定维度的医学文献、如何调整其微调比重、或者是否需要在回答中添加更具体的机制解释等）"""
     try:
         response = await llm_service.call_llm(
             prompt,
@@ -201,7 +202,7 @@ async def generate_diff_analysis(llm_service, item: dict) -> str:
         return response.strip()
     except Exception as e:
         logger.warning(f"⚠️ 差异分析生成失败: {e}")
-        return "【原始问题】: 分析生成失败。\n【改动说明】: 分析生成失败。"
+        return "【原始问题】: 分析生成失败。\n【改动说明】: 分析生成失败。\n【改进建议】: 分析生成失败。"
 
 
 def scrub_engineering_leakage(text: str) -> str:
@@ -1183,19 +1184,20 @@ async def main():
                 lf.write(f"    - 🩺 医学严谨度 (Medical Rigor): **{sc.get('medical_rigor_score', 'N/A')}/100**\n")
                 lf.write(f"    - 🧠 逻辑深度与思维熵 (Logical Depth): **{sc.get('logical_depth_score', sc.get('logical_coherence_score', 'N/A'))}/100**\n")
                 lf.write(f"    - 💬 裁判评审详情 (Judge Reason): *\"{sc.get('reason', 'N/A')}\"*\n")
+                lf.write(f"    - 💡 裁判后续改进建议 (Suggestions): *\"{sc.get('improvement_suggestions', 'N/A')}\"*\n")
                 if sc.get("purity_bypass"):
                     lf.write("    - ⚠️ **绕过警告**: 检测到大模型高度拷贝原文且有残留工程垃圾，被判为防拷贝幻觉绕过！\n\n")
                 else:
                     lf.write("\n")
                 
-                # 🔬 差异分析段：原始问题 & 改动说明
+                # 🔬 差异分析段：原始问题、改动说明与改进建议
                 compatibility_val = item.get("compatibility", "COMPATIBLE")
                 simplify_flag = item.get("simplify", False)
                 mode_badge = ""
                 if compatibility_val == "COMPATIBLE_SIMPLE" or simplify_flag:
                     mode_badge = " 🔵 `SIMPLIFY 极简模式`"
                 
-                lf.write(f"#### 🔬 原始问题 & 改动说明{mode_badge}\n\n")
+                lf.write(f"#### 🔬 原始问题、改动说明与改进建议{mode_badge}\n\n")
                 diff_analysis = item.get("diff_analysis", "")
                 if diff_analysis:
                     for al in diff_analysis.split("\n"):
@@ -1204,6 +1206,8 @@ async def main():
                             lf.write(f"- **🔴 原始 CoT 存在的问题**: {al[len('【原始问题】:'):].strip()}\n")
                         elif al.startswith("【改动说明】:"):
                             lf.write(f"- **🟢 提纯改动说明**: {al[len('【改动说明】:'):].strip()}\n")
+                        elif al.startswith("【改进建议】:"):
+                            lf.write(f"- **💡 改进建议**: {al[len('【改进建议】:'):].strip()}\n")
                         elif al:
                             lf.write(f"  {al}\n")
                 lf.write("\n")

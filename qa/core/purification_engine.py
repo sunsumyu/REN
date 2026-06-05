@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import datetime
+import sqlite3
 from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
@@ -193,6 +194,180 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                 else:
                     scores = await self.evaluator.evaluate(q, smoothed_planner, raw_think, purified, line_num=line_num, refs=active_refs)
                 
+                # 🛡️ 【多模型异构共识与安全会审审计】
+                if scores.get("conflict_detected"):
+                    logger.warning(f"   🚨 [Conflict Detected] Stage-1 Judge flagged a conflict. Triggering FactAuditingGateway...")
+                    
+                    conflict_desc = scores.get("conflict_description", "")
+                    conflict_details = scores.get("conflict_details") or {}
+                    
+                    # 1. 记录到 registry
+                    import datetime
+                    import time
+                    import random
+                    from services.fact_correction_service import FactAuditingGateway, FactCorrectionProposal, DBHotpatchManager
+                    from retrieval.local_rag import LocalRAGService
+                    
+                    registry_entry = {
+                        "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "line_num": line_num,
+                        "question": q,
+                        "planner": planner,
+                        "purified_think": purified,
+                        "conflict_description": conflict_desc,
+                        "conflict_details": conflict_details,
+                        "status": "DETECTED",
+                        "verdict": None
+                    }
+                    
+                    def log_conflict(entry):
+                        logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+                        os.makedirs(logs_dir, exist_ok=True)
+                        path = os.path.join(logs_dir, "factual_conflicts_registry.jsonl")
+                        try:
+                            with open(path, "a", encoding="utf-8", newline="\n") as f_reg:
+                                f_reg.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                        except Exception as ex:
+                            logger.error(f"Failed to log conflict to registry: {ex}")
+                            
+                    log_conflict(registry_entry)
+                    
+                    # 2. 触发二审跨厂商盲审
+                    try:
+                        gateway = FactAuditingGateway(self.llm_service)
+                        audit_result = await gateway.audit_conflict(
+                            q=q,
+                            planner=smoothed_planner,
+                            purified_think=purified,
+                            refs=active_refs,
+                            first_stage_conflict_description=conflict_desc,
+                            first_stage_conflict_details=conflict_details
+                        )
+                        
+                        verdict = audit_result.get("verdict")
+                        confidence = audit_result.get("confidence", 0.0)
+                        logger.info(f"   ├─ Stage-2 Audit Verdict: '{verdict}' (Confidence: {confidence})")
+                        
+                        registry_entry["verdict"] = verdict
+                        registry_entry["status"] = "AUDITED"
+                        registry_entry["audit_confidence"] = confidence
+                        registry_entry["audit_reason"] = audit_result.get("reason")
+                        log_conflict(registry_entry)
+                        
+                        # 3. 黄金标准库匹配与物理安全更新门禁
+                        if verdict == "RAG_ERROR":
+                            # 确定本地数据库路径
+                            db_path = "local_rag.db"
+                            if not os.path.exists(db_path):
+                                db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_rag.db")
+                                
+                            # 查找对应的数据库记录
+                            evidence_text = conflict_details.get("evidence") or ""
+                            db_info = None
+                            
+                            def find_db_record(path, text):
+                                if not os.path.exists(path) or not text:
+                                    return None
+                                try:
+                                    conn_local = sqlite3.connect(path)
+                                    cur = conn_local.cursor()
+                                    cur.execute("SELECT id, context FROM local_rag_index WHERE context = ?", (text,))
+                                    r = cur.fetchone()
+                                    if r:
+                                        conn_local.close()
+                                        return r
+                                    cur.execute("SELECT id, context FROM local_rag_index WHERE context LIKE ?", (f"%{text}%",))
+                                    r = cur.fetchone()
+                                    if r:
+                                        conn_local.close()
+                                        return r
+                                    conn_local.close()
+                                except Exception as ex:
+                                    logger.error(f"Error querying local DB: {ex}")
+                                return None
+                                
+                            if evidence_text:
+                                db_info = find_db_record(db_path, evidence_text)
+                            if not db_info and active_refs:
+                                for ref in active_refs:
+                                    ref_ctx = ref.get("context") if isinstance(ref, dict) else ""
+                                    if ref_ctx:
+                                        db_info = find_db_record(db_path, ref_ctx)
+                                        if db_info:
+                                            break
+                                            
+                            if db_info:
+                                db_id, db_context = db_info
+                                conflict_original = conflict_details.get("original_value") or ""
+                                conflict_corrected = conflict_details.get("corrected_value") or ""
+                                
+                                # 构建修正后的全段 context
+                                if conflict_original and conflict_original in db_context:
+                                    corrected_context = db_context.replace(conflict_original, conflict_corrected)
+                                    
+                                    # 创建订正提案
+                                    proposal = FactCorrectionProposal(
+                                        proposal_id=f"prop_{int(time.time())}_{random.randint(1000, 9999)}",
+                                        db_type="local_rag.db",
+                                        table_name="local_rag_index",
+                                        target_id=str(db_id),
+                                        field_name="context",
+                                        corrected_value=corrected_context,
+                                        clinical_evidence=audit_result.get("reason", "Heterogeneous audit verdict"),
+                                        confidence_score=confidence,
+                                        original_value=conflict_original,
+                                        verdict="RAG_ERROR"
+                                    )
+                                    
+                                    patch_manager = DBHotpatchManager(db_path)
+                                    applied = patch_manager.execute_patch(proposal)
+                                    
+                                    if applied:
+                                        # 热修复成功，清除 RAG 内存缓存，并同步更新当前在内存里的引用以立即纠错重试
+                                        LocalRAGService.clear_all_caches()
+                                        
+                                        # 内存中更新当前正在使用的 refs，从而让下一次尝试加载对齐后的正确 RAG 段落
+                                        for r in active_refs:
+                                            if isinstance(r, dict) and r.get("context") == db_context:
+                                                r["context"] = corrected_context
+                                        for r in (refs or []):
+                                            if isinstance(r, dict) and r.get("context") == db_context:
+                                                r["context"] = corrected_context
+                                                
+                                        # 重新生成 anchors_prompt
+                                        anchors = []
+                                        for idx, r in enumerate(active_refs, start=1):
+                                            if isinstance(r, dict):
+                                                ctx = r.get("context", "")
+                                                if ctx:
+                                                    clean_ctx = ctx.replace("【互联网权威医疗站快讯】:", "").replace("【互联网权威医疗数据通报】:", "").strip()
+                                                    anchors.append(f"- [文献_{idx:02d}] {clean_ctx}")
+                                        if anchors:
+                                            anchors_text = "\n".join(anchors)
+                                            anchors_prompt = f"""
+
+### 确证医学文献事实与临床研究数据 (Confirmed Clinical & Literature Facts):
+{anchors_text}
+【⚠️ 确证事实对齐】：请注意，以上数据为临床确证事实，你的药理因因因果推演必须与之完全吻合，绝对禁止对其中任何药理关系、不良反应或用药禁忌进行任何否定、篡改或凭空编造！"""
+                                        else:
+                                            anchors_prompt = ""
+                                            
+                                        logger.info("🎉 Hotpatched local database and synchronized active references in memory. Forcing self-healing retry.")
+                                    else:
+                                        logger.warning("🚫 Audit failed safety gates or blocked as PENDING_APPROVAL. No database change applied.")
+                                        scores["is_passed"] = False
+                                        scores["requires_human_review"] = True
+                            else:
+                                logger.error("❌ Could not match RAG evidence to database record for patching.")
+                                scores["is_passed"] = False
+                                scores["requires_human_review"] = True
+                        else:
+                            logger.warning(f"🚫 Stage-2 Audit verdict '{verdict}' is not RAG_ERROR. Blocked DB writing.")
+                            scores["is_passed"] = False
+                            scores["requires_human_review"] = True
+                    except Exception as audit_ex:
+                        logger.error(f"⚠️ Exception during FactAuditingGateway workflow: {audit_ex}")
+
                 last_scores = scores
                 
                 p_score = purifier_module.safe_int(scores.get("semantic_purity_score", 90))
@@ -288,6 +463,10 @@ CRITICAL factual boundary: never invent or preserve unsupported official standar
                         feedback_msg += "\n【核心优化指令：你的前一次写入在“逻辑深度”上不符合规范，请避免平铺直叙，融入探究反思。】"
                     if reason and reason != "No explanation provided" and not factual_errors:
                         feedback_msg += f"\n【质检审查裁判的具体评审意见：{reason}】"
+                    
+                    suggestions = scores.get("improvement_suggestions", "")
+                    if suggestions and suggestions != "No suggestions provided":
+                        feedback_msg += f"\n【质检审查裁判给出的具体改进建议：{suggestions}】"
                     
                     feedback_msg = feedback_msg.replace('[', '【').replace(']', '】')
                     feedback_prompt = feedback_msg

@@ -31,8 +31,8 @@
 第一阶段的核心目标是：从医学图谱与文献中，基于 Agent 仿真技术，自动合成为一个具有多分析切面（如药理、用药禁忌、不良反应等）、带有探索性 `<think>` 推理过程的高质量多轮问答数据集。
 
 ### 2.1 核心主线数据流
-1. **主控运行**：由运行脚本或 [main.py](file:///d:/REN/qa/main.py) 触发，实例化服务并拉起主工作流。
-2. **工作流调度**：由 [PipelineWorkflow](file:///d:/REN/qa/core/pipeline_workflow.py#L90) 类作为核心编排器，通过 [generate_single_round](file:///d:/REN/qa/core/pipeline_workflow.py#L745) 执行单轮问答生成循环，并使用 [generate_multi_round_dataset](file:///d:/REN/qa/core/pipeline_workflow.py#L800) 控制多轮会话的进化状态。
+1. **主控运行与接口代理**：由运行脚本或 [main.py](file:///d:/REN/qa/main.py) 触发，实例化后向兼容的 Proxy 代理类 [MedicalQAPipeline](file:///d:/REN/qa/pipeline.py#L69)。代理类在初始化时拉起核心工作流并注入依赖。
+2. **工作流调度**：通过代理类将方法调用路由至 [PipelineWorkflow](file:///d:/REN/qa/core/pipeline_workflow.py#L90) 类这一核心编排器，通过 [generate_single_round](file:///d:/REN/qa/core/pipeline_workflow.py#L745) 执行单轮问答生成循环，并使用 [generate_multi_round_dataset](file:///d:/REN/qa/core/pipeline_workflow.py#L800) 控制多轮会话的进化状态。
 
 ---
 
@@ -72,6 +72,15 @@
   * 调用高级大模型（model_pool = `"premium"`），强制大模型按照 `FacetQAOutput` 强类型 schema 输出包含 evidences、reasoning_chains、answer_body 的回答。
   * **质量防卫线**：调用 `strategies/quality_gate/answer_guard.py` 的 `check_answer_quality` 检查输出质量，不合格则打回并重试。若重复失败则启动普通文本 + 推理心流（call_llm_with_reasoning）的降级容错方案。
 
+#### 第五步半：视角冗余度检测与去重过滤 (Redundancy Filter)
+* **核心类/方法**：
+  * 冗余过滤调度：在 [PipelineWorkflow.generate_single_round](file:///d:/REN/qa/core/pipeline_workflow.py#L780) 中调用冗余过滤器。
+  * 冗余过滤策略：[LLMRedundancyFilterStrategy.filter_redundancy](file:///d:/REN/qa/strategies/redundancy_filter/llm_filter.py#L20)
+* **枝叶流转**：
+  * 并发切面回答生成后，将其送入策略去重过滤器。
+  * 过滤器调用轻量级大模型（model_pool = `"lightweight"`），利用 `FACET_REDUNDANCY_DETECTOR_TEMPLATE` 指引模型识别内容重复或过度重叠的切面，并输出需要剔除的视角索引。
+  * 最终仅保留非冗余的切面回答，传送至下一步进行综合总结。
+
 #### 第六步：综合总结与多轮进化
 * **核心方法**：[PipelineWorkflow.synthesize_answers](file:///d:/REN/qa/core/pipeline_workflow.py#L692) 总结；[PipelineWorkflow.generate_next_question](file:///d:/REN/qa/core/pipeline_workflow.py#L720) 下一轮生成。
 * **枝叶流转**：
@@ -104,8 +113,8 @@
 
 #### 第二步：回答正文重写 (Answer Body Rewriter)与防抖纠偏
 * **核心方法**：
-  * 重写方法：[rewrite_answer_body](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L278)
-  * 硬性除噪：[scrub_engineering_leakage](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L207) 和 [scrub_unsupported_official_identifiers](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L244)
+  * 重写方法：[rewrite_answer_body](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L279)
+  * 硬性除噪：[scrub_engineering_leakage](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L208) 和 [scrub_unsupported_official_identifiers](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L245)
 * **枝叶流转**：
   * 先调用轻量大模型将原始 Answer Body 缩窄，剔除偏离主线的病生理推演。
   * 利用 `scrub_engineering_leakage` 强制正则过滤显式工程字眼。
@@ -134,7 +143,9 @@
   * 依据三方裁判细则，若新增事实能被事实包支持，则判定为合规对齐并奖励分数；若不被支持，一票否决扣至 50 分以下，将打分打回并进入重试循环（Feedback Loop）。
 
 #### 第六步：局部事务管理与并发写写回机制 (Transaction Manager)
-* **核心控制流**：在 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L805) 的主流程控制分支。
+* **核心控制流**：
+  * 事务局部状态决策：在 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L806) 的局部事务控制分支。
+  * 安全并发合并写回：在 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L969-L981) 处执行并发合并冲突防御。
 * **枝叶流转**：
   * 判定 `line_status` 与 `planner_status`，某一切面失败不连坐整行，成功切面可作为 `partial_success` 局部持久化，失败切面隔离到 `purification_failures.jsonl` 中。
   * **Lost Update 并发保护**：在最终写入磁盘前，再次读取一次最新的数据集，与在提纯期间追加的语料行执行安全合并写回，防止并发覆盖。

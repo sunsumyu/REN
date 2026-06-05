@@ -813,6 +813,7 @@ class PipelineWorkflow:
         # 1. 获取随机知识图谱数据
         try:
             graph_data = await self.graph_service.fetch_random_knowledge_graph(count=1)
+            logger.info(f"{log_prefix}AAA Fetched KG graph_data: {json.dumps(graph_data, ensure_ascii=False)}")
         except Exception as e:
             logger.critical(f"{log_prefix}Failed to fetch random KG: {e}")
             graph_data = {"entities": [], "relationships": []}
@@ -856,6 +857,7 @@ class PipelineWorkflow:
         
         # 3. 准备上下文和参考引用，生成初始问题
         context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
+        logger.debug(f"{log_prefix}AAABPrepared context_list: {len(context_list)} items, refs: {len(refs)} items")
         q1 = await self.generate_initial_question(context_list, task_id_label=task_id_label)
         
         history = []
