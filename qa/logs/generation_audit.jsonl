@@ -873,3 +873,5 @@
 {"stage": "facet_planning", "status": "success", "task_id": "Task-1", "query": "止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？", "attempt": 1, "facets": ["解热机制", "儿童适用性"], "time": "2026-06-06T15:31:13"}
 {"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？", "log": "Pruned facet '解热机制' due to incompatibility with Q: '止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？'", "time": "2026-06-06T15:31:37"}
 {"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？", "log": "Redirected simple Q: '止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？' with facet '儿童适用性' -> '禁忌人群' (COMPATIBLE_SIMPLE)", "time": "2026-06-06T15:31:37"}
+{"stage": "facet_planning", "status": "success", "task_id": "Task-1", "query": "牛黄至宝丸适用于哪些症状？", "attempt": 1, "facets": ["药物成分", "适应症"], "time": "2026-06-06T17:44:33"}
+{"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "牛黄至宝丸适用于哪些症状？", "log": "Repaired facet '药物成分' -> '适应症' for Q: '牛黄至宝丸适用于哪些症状？'", "time": "2026-06-06T17:44:49"}

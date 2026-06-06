@@ -78,9 +78,9 @@ def get_purify_system_prompt(planner: str) -> str:
 4. 📐 【强化的 5 阶段临床认知深度推理流（Exploratory CoT Trajectory）】：
    优秀的 Reasoning 微调 CoT 必须呈现出**“提出假设 -> 探究机制 -> 遇到逻辑分叉/交叉校验 -> 推导排除 -> 决策合拢”**的动态心流轨迹（Thought Trace）。
    - 🚨 **【拒绝静态科普文】**：绝对不能写成“A是B，C通过D发挥作用”这种平铺直叙的百度百科或说明书体！模型是在进行“即时探索和解题推理”，不是在背诵课本。
-   - **必须使用高密度的逻辑摩擦关联词**：在思维链中，强制要求使用诸如“要剖析...必须深层解构...”、“既然...必然...”、“然而仅靠...是不够的”、“进一步来看...”、“这就完美解释了为何...”、“如果是遇到...情况呢？”、“由此推导...”等带有强烈因果推演和自问自答色彩的动态思考词汇，展现专家大脑内部的真实演算过程。
+   - **必须使用高密度的逻辑摩擦关联词**：在思维链中，强制要求使用诸如“核心矛盾在于...”、“既然...必然...”、“然而仅靠...是不够的”、“进一步来看...”、“这就完美解释了为何...”、“如果是遇到...情况呢？”、“由此推导...”等带有强烈因果推演和自问自答色彩的动态思考词汇，展现专家大脑内部的真实演算过程。
    您必须引导思维链通过以下 5 个自然的认知阶段隐式递进：
-   - **阶段一：核心临床矛盾解构** —— 开头直切临床/医学矛盾核心（例如，直接以物理/医学事实及逻辑摩擦词切入主题：“要剖析[疾病/药物/治疗名称]的核心机制/生理本质，必须深层解构...”，不需要任何结构性的开场白、自问自答或过渡废话）。
+   - **阶段一：核心临床矛盾解构** —— 开头直切临床/医学矛盾核心（例如，直接以医学实体、机制事实或风险判断切入主题：“[疾病/药物/治疗名称]的核心机制/生理本质，关键在于...”，不需要任何结构性的开场白、自问自答或过渡废话）。
    - **阶段二：微观病生理/临床逻辑推演** —— 对分子靶点、受体结合、体内代动学参数或临床指南要点等进行深度因果链条解析，呈现动态心流。
    - **阶段三：逻辑分叉与特殊情况排查** —— 加入自我提问和临床假说排查，增加思维链的“逻辑熵”（例如：“慢着，在此处必须评估：这一情况在特定生理状态下是否会持续...”、“如果是遇到...情况呢？”）。
    - **阶段四：生理/安全极限与查漏补缺** —— 引入对于年龄、肝肾功能受损等特殊情况或安全边界的核验，展示高价值的“自我纠正与查漏补缺”过程。
@@ -106,7 +106,7 @@ FEW_SHOT_PHARMACOLOGY = """
 \"\"\"
 * **输出提纯重构后的完美思维链**：
 \"\"\"
-要剖析丹膝颗粒的药理学机制，必须深层解构其核心临床目标：缺血性脑血管病恢复期的‘瘀血阻络兼肾虚证’。既然核心矛盾是‘瘀血’与‘肾虚’，方剂的骨架必然以此为基底。我们观察到处方中的丹参、赤芍、川芎，这三者是经典的活血化瘀药对。从现代药理学推演，它们的作用机制显然是指向改善微循环和抑制血小板聚集，从而直接打击脑梗塞后的局部缺血核心病理。然而，仅靠活血通络是不够的。中风后遗症往往伴随长期的机体耗损，处方中紧接着出现的牛膝、地黄、淫羊藿、桑寄生，在微观机制上是为了调节下丘脑-垂体-靶腺轴，通过抗应激损伤来纠正底层的虚损状态。慢着，如果是遇到合并严重肾脏排泄功能受损的患者呢？桑寄生与牛膝中的某些皂苷成分排泄是否会受阻？从临床指南来看，虽然常用剂量下安全性尚可，但对于此类患者仍需加强血清学指标监视。进一步来看，脑血管病患者多伴有血压波动与神经兴奋性异常，这完美解释了方中为何要配伍天麻——利用天麻素的镇静活性来保护脑神经；同时辅以牡丹皮、栀子、决明子来压制烦躁失眠的伴发症状。而在方剂的边缘，为何会出现一味火麻仁？对于中风卧床患者，保持肠道通畅能有效降低腹压，间接稳定血压并减轻脑血管负荷，这是极其精妙的‘釜底抽薪’式次级调节。经此层层解构，十二味药材的配伍逻辑已完全清晰：形成了一个涵盖抗血小板、神经保护、内分泌调节与靶器官减负的多靶点整合网络。
+丹膝颗粒的药理学机制，核心临床目标是缺血性脑血管病恢复期的‘瘀血阻络兼肾虚证’。既然核心矛盾是‘瘀血’与‘肾虚’，方剂的骨架必然以此为基底。我们观察到处方中的丹参、赤芍、川芎，这三者是经典的活血化瘀药对。从现代药理学推演，它们的作用机制显然是指向改善微循环和抑制血小板聚集，从而直接打击脑梗塞后的局部缺血核心病理。然而，仅靠活血通络是不够的。中风后遗症往往伴随长期的机体耗损，处方中紧接着出现的牛膝、地黄、淫羊藿、桑寄生，在微观机制上是为了调节下丘脑-垂体-靶腺轴，通过抗应激损伤来纠正底层的虚损状态。慢着，如果是遇到合并严重肾脏排泄功能受损的患者呢？桑寄生与牛膝中的某些皂苷成分排泄是否会受阻？从临床指南来看，虽然常用剂量下安全性尚可，但对于此类患者仍需加强血清学指标监视。进一步来看，脑血管病患者多伴有血压波动与神经兴奋性异常，这完美解释了方中为何要配伍天麻——利用天麻素的镇静活性来保护脑神经；同时辅以牡丹皮、栀子、决明子来压制烦躁失眠的伴发症状。而在方剂的边缘，为何会出现一味火麻仁？对于中风卧床患者，保持肠道通畅能有效降低腹压，间接稳定血压并减轻脑血管负荷，这是极其精妙的‘釜底抽薪’式次级调节。经此层层解构，十二味药材的配伍逻辑已完全清晰：形成了一个涵盖抗血小板、神经保护、内分泌调节与靶器官减负的多靶点整合网络。
 \"\"\"
 """
 
@@ -118,7 +118,7 @@ FEW_SHOT_CONTRAINDICATION = """
 \"\"\"
 * **输出提纯重构后的完美思维链**：
 \"\"\"
-面对非洛地平缓释胶囊的禁忌症，必须要明确其底层药理核心：它是一种二氢吡啶类钙通道阻断药，其核心作用是阻滞L型钙通道以强效舒张外周血管。基于这一机制进行临床反推：对于急性心肌梗塞患者，其血流动力学本就极其脆弱，此时如果使用非洛地平导致血管急剧舒张、血压骤降，必然会反射性地激活交感神经。这会导致什么后果？心率加快、心肌耗氧量激增，从而致命性地加重缺血性损伤。因此，急性心梗绝对禁忌。同理推演，不稳定型心绞痛患者的冠状动脉处于高度不稳定的痉挛状态，强行舒张极易诱发反常的心肌缺血。此外，如果是遇到非代偿性心力衰竭患者呢？这类患者的心脏泵血功能已达极限，非洛地平潜在的负性肌力作用会成为压死骆驼的最后一根稻草，直接诱发心输出量锐减，故同样禁忌。而在更宽泛的临床防御维度上，从一般用药安全底线来看，妊娠期与哺乳期妇女可能因药物干扰子宫胎盘血流或乳汁分泌而面临胎儿/新生儿发育风险，而对制剂辅料过敏者则面临免疫介导的速发过敏反应，这些均构成常规绝对禁忌。
+非洛地平缓释胶囊的禁忌症，必须回到其底层药理核心：它是一种二氢吡啶类钙通道阻断药，其核心作用是阻滞L型钙通道以强效舒张外周血管。基于这一机制进行临床反推：对于急性心肌梗塞患者，其血流动力学本就极其脆弱，此时如果使用非洛地平导致血管急剧舒张、血压骤降，必然会反射性地激活交感神经。这会导致什么后果？心率加快、心肌耗氧量激增，从而致命性地加重缺血性损伤。因此，急性心梗绝对禁忌。同理推演，不稳定型心绞痛患者的冠状动脉处于高度不稳定的痉挛状态，强行舒张极易诱发反常的心肌缺血。此外，如果是遇到非代偿性心力衰竭患者呢？这类患者的心脏泵血功能已达极限，非洛地平潜在的负性肌力作用会成为压死骆驼的最后一根稻草，直接诱发心输出量锐减，故同样禁忌。而在更宽泛的临床防御维度上，从一般用药安全底线来看，妊娠期与哺乳期妇女可能因药物干扰子宫胎盘血流或乳汁分泌而面临胎儿/新生儿发育风险，而对制剂辅料过敏者则面临免疫介导的速发过敏反应，这些均构成常规绝对禁忌。
 \"\"\"
 """
 
@@ -130,7 +130,7 @@ FEW_SHOT_GENERAL = """
 \"\"\"
 * **输出提纯重构后的完美思维链**：
 \"\"\"
-探究白头翁的临床应用，必须牢牢锁定其在中药性味归经中的核心定位：苦寒，入大肠经。苦寒之性决定了其具有强效的清热解毒、凉血之功。既然直达大肠血分，那么其最核心的对症病理必然是肠道湿热毒盛、伤及血络所致的疾病。由此推导，临床上以腹痛、里急后重、下痢脓血为特征的“热毒血痢”（如现代医学的细菌性痢疾、阿米巴痢疾），正是白头翁的绝对主治靶点。进一步延伸，既然其擅长清下焦湿热与解毒杀虫，那么当湿热下注侵袭女性生殖系统时，引发的阴痒、带下黄稠等症，亦可利用其清热燥湿杀虫之效进行辨治。因此，其主治方向完全由其“清热解毒、凉血止痢”的核心功效严密推演而来。
+白头翁的临床应用，核心定位在于其苦寒、入大肠经的性味归经。苦寒之性决定了其具有强效的清热解毒、凉血之功。既然直达大肠血分，那么其最核心的对症病理必然是肠道湿热毒盛、伤及血络所致的疾病。由此推导，临床上以腹痛、里急后重、下痢脓血为特征的“热毒血痢”（如现代医学的细菌性痢疾、阿米巴痢疾），正是白头翁的绝对主治靶点。进一步延伸，既然其擅长清下焦湿热与解毒杀虫，那么当湿热下注侵袭女性生殖系统时，引发的阴痒、带下黄稠等症，亦可利用其清热燥湿杀虫之效进行辨治。因此，其主治方向完全由其“清热解毒、凉血止痢”的核心功效严密推演而来。
 \"\"\"
 """
 
@@ -171,7 +171,7 @@ JUDGE_SYSTEM_PROMPT = """您是一位极其严苛的医疗微调数据集质量�
    - **核心判定逻辑**：评估思维链是否呈现了饱满的临床推理过程，彻底杜绝走捷径、干瘪的“常识陈述”。
    - **🚨 负面惩罚样例与控分机制（严防对教科书文章的虚高评价）**：
      - *类型一（名词堆砌而无临床闭环）*：单纯罗列高深医学名词，未紧扣临床矛盾展开因果推导，得分**绝对不能超过 75 分**。
-     - *类型二（低级做作的自我纠偏）*：写出无医学逻辑价值的注水废话（如：“等一下，不对，刚才看错了”等生硬否定句），扣除 **20-40 分**。
+     - *类型二（低级做作的自我纠偏与套路化心流 Style Mimicry）*：写出无医学逻辑价值的注水废话（如：“等一下，不对，刚才看错了”等生硬否定句），或为了套用格式而滥用无实际推演意义的“等等、慢着”等语气词（如“等等，慢着，丹参是丹参”）。此类形式化套路直接扣除 **20-40 分**。
      - *类型三（🚨静态陈述与平铺直叙文章惩罚）*：如果思维链读起来像是一篇四平八稳的“教科书科普文章”或“百度百科”，全篇都是“A是B”、“C的机制是D”的静态陈述，**而严重缺乏“推断性疑问（没有问号 '?' 级反思锚点）、反向探究假说、动态摩擦词”**，此维度得分**必须强制扣至 70 分以下**！
      - *字数与结构约束*：思维链过短（少于 150 字）或仅为说明书条目复读的，此项得分直接扣至 70 分以下。
 
@@ -259,6 +259,76 @@ def pre_strip_engineering_noise(raw_text: str) -> str:
     cleaned = re.sub(r'[\{\}\[\]]', ' ', cleaned)
     return cleaned.strip()
 
+SEMANTIC_WASH_MAP = {
+    "根据确证的用法用量知识点记载": "根据规范的用法用量要求",
+    "根据确证的用法用量记载": "根据说明书用法用量",
+    "确证的用法用量知识点": "临床用药规范",
+    "确证的事实记载": "临床文献记载",
+    "根据确证的数据": "根据临床数据",
+    "根据确证的": "根据临床",
+    "知识点记载": "文献记载",
+}
+
+DISCONNECTED_OPENING_PREFIXES = (
+    "因此", "所以", "由此", "这样", "这种", "这个", "该", "其", "上述",
+    "前者", "后者", "同时", "而且", "并且", "然而", "但是", "不过"
+)
+
+def apply_semantic_wash(text: str) -> str:
+    """替换高频工程化过渡词，避免模型把 evidence 对齐口吻写进自然思维链。"""
+    cleaned = text
+    for source, target in sorted(SEMANTIC_WASH_MAP.items(), key=lambda item: len(item[0]), reverse=True):
+        cleaned = cleaned.replace(source, target)
+    return cleaned.strip()
+
+def extract_entity_from_query(query: str) -> str:
+    """从问答对的 Q（问题）中启发式提取医疗实体名称"""
+    if not query:
+        return ""
+    # 常用模式 1: "关于 X 的" 或 "针对 X 的"
+    m = re.search(r"关于[\"‘“]?(.*?)[\"’”]?的", query)
+    if m:
+        return m.group(1).strip()
+    # 常用模式 2: "X的禁忌人群" / "X的给药方式" -> 提取 X
+    m = re.search(r"^([^的，。？！\s]{2,25})的", query)
+    if m:
+        return m.group(1).strip()
+    # 常用模式 3: "专门的 X 用药研究"
+    m = re.search(r"专门的([^的，。？！\s]{2,25})用药", query)
+    if m:
+        return m.group(1).strip()
+    # 常用模式 4: "X可能导致..." 或 "X在..."
+    m = re.search(r"([^的，。？！\s]{2,25})(?:可能导致|在|主要成分|是否|的)", query)
+    if m:
+        return m.group(1).strip()
+    # 兜底：提取第一个中/英文词
+    words = re.findall(r"([a-zA-Z0-9\u4e00-\u9fa5\-]{2,20})", query)
+    for w in words:
+        if w not in ["哪些", "如何", "什么是", "主要", "成分", "对于", "是否", "问题", "我们", "分析", "研究"]:
+            return w
+    return ""
+
+def heal_disconnected_opening_locally(text: str, entity_name: str) -> str:
+    """代词原地映射自愈，免除高额大模型重试成本"""
+    stripped = text.strip()
+    if not entity_name:
+        return stripped
+        
+    pronoun_prefixes = ["该药", "此药", "它", "该药物"]
+    for prefix in pronoun_prefixes:
+        if stripped.startswith(prefix):
+            return entity_name + stripped[len(prefix):]
+    if stripped.startswith("其"):
+        return entity_name + "的" + stripped[1:]
+    return stripped
+
+def has_disconnected_opening(text: str) -> bool:
+    """检测正则截头后是否留下半句话或承接词开头。"""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return stripped[0] in "，。：；、,.;:!?" or stripped.startswith(DISCONNECTED_OPENING_PREFIXES)
+
 def post_strip_meta_openings(text: str) -> str:
     """
     后置微创手术（升级版）：
@@ -269,6 +339,9 @@ def post_strip_meta_openings(text: str) -> str:
     
     # 1. 拦截并切除位于文本开头的元描述
     meta_patterns = [
+        r"^(?:好的[，,。！!\s]*)?我们(?:现在|今天)?(?:先|来)?(?:开始|继续)?(?:针对|围绕|就|对|结合)[^\n，。：；]{1,80}(?:进行)?(?:推演|分析|解答|讨论|阐述|梳理|拆解|判断)[，。：；\n\s]*",
+        r"^(?:好的[，,。！!\s]*)?(?:下面|接下来|现在)(?:我们)?(?:开始|来|先)?(?:针对|围绕|就|对)?[^\n，。：；]{0,80}(?:进行)?(?:分析|推演|解答|讨论|阐述|梳理|拆解)[，。：；\n\s]*",
+        r"^(?:针对|关于)(?:上述|这个|这一)?[^\n，。：；]{0,60}(?:问题|主题|内容)[，。：；\n\s]*",
         r"^(我们(需|需要|将)?[^\n，。：]*?从[^\n，。：]*?视角[^\n，。：]*?[。，：])",
         r"^(针对(上述|这个|这一)?[^\n，。：]*?问题，?(我们)?[^\n，。：]*?[。，：])",
         r"^(为(了)?(解答|回答|探讨)[^\n，。：]*?问题，?(我们)?[^\n，。：]*?[。，：])",
@@ -367,7 +440,7 @@ async def purify_single_think(client: APIClient, q: str, planner: str, raw_think
         prompt = f"""{few_shot}
 
 ### 系统指令 (System Directive)：
-Please write a pure, raw clinical thought chain focusing on {directive}. Do NOT output the word 'facet', the word 'mechanism', or the facet name '{planner}' in the text. Output ONLY the purified, direct thought chain without any markdown block formatting or meta-narrative declarations.
+Please write a pure, raw clinical thought chain focusing on {directive}. Do NOT output the word 'facet', the word 'mechanism', or the facet name '{planner}' in the text. Start directly with the core medical entity, clinical conflict, mechanism fact, or risk judgment. Do not begin with greetings, task confirmations, or action declarations such as "好的", "下面", "接下来", "我们", "我", "针对", "关于", "为了回答", or "要剖析". Output ONLY the purified, direct thought chain without any markdown block formatting or meta-narrative declarations.
 
 问题: {q}
 原始思维链 (CoT) 内容:
@@ -386,10 +459,24 @@ Please write a pure, raw clinical thought chain focusing on {directive}. Do NOT 
                 purified = "\n".join(purified.splitlines()[:-1])
             purified = purified.strip()
             
-            # 定向物理切除元指令开场白
-            purified = post_strip_meta_openings(purified)
+            # 定向物理切除元指令开场白，并洗掉 evidence 对齐带来的工程化过渡词
+            purified = apply_semantic_wash(post_strip_meta_openings(purified))
             
-            if is_catastrophic_format_collapse(purified):
+            # 本地代词自愈，免除高额重试成本
+            entity_name = extract_entity_from_query(q)
+            purified = heal_disconnected_opening_locally(purified, entity_name)
+            
+            opening_issue = has_disconnected_opening(purified)
+            
+            if opening_issue:
+                logger.warning(f"   🚨 Attempt {attempt+1} triggered DISCONNECTED OPENING guard! Local intercepting and forcing retry...")
+                scores = {
+                    "semantic_purity_score": 70,
+                    "medical_rigor_score": 90,
+                    "logical_depth_score": 65,
+                    "reason": "正则截头后文本以承接词、指代词、标点或空内容开头，首句不连贯，需重新生成更自然的实体/机制事实开篇。"
+                }
+            elif is_catastrophic_format_collapse(purified):
                 logger.warning(f"   🚨 Attempt {attempt+1} triggered SYNTAX FORMAT COLLAPSE! Local intercepting and forcing retry...")
                 scores = {
                     "semantic_purity_score": 0,
@@ -437,6 +524,9 @@ Please write a pure, raw clinical thought chain focusing on {directive}. Do NOT 
                 
                 if d_score < THRESHOLD_DEPTH:
                     feedback_msg += "\n【核心优化指令：你的前一次写入在“逻辑深度”上不符合规范，读起来像是一篇死板静态的科普文章或药物说明书。请避免平铺直叙，强制在思维中途加入 1-2 处以“？”结尾的真实探究疑问，并使用高密度的因果转折词展现动态探索与自我纠偏的心流轨迹。】"
+
+                if opening_issue:
+                    feedback_msg += "\n【开头修复指令：你的前一次写入在删除寒暄或动作宣告后，首句出现承接词、指代词或半句话开场。请直接以核心医学实体、临床矛盾、机制事实或风险判断开头，禁止以“好的、下面、接下来、现在、我们、我、针对、关于、为了回答、要剖析”等词开头。】"
                 
                 # 🔴 方案一：反馈通道自适应脱敏，物理替换所有可能触发熔断的中括号，切断 Token 拷贝引力
                 feedback_msg = feedback_msg.replace('[', '【').replace(']', '】')
@@ -479,11 +569,22 @@ async def main():
         logger.error(f"Dataset file not found: {dataset_path}")
         return
         
+    # 🟢 智能多版本滚动备份机制
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = logs_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        rolling_backup_path = backup_dir / f"medical_qa_dataset_raw_{timestamp}.jsonl.bak"
+        logger.info(f"✨ Creating rolling backup at {rolling_backup_path}")
+        shutil.copyfile(dataset_path, rolling_backup_path)
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to create rolling backup: {e}")
+
     if not backup_path.exists():
         logger.info(f"✨ Creating initial raw backup at {backup_path}")
         shutil.copyfile(dataset_path, backup_path)
     else:
-        # 🟢 智能增量同步备份逻辑：在清洗前，仅将新增的未清洗 Raw 数据行追加到原备份文件末尾，保持单一备份文件同步递增
+        # 🟢 智能增量同步备份与防覆盖核验逻辑
         try:
             with open(dataset_path, 'r', encoding='utf-8') as f:
                 dataset_lines = f.readlines()

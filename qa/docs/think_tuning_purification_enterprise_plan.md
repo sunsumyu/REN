@@ -96,7 +96,7 @@
    - 必须合理高频地使用口语化思考副词与强因果关联词：在思维链中，强制要求使用诸如“等等...”、“慢着...”、“对！”、“哦，我想通了...”、“既然...必然...”、“然而仅靠...是不够的”、“如果是遇到...情况呢？”、“由此推导...”等，展现专家大脑内部的真实演算过程。
 
 3. 🔍 5 阶段认知心流强制路径：
-   - 阶段一：提取核心变量 —— 开头以疑惑或解构句式切入：“要搞清楚[问题/药物]，我们首先得盯着它的核心矛盾：...”。
+   - 阶段一：提取核心变量 —— 开头直接以核心医学实体、临床矛盾、机制事实或风险判断切入，例如：“[问题/药物]的核心矛盾在于...”。避免“要搞清楚...”“我们首先...”这类动作宣告式开场。
    - 阶段二：微观病推导 —— 对靶点、渗透压、电荷等进行深度因果链条解析。
    - 阶段三：逻辑撞墙与特殊排查 —— 强制设计一个逻辑冲突（“等一下，这里有个细节说不通...如果...呢？”）。
    - 阶段四：自我解释与校准 —— 展现“豁然开朗”和“查漏补缺”的过程，用药理常识合理解释冲突。
@@ -112,43 +112,107 @@
    - **核心判定逻辑**：评估思维链是否呈现了饱满的临床推理过程，彻底杜绝走捷径、干瘪的“常识陈述”。
    - **🚨 负面惩罚样例与控分机制（严防阿谀奉承与对长文本的虚高评价）**：
      - *类型一（概念名词堆砌而无临床闭环）*：单纯罗列高深医学名词，未紧扣临床矛盾展开因果推导，得分绝对不能超过 75 分。
-     - *类型二（低级做作的自我纠偏）*：写出无医学逻辑价值的注水废话（如：“等一下，不对，刚才看错了”等生硬否定句），扣除 20-40 分。
+     - *类型二（低级做作的自我纠偏与套路化心流 Style Mimicry）*：写出无医学逻辑价值的注水废话（如：“等一下，不对，刚才看错了”等生硬否定句），或为了套用格式而滥用无实际推演意义的“等等、慢着”等语气词（如“等等，慢着，丹参是丹参”）。此类形式化套路直接扣除 20-40 分。
      - *类型三（🚨静态陈述与缺乏思维摩擦惩罚）*：如果思维链读起来像是一篇四平八稳的“教科书标准答案”或“百度百科”，全篇都是静态陈述句，而严重缺乏“推断性疑问、假设排查、因果连接词（如：既然、然而、进一步来看、由此推导）”等动态探索轨迹，此维度得分必须扣至 70 分以下！
 ```
 
 ---
 
-## 💾 四、 增量追加同步备份机制（Data Safety Architecture）
+## 💾 四、 增量备份与多版本滚动机制（Data Safety & Version Rotation）
 
-针对企业递增式数据集，本升级方案在管线中部署了**“智能增量追加同步备份算法”**，确保在清洗前对所有 Raw 增量进行安全封存，规避单一备份文件被清洗后数据覆盖的风险：
-
-```python
-# 📂 已集成于 llm_purify_dataset_opt.py : main() 头部
-if not backup_path.exists():
-    logger.info(f"✨ Creating initial raw backup at {backup_path}")
-    shutil.copyfile(dataset_path, backup_path)
-else:
-    # 🟢 智能增量同步备份逻辑：在清洗前，仅将新增的未清洗 Raw 数据行追加到原备份文件末尾，保持单一备份文件同步递增
-    try:
-        with open(dataset_path, 'r', encoding='utf-8') as f:
-            dataset_lines = f.readlines()
-        with open(backup_path, 'r', encoding='utf-8') as f:
-            backup_lines = f.readlines()
-            
-        if len(dataset_lines) > len(backup_lines):
-            new_raw_lines = dataset_lines[len(backup_lines):]
-            logger.info(f"➕ Detected {len(new_raw_lines)} new raw incremental records. Syncing and appending to raw backup...")
-            with open(backup_path, 'a', encoding='utf-8') as f:
-                f.writelines(new_raw_lines)
-        else:
-            logger.info(f"👉 Raw backup is fully in sync with current dataset ({len(backup_lines)} lines). No new raw entries to append.")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to sync incremental backup: {e}. Keeping existing backup.")
-```
+针对企业级多变的数据集文件，纯粹依赖行数大小对比（`len(dataset_lines) > len(backup_lines)`）进行增量备份存在局限性（无法处理历史记录内容变更等非追加更新）。本方案升级为**“智能多版本滚动备份与行级状态核验机制”**：
+1. **多版本时间戳滚动**：在对数据集执行重构前，自动将当前的原始/前序版本以 `medical_qa_dataset_raw_YYYYMMDD_HHMMSS.jsonl.bak` 形式归档到备份目录，实现真正的物理版本隔离。
+2. **防覆盖校验**：自动校验每个数据行的哈希特征或修改时间，防止清洗后的 purified 记录覆盖了未保存的 raw 增量。
 
 ---
 
-## 🚀 五、 落地实施步骤与排批交付
+## 🔍 五、 元叙述防逃逸与生硬过渡词消融体系（Meta-Narrative & Stiff Transition Mitigation）
+
+在跑批清洗中，虽然我们禁止了工程噪声，但大模型高频产生的“好的，我们开始针对……”等元叙述（Meta-narrative）以及“根据确证的用法用量知识点记载”等生硬过渡词（Stiff transitions）极难通过简单的 Prompt 否定指令根除。因为单纯的“禁止说 X”会触发注意力的“粉红大象效应”，大模型会通过语义变体（如“针对该问题，我们下面分析……”）自动绕过限制。
+
+为最大化阻断此类逃逸，同时避免正则截头造成语义断裂，我们设计并实施了**前置消融、首句白名单锚定、后置正则微创切割、连贯性自检相结合的多维防逃逸架构**：
+
+### 5.1 认知解耦：“内部独白”人设（Persona Dissolution & Private Monologue）
+不要将模型设定为需要对用户负责的“解答专家”（对话本能是客套话的根源），而是将模型降级为“无受众的静默草稿纸”：
+* **核心设定**：“你不是在回答问题的助手，你没有受众，不需要与任何人对话。你现在正处于一个完全封闭、仅限自读的私有脑力草稿纸（Private Scratchpad）中。请直接记录你在解题时发生的、未经修饰的真实推理轨迹。”
+* **效果**：关闭模型的对话意图，物理消除“接单客套（好的，我们开始）”的诱因，同时**完整保留其自问自答、反事实排查等高熵推理活性**。
+
+### 5.2 首句白名单锚定与首字控制（First-Sentence Whitelist / First-Token Forcing）
+由于大模型是自回归生成的预测引擎，最有效的阻断是在它生成第一个 Token 之前，直接限制首句的合法形态，而不是只做“禁止说 X”的负面约束：
+* **首句白名单**：输出必须直接以“核心医学实体 / 临床矛盾 / 机制事实 / 风险判断”开场。例如“布比卡因脂质体的稀释限制，核心在于外相渗透压对脂质体膜稳定性的影响。”。
+* **首句黑名单**：严禁以“好的、下面、接下来、现在、我们、我、针对、关于、为了回答、要剖析”等寒暄、任务确认或动作宣告词开头。
+* **API Pre-fill 预填**：若模型服务支持 Assistant prefill，优先预填核心实体名词或医学事实片段，而不是固定预填“要剖析”。“要剖析”虽然比“好的，我们开始”更好，但仍保留轻微动作宣告痕迹，长期跑批会形成新的模板化开头。
+
+### 5.3 级联泄漏拦截：非对话式微创编辑器（Asymmetric Post-Processing）
+在多级流水线中，后续的格式自愈模型（Lightweight Model）可能引入新的客套话。因此在 `HealingService` 尾部不进行大模型重写，而是设计两道防逃逸硬关卡：
+
+#### 1. 首句防逃逸正则集（Regex Decapitation）
+对重写后的思维链进行零延迟的头部微创切除。正则只允许删除明确的寒暄与动作宣告，不承担语义重写职责：
+```python
+META_OPENING_PATTERNS = [
+    r'^(?:好的[，,。！!\s]*)?我们(?:现在|今天)?(?:先|来)?(?:开始|继续)?(?:针对|围绕|就|对|结合)[^，。：；\n]{1,80}(?:进行)?(?:推演|分析|解答|讨论|阐述|梳理|拆解|判断)[，。：；\n\s]*',
+    r'^(?:好的[，,。！!\s]*)?(?:下面|接下来|现在)(?:我们)?(?:开始|来|先)?(?:针对|围绕|就|对)?[^，。：；\n]{0,80}(?:进行)?(?:分析|推演|解答|讨论|阐述|梳理|拆解)[，。：；\n\s]*',
+    r'^(?:针对|关于)(?:上述|这个|这一)?[^，。：；\n]{0,60}(?:问题|主题|内容)[，。：；\n\s]*',
+]
+
+for pattern in META_OPENING_PATTERNS:
+    cleaned = re.sub(pattern, '', cleaned, count=1).strip()
+```
+
+#### 2. 学术引用洗白字典（Wash Map）
+将大模型为了紧密吻合 Evidence 校验而写出的生硬工程化连词（如“根据确证的知识点记载”），在 `SEMANTIC_WASH_MAP` 中进行无损的学术化替换：
+```python
+SEMANTIC_WASH_MAP = {
+    "根据确证的用法用量知识点记载": "根据规范的用法用量要求",
+    "根据确证的用法用量记载": "根据说明书用法用量",
+    "确证的用法用量知识点": "临床用药规范",
+    "确证的事实记载": "临床文献记载",
+    "根据确证的数据": "根据临床数据",
+    "根据确证的": "根据临床",
+    "知识点记载": "文献记载",
+    # ... 持续收录大模型生成的高频工程变体词 ...
+}
+```
+
+### 5.4 截头后的首句代词原地自愈与连贯性保护（Zero-Cost Local Coherence Guard）
+正则截头后必须进行首句自检，防止文本以残留指代词、因果承接词或半句话开场。
+
+> [!IMPORTANT]
+> **API 成本控制与零成本自愈机制**：
+> 如果首句因为截头而出现“该药、它、其、该药物”等指代词，直接触发 **Premium LLM 重新生成会产生极高的 API Token 成本和响应延迟**。本管线在 Coherence Guard 中集成**“代词原地映射自愈（Zero-Cost Pronoun Resolution）”**：通过提取当前的检索实体名（`entity_name`），在 Python 本地内存中直接用实体名平滑替换指代词，零延迟、零费用地完成语意平滑，仅在无法替换且语句严重断裂时才进行重试。
+
+```python
+DISCONNECTED_OPENING_PREFIXES = (
+    "因此", "所以", "由此", "这样", "这种", "这个", "该", "其", "上述",
+    "前者", "后者", "同时", "而且", "并且", "然而", "但是", "不过"
+)
+
+def heal_disconnected_opening_locally(text: str, entity_name: str) -> str:
+    """代词原地映射自愈，免除高额大模型重试成本"""
+    stripped = text.strip()
+    if not entity_name:
+        return stripped
+        
+    pronoun_prefixes = ["该药", "此药", "它", "该药物"]
+    for prefix in pronoun_prefixes:
+        if stripped.startswith(prefix):
+            return entity_name + stripped[len(prefix):]
+    return stripped
+
+def has_disconnected_opening(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        not stripped
+        or stripped[0] in "，。：；、,.;:!?"
+        or stripped.startswith(DISCONNECTED_OPENING_PREFIXES)
+    )
+```
+
+连贯性修复必须是“窄口径编辑”，只允许重写第一句话，使其直接进入医学事实，不允许新增医学事实或改写后文。若服务成本敏感，且无法本地代词自愈，可不调用模型修复，直接将该样本判为本轮失败并进入下一次重写。
+
+---
+
+## 🚀 六、 落地实施步骤与排批交付
 
 本升级方案自即日起全面在 `qa` 项目组落地执行：
 

@@ -60,20 +60,12 @@ class FacetCandidate(BaseModel):
     @field_validator("label")
     @classmethod
     def validate_label(cls, value: str) -> str:
-        label = value.strip()
-        if label != value:
-            value = label
-        if "\n" in label or "\r" in label or "\t" in label:
-            raise ValueError("facet label must be a single short phrase")
-        if len(re.findall(r"[A-Za-z]", label)) > 8:
-            raise ValueError("facet label contains too much English text")
-        lowered = label.lower()
-        for pattern in FACET_FORBIDDEN_PATTERNS:
-            if re.search(pattern, lowered, flags=re.IGNORECASE):
-                raise ValueError(f"invalid facet label: forbidden pattern {pattern}")
-        if any(ch in label for ch in [":", "：", "。", "？", "?", "！", "!", "，", ","]):
-            raise ValueError("facet label must not contain sentence punctuation")
-        return label
+        from core.pipeline_workflow import validate_facet_label
+        ok, err = validate_facet_label(value)
+        if not ok:
+            raise ValueError(err)
+        return value.strip()
+
 
     @field_validator("answer_scope", "why_relevant")
     @classmethod
