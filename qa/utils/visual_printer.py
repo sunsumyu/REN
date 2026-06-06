@@ -216,6 +216,38 @@ def print_graph_data(graph_data: dict):
         print("\n=== [Fallback] Graph Data (Relationships) ===")
         print(json.dumps(relationships, indent=2, ensure_ascii=False))
 
+def print_generated_questions(questions: list):
+    """
+    在终端中以富文本表格形式优雅地显示大模型生成的候选主问题列表
+    """
+    if not questions:
+        return
+        
+    if _has_rich:
+        # 构造表格
+        table = Table(
+            box=ROUNDED, 
+            show_header=True, 
+            header_style="bold cyan", 
+            title="[bold cyan]❓ Candidate Questions (生成的主问题候选列表)[/bold cyan]"
+        )
+        table.add_column("No.", style="dim", width=4, justify="center")
+        table.add_column("Generated Question / 候选问题文本", style="white")
+        
+        for idx, q in enumerate(questions):
+            table.add_row(
+                str(idx + 1),
+                q
+            )
+        _console.print("\n")
+        _console.print(table)
+        _console.print("\n")
+    else:
+        print("\n=== [Fallback] Candidate Questions ===")
+        for idx, q in enumerate(questions):
+            print(f"  [{idx + 1}] {q}")
+        print("\n")
+
 def apply_aop_aspects():
     """
     通过 Monkey Patch 动态织入（Weave）AOP 切面，拦截指定方法的执行，
@@ -270,6 +302,34 @@ def apply_aop_aspects():
             
         GraphService.fetch_random_knowledge_graph = wrapped_fetch
         logger.info("AOP Aspect successfully woven: GraphService.fetch_random_knowledge_graph")
+        
+        # 4. 织入并完全代理对 generate_initial_question 的切面拦截
+        async def wrapped_gen_q(self, context_list, task_id_label=""):
+            import prompts
+            from core.prompt_renderer import PromptRenderer
+            prompt = PromptRenderer.render(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
+            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+            
+            response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}初始问题生成")
+            
+            from pipeline import parse_json_safely
+            questions = parse_json_safely(response, [])
+            if not questions:
+                raise Exception("Failed to generate questions from context.")
+            
+            # 自动渲染候选问题列表
+            try:
+                print_generated_questions(questions)
+            except Exception as e:
+                logger.error(f"[AOP Aspect Error] Failed to print candidate questions in wrapped_gen_q: {e}")
+                
+            import random
+            selected_q = random.choice(questions)
+            logger.info(f"Generated {len(questions)} questions. Selected: '{selected_q}'")
+            return selected_q
+            
+        PipelineWorkflow.generate_initial_question = wrapped_gen_q
+        logger.info("AOP Aspect successfully woven: PipelineWorkflow.generate_initial_question")
         
     except ImportError as e:
         logger.warning(f"Failed to weave AOP aspects due to import error: {e}. Skipping AOP enhancement.")

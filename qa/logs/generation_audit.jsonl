@@ -870,3 +870,6 @@
 {"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "低风险缺陷通常包括哪些问题类型？", "log": "Pruned facet '药代动力学特点' due to incompatibility with Q: '低风险缺陷通常包括哪些问题类型？'", "time": "2026-06-06T14:36:57"}
 {"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "低风险缺陷通常包括哪些问题类型？", "log": "Redirected simple Q: '低风险缺陷通常包括哪些问题类型？' with facet '特殊人群安全' -> '概念定义' (COMPATIBLE_SIMPLE)", "time": "2026-06-06T14:36:57"}
 {"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "低风险缺陷通常包括哪些问题类型？", "log": "Redirected simple Q: '低风险缺陷通常包括哪些问题类型？' with facet '临床研究证据' -> '临床事实核验' (COMPATIBLE_SIMPLE)", "time": "2026-06-06T14:36:57"}
+{"stage": "facet_planning", "status": "success", "task_id": "Task-1", "query": "止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？", "attempt": 1, "facets": ["解热机制", "儿童适用性"], "time": "2026-06-06T15:31:13"}
+{"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？", "log": "Pruned facet '解热机制' due to incompatibility with Q: '止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？'", "time": "2026-06-06T15:31:37"}
+{"stage": "facet_governance", "status": "governed", "task_id": "Task-1", "query": "止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？", "log": "Redirected simple Q: '止眩安神颗粒适用于治疗哪些症状，哪些人群禁止使用该药物？' with facet '儿童适用性' -> '禁忌人群' (COMPATIBLE_SIMPLE)", "time": "2026-06-06T15:31:37"}
