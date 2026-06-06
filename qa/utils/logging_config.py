@@ -125,6 +125,9 @@ def setup_logging(log_file: str = None, level: int = logging.INFO):
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
     
+    # Silence verbose third-party loggers (like faiss loader AVX2 warning)
+    logging.getLogger("faiss").setLevel(logging.WARNING)
+    
     # Remove existing handlers to avoid duplicates
     for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
@@ -151,3 +154,10 @@ def setup_logging(log_file: str = None, level: int = logging.INFO):
 
     # Prevent propagation to double-logging if root is configured
     root_logger.propagate = False
+
+    # 动态织入（Weave）AOP 切面，拦截目标方法并自动渲染富文本排版
+    try:
+        from utils.visual_printer import apply_aop_aspects
+        apply_aop_aspects()
+    except Exception as e:
+        root_logger.warning(f"Failed to auto-weave logging AOP aspects: {e}")

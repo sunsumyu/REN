@@ -130,7 +130,10 @@ class LocalRAGService:
             logger.info(f"🎉 Local RAG Vector Mode initialized. Registered {self.vector_index.ntotal} vectors.")
         except Exception as e:
             # 当任何一环出错时，直接失效向量模式，确保后续 search 绝不执行向量分支
-            logger.error(f"Failed to load vector storage: {e}. Automatically falling back to standard mode.")
+            if isinstance(e, FileNotFoundError):
+                logger.info(f"Vector storage index file not found: {e}. Falling back to standard mode (SQLite3 FTS5 / SQL LIKE).")
+            else:
+                logger.error(f"Failed to load vector storage: {e}. Automatically falling back to standard mode.", exc_info=True)
             self.vector_enabled = False
             self.embedding_engine = None
             self.vector_index = None

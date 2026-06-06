@@ -45,3 +45,233 @@ def print_token_usage(stage: str, model: str, duration: float, usage: dict):
             f"[{stage}] Model: {model} | Latency: {duration:.3f}s | "
             f"Prompt: {prompt_tokens} | Completion: {completion_tokens} | Total: {total_tokens}"
         )
+
+def print_context_and_refs(context_list: list, refs: list):
+    """
+    在终端中以富文本（Table/Panel）形式优雅地显示图谱上下文和 RAG 参考文献
+    """
+    import json
+    if _has_rich:
+        from rich.panel import Panel
+        from rich.columns import Columns
+        from rich.text import Text
+        
+        # 1. 构造 Context List 的表格
+        ctx_table = Table(box=ROUNDED, show_header=True, header_style="bold cyan", title="[bold cyan]📍 Graph-RAG Context List (图谱上下文)[/bold cyan]")
+        ctx_table.add_column("No.", style="dim", width=4, justify="center")
+        ctx_table.add_column("Source / 来源", style="green", width=35)
+        ctx_table.add_column("Context / 事实上下文", style="white")
+        
+        for idx, item in enumerate(context_list):
+            ctx_table.add_row(
+                str(idx + 1),
+                item.get("source", "Unknown"),
+                item.get("context", "")
+            )
+            
+        # 2. 构造 Refs 的表格
+        refs_table = Table(box=ROUNDED, show_header=True, header_style="bold yellow", title="[bold yellow]📚 References & Grounding (依据文献)[/bold yellow]")
+        refs_table.add_column("No.", style="dim", width=4, justify="center")
+        refs_table.add_column("Source / 参考文献来源", style="gold1", width=40)
+        refs_table.add_column("Context / 文献摘要及定义", style="white")
+        
+        for idx, item in enumerate(refs):
+            source = item.get("source", "Unknown")
+            source_text = Text(source)
+            if "PubMed" in source:
+                source_text.stylize("bold red")
+            elif "实体库" in source:
+                source_text.stylize("bold green")
+            elif "图谱关系" in source:
+                source_text.stylize("bold blue")
+            elif "异常" in source or "未收录" in source:
+                source_text.stylize("bold reverse red")
+                
+            refs_table.add_row(
+                str(idx + 1),
+                source_text,
+                item.get("context", "")
+            )
+            
+        _console.print("\n")
+        _console.print(ctx_table)
+        _console.print("\n")
+        _console.print(refs_table)
+        _console.print("\n")
+    else:
+        print("\n=== [Fallback] Graph-RAG Context List ===")
+        print(json.dumps(context_list, indent=2, ensure_ascii=False))
+        print("\n=== [Fallback] References & Grounding ===")
+        print(json.dumps(refs, indent=2, ensure_ascii=False))
+
+def print_tiered_refs(query: str, name: str, tier_label: str, tiered_refs: list):
+    """
+    在终端中以富文本形式优雅地显示分层检索（Tiered Grounding）抓取出来的参考文献
+    """
+    import json
+    if not tiered_refs:
+        return
+        
+    if _has_rich:
+        from rich.text import Text
+        
+        # 构造表格
+        table = Table(
+            box=ROUNDED, 
+            show_header=True, 
+            header_style="bold magenta", 
+            title=f"[bold magenta]🔍 Tiered Grounding Match: '{name}' via [[bold green]{tier_label}[/bold green]][/bold magenta]"
+        )
+        table.add_column("No.", style="dim", width=4, justify="center")
+        table.add_column("Source / 参考文献来源", style="orange1", width=40)
+        table.add_column("Context / 文献参考正文", style="white")
+        
+        for idx, item in enumerate(tiered_refs):
+            source = item.get("source", "Unknown")
+            source_text = Text(source)
+            if "PubMed" in source:
+                source_text.stylize("bold red")
+            elif "在线" in source or "异常" in source or "未收录" in source:
+                source_text.stylize("bold reverse red")
+            elif "实体库" in source:
+                source_text.stylize("bold green")
+                
+            table.add_row(
+                str(idx + 1),
+                source_text,
+                item.get("context", "")
+            )
+            
+        _console.print("\n")
+        _console.print(table)
+        _console.print("\n")
+    else:
+        print(f"\n=== [Fallback] Tiered Grounding Match for '{name}' via [{tier_label}] ===")
+        print(json.dumps(tiered_refs, indent=2, ensure_ascii=False))
+
+def print_graph_data(graph_data: dict):
+    """
+    在终端中以富文本表格形式优雅地显示从 API 抓取来的原始知识图谱数据 (Entities & Relationships)
+    """
+    import json
+    if not graph_data:
+        return
+        
+    entities = graph_data.get("entities", [])
+    relationships = graph_data.get("relationships", [])
+    
+    if _has_rich:
+        # 1. 构造 Entities 表格
+        ent_table = Table(
+            box=ROUNDED, 
+            show_header=True, 
+            header_style="bold magenta", 
+            title="[bold magenta]🟢 Graph Database Entities (图谱节点)[/bold magenta]"
+        )
+        ent_table.add_column("No.", style="dim", width=4, justify="center")
+        ent_table.add_column("ID", style="dim cyan", width=12)
+        ent_table.add_column("Entity / 实体名", style="bold green", width=25)
+        ent_table.add_column("Type / 类型", style="yellow", width=15)
+        ent_table.add_column("Description / 描述说明", style="white")
+        
+        for idx, ent in enumerate(entities):
+            ent_table.add_row(
+                str(idx + 1),
+                str(ent.get("id", "N/A")),
+                ent.get("name", "Unknown"),
+                ent.get("type", "Unknown"),
+                ent.get("description", "N/A")
+            )
+            
+        # 2. 构造 Relationships 表格
+        rel_table = Table(
+            box=ROUNDED, 
+            show_header=True, 
+            header_style="bold cyan", 
+            title="[bold cyan]🔵 Graph Database Relationships (图谱边关系)[/bold cyan]"
+        )
+        rel_table.add_column("No.", style="dim", width=4, justify="center")
+        rel_table.add_column("Source / 源实体", style="bold green", width=25)
+        rel_table.add_column("Relationship / 关联关系", style="yellow", width=20)
+        rel_table.add_column("Target / 目标实体", style="bold green", width=25)
+        rel_table.add_column("Strength / 强度", style="red", justify="right", width=10)
+        
+        for idx, rel in enumerate(relationships):
+            rel_table.add_row(
+                str(idx + 1),
+                rel.get("sourceName", rel.get("source", "Unknown")),
+                rel.get("relationship", "Unknown"),
+                rel.get("targetName", rel.get("target", "Unknown")),
+                str(rel.get("relationshipStrength", 10))
+            )
+            
+        _console.print("\n")
+        _console.print(ent_table)
+        _console.print("\n")
+        _console.print(rel_table)
+        _console.print("\n")
+    else:
+        print("\n=== [Fallback] Graph Data (Entities) ===")
+        print(json.dumps(entities, indent=2, ensure_ascii=False))
+        print("\n=== [Fallback] Graph Data (Relationships) ===")
+        print(json.dumps(relationships, indent=2, ensure_ascii=False))
+
+def apply_aop_aspects():
+    """
+    通过 Monkey Patch 动态织入（Weave）AOP 切面，拦截指定方法的执行，
+    在方法返回后（After Returning）自动输出富文本排版。
+    """
+    try:
+        from core.pipeline_workflow import PipelineWorkflow
+        from retrieval.retrieval_manager import RetrievalManager
+        from services.graph_service import GraphService
+        import config
+        
+        # 1. 织入对 _prepare_context_and_refs 的切面拦截
+        orig_prepare = PipelineWorkflow._prepare_context_and_refs
+        
+        async def wrapped_prepare(self, graph_data, query=""):
+            res = await orig_prepare(self, graph_data, query)
+            try:
+                context_list, refs = res
+                print_context_and_refs(context_list, refs)
+            except Exception as e:
+                logger.error(f"[AOP Aspect Error] Failed to print context_list/refs in wrapped_prepare: {e}")
+            return res
+            
+        PipelineWorkflow._prepare_context_and_refs = wrapped_prepare
+        logger.info("AOP Aspect successfully woven: PipelineWorkflow._prepare_context_and_refs")
+        
+        # 2. 织入对 get_grounding_references 的切面拦截
+        orig_grounding = RetrievalManager.get_grounding_references
+        
+        async def wrapped_grounding(self, query, name):
+            res = await orig_grounding(self, query, name)
+            try:
+                tiered_refs, tier_label = res
+                print_tiered_refs(query, name, tier_label, tiered_refs)
+            except Exception as e:
+                logger.error(f"[AOP Aspect Error] Failed to print tiered_refs in wrapped_grounding: {e}")
+            return res
+            
+        RetrievalManager.get_grounding_references = wrapped_grounding
+        logger.info("AOP Aspect successfully woven: RetrievalManager.get_grounding_references")
+        
+        # 3. 织入对 fetch_random_knowledge_graph 的切面拦截
+        orig_fetch = GraphService.fetch_random_knowledge_graph
+        
+        async def wrapped_fetch(self, count=config.DEFAULT_ENTITY_COUNT, kb_id=config.DEFAULT_KNOWLEDGE_BASE_ID, hop_count=config.DEFAULT_HOP_COUNT):
+            res = await orig_fetch(self, count, kb_id, hop_count)
+            try:
+                print_graph_data(res)
+            except Exception as e:
+                logger.error(f"[AOP Aspect Error] Failed to print graph_data in wrapped_fetch: {e}")
+            return res
+            
+        GraphService.fetch_random_knowledge_graph = wrapped_fetch
+        logger.info("AOP Aspect successfully woven: GraphService.fetch_random_knowledge_graph")
+        
+    except ImportError as e:
+        logger.warning(f"Failed to weave AOP aspects due to import error: {e}. Skipping AOP enhancement.")
+    except Exception as e:
+        logger.error(f"Error occurred during AOP weaving: {e}")
