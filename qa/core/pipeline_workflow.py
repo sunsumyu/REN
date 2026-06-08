@@ -129,6 +129,11 @@ class PipelineWorkflow:
         from retrieval.retrieval_manager import RetrievalManager
         retrieval_mgr = RetrievalManager(llm_service=self.llm_service)
         
+        # 纯数据容器型实体类型黑名单：这类实体只含实验参数，无机制信息，
+        # 生成的问题几乎只能是纯事实提取题（几只动物/几组等），对 CoT 训练无价值。
+        # 仍保留在 refs 供 CoT 回答时作为事实锚点引用。
+        FACT_CONTAINER_ENTITY_TYPES = {"group", "result", "measurement", "statistic"}
+
         # 格式化实体数据
         for entity in entities:
             name = entity.get("name", "未命名实体")
@@ -146,7 +151,12 @@ class PipelineWorkflow:
                 "entity_id": str(ent_id),
                 "metadata": {"type": "entity", "entity_type": ent_type}
             }
-            context_list.append(item)
+            # 层次一过滤：纯数据容器型实体不加入 context_list（问题生成源），
+            # 但始终加入 refs（事实锚点），保留其数据价值。
+            if ent_type.lower() not in FACT_CONTAINER_ENTITY_TYPES:
+                context_list.append(item)
+            else:
+                logger.debug(f"[实体过滤] '{name}'（type={ent_type}）被识别为纯数据容器型实体，跳过加入 context_list，仅保留在 refs。")
             refs.append({
                 "context": f"概念定义: {name} (类型: {ent_type}) - {description}",
                 "source": f"refs:《实体库:{name}》",
@@ -210,10 +220,47 @@ class PipelineWorkflow:
         questions = parse_json_safely(response, [])
         if not questions:
             raise Exception("Failed to generate questions from context.")
-            
+
+        # 层次三：正则网关——移除事实提取型问题候选，最多重试 2 次
+        import re as _re
+        _FACT_RETRIEVAL_PATTERNS = [
+            r"是多少",
+            r"有几",
+            r"是第几",
+            r"是哪\w{0,2}年",
+            r"具体数值",
+            r"具体剂量",
+            r"规格是",
+            r"批准文号",
+            r"生产厂家",
+            r"总\w{0,3}组数",
+            r"总\w{0,3}数量",
+            r"每组\w{0,4}数",
+            r"共\w{0,2}组",
+        ]
+
+        def _is_fact_retrieval(q: str) -> bool:
+            return any(_re.search(p, q) for p in _FACT_RETRIEVAL_PATTERNS)
+
+        filtered = [q for q in questions if not _is_fact_retrieval(q)]
+        retry_count = 0
+        while not filtered and retry_count < 2:
+            retry_count += 1
+            logger.warning(f"{stage_prefix}所有候选问题均为事实提取型，重新生成（第 {retry_count} 次重试）...")
+            resp2 = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}初始问题生成(重试{retry_count})")
+            questions2 = parse_json_safely(resp2, [])
+            filtered = [q for q in questions2 if not _is_fact_retrieval(q)]
+        if not filtered:
+            logger.warning(f"{stage_prefix}重试后仍无推理型问题，降级使用全部候选题。")
+            filtered = questions
+
+        filtered_out = len(questions) - len(filtered)
+        if filtered_out > 0:
+            logger.info(f"{stage_prefix}事实提取题过滤：移除 {filtered_out} 题，剩余 {len(filtered)} 题可用。")
+
         # 随机选择一个问题
-        selected_q = random.choice(questions)
-        logger.info(f"Generated {len(questions)} questions. Selected: '{selected_q}'")
+        selected_q = random.choice(filtered)
+        logger.info(f"Generated {len(questions)} questions (filtered to {len(filtered)}). Selected: '{selected_q}'")
         return selected_q
 
     async def plan_facets(self, query: str, task_id_label: str = "") -> List[str]:
