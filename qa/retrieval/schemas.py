@@ -26,11 +26,13 @@ class NormalizedClinicalRef(BaseModel):
         description="元数据扩展信息。例如: {'PMID': '12345'}, {'UpdateDate': '2026-05'}"
     )
 
-    def to_pipeline_format(self) -> Dict[str, str]:
+    def to_pipeline_format(self) -> Dict[str, Any]:
         """
         转换为问答管道 (pipeline.py) 支持的 Grounding Context 字典格式
         """
         return {
             "source": self.source,
-            "context": self.context
+            "context": self.context,
+            "metadata": self.metadata,
+            "category": self.category
         }

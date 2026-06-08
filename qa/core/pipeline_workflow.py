@@ -143,12 +143,14 @@ class PipelineWorkflow:
             item = {
                 "context": context_str,
                 "source": source_str,
-                "entity_id": str(ent_id)
+                "entity_id": str(ent_id),
+                "metadata": {"type": "entity", "entity_type": ent_type}
             }
             context_list.append(item)
             refs.append({
                 "context": f"概念定义: {name} (类型: {ent_type}) - {description}",
-                "source": f"refs:《实体库:{name}》"
+                "source": f"refs:《实体库:{name}》",
+                "metadata": {"type": "entity", "entity_type": ent_type}
             })
             
             # 尝试获取分层检索依据，注入到参考引用中
@@ -173,12 +175,14 @@ class PipelineWorkflow:
             
             item = {
                 "context": context_str,
-                "source": source_str
+                "source": source_str,
+                "metadata": {"type": "relationship", "relationship": relation}
             }
             context_list.append(item)
             refs.append({
                 "context": f"知识关联: 【{src}】 --({relation})--> 【{tgt}】",
-                "source": f"refs:《图谱关系:{src}-{tgt}》"
+                "source": f"refs:《图谱关系:{src}-{tgt}》",
+                "metadata": {"type": "relationship", "relationship": relation}
             })
             
         # 关闭检索管理器释放资源
