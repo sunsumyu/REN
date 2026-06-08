@@ -60,15 +60,15 @@
 #### 第四步：切面兼容性治理与证据路由 (Evidence Scope Routing)
 * **核心类/方法**：
   * 兼容过滤器：`core/governance/facet_strategy.py` 中的 `FacetGovernanceFilter` 评估兼容决策。
-  * 证据域路由：[EvidenceScopeRouter.route_references](file:///d:/REN/qa/core/rag/evidence_scope_router.py#L21) 过滤 refs 边界。
+  * 证据域路由：[EvidenceScopeRouter.route_references](file:///d:/REN/qa/core/rag/evidence_scope_router.py#L107) 过滤 refs 边界（已升级为异步批量优化）。
 * **枝叶流转**：
-  * 生成切面后，利用小模型分析主问题与各切面的兼容度，执行 `DROP`（丢弃）、`RENAME`（重命名自愈）或 `REDIRECT_SIMPLE`（极简退避）。
-  * 同时，将 refs 送入路由，根据意图细分为 `CORE`、`BOUNDARY`、`BLOCKED`、`UNUSED` 四种等级，剔除旁路噪声，防止把简单问答写宽。
+  * 生成切面后，利用小模型**并发**分析主问题与各切面的兼容度，执行 `DROP`（丢弃）、`RENAME`（重命名自愈）或 `REDIRECT_SIMPLE`（极简退避）。若全灭则通过 `config.DOMAIN_NAME` 触发解耦后的兜底重规划。
+  * 同时，将 refs 送入路由，根据意图细分为 `CORE`、`BOUNDARY`、`BLOCKED`、`UNUSED` 四类。遇到缺乏 Metadata 的散文本，将通过后台线程池 (`asyncio.to_thread`) 批量计算向量距离，绝不阻塞主异步循环。
 
 #### 第五步：并发切面 Agent 仿真生成
-* **核心方法**：[PipelineWorkflow.run_parallel_answers](file:///d:/REN/qa/core/pipeline_workflow.py#L527) 调度并发；[PipelineWorkflow.answer_single_facet](file:///d:/REN/qa/core/pipeline_workflow.py#L365) 单视角深度问答。
+* **核心方法**：[PipelineWorkflow.run_parallel_answers](file:///d:/REN/qa/core/pipeline_workflow.py#L600) 调度并发；[PipelineWorkflow.answer_single_facet](file:///d:/REN/qa/core/pipeline_workflow.py#L369) 单视角深度问答。
 * **枝叶流转**：
-  * 使用 `asyncio.Semaphore` 限制最大并发量。
+  * 使用 `asyncio.gather` 与 `asyncio.Semaphore` 混合控制各切面的全异步流转，大幅提升吞吐率。
   * 调用高级大模型（model_pool = `"premium"`），强制大模型按照 `FacetQAOutput` 强类型 schema 输出包含 evidences、reasoning_chains、answer_body 的回答。
   * **质量防卫线**：调用 `strategies/quality_gate/answer_guard.py` 的 `check_answer_quality` 检查输出质量，不合格则打回并重试。若重复失败则启动普通文本 + 推理心流（call_llm_with_reasoning）的降级容错方案。
 
@@ -94,10 +94,10 @@
 第二阶段的核心目标是：针对原始生成数据，离线剔除所有的工程残留字眼（如 refs、json 等），重新提纯思维链 CoT 使之完美契合最终回答事实边界，达到頂尖推理模型（如 DeepSeek-R1）微调的冷启动标准。
 
 ### 3.1 核心主线数据流
-1. **启动清洗**：由外部运行脚本 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py) 开始任务分配。
-2. **记录循环**：通过 `process_record` 方法遍历并定位行号，并发分发单行内的切面任务。
-3. **单切面重写**：由 `process_planner` 异步任务调用 [PurificationEngine.purify_single_think](file:///d:/REN/qa/core/purification_engine.py#L67) 执行核心思维链净化重构。
-4. **事务决策与写回**：对成功与局部成功的 Planner 执行最终合并，重新生成摘要并秒级合并写回原文件。
+1. **启动清洗**：由外部运行脚本 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py) 实例化 [RecordPurificationPipeline](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L380) 开始任务分配。
+2. **记录流转**：通过 [RecordPurificationPipeline.execute](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L388) 方法线性驱动数据上下文 ([PurificationContext](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L236))，遍历定位行号，并发分发单行内的切面任务。
+3. **单切面重写**：由 [FacetPurificationTask.process](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L285) 异步任务调用 [PurificationEngine.purify_single_think](file:///d:/REN/qa/core/purification_engine.py#L532) 执行核心思维链净化重构。
+4. **事务决策与写回**：对成功与局部成功的 Planner 执行最终合并，由 [GlobalAuditTracker](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L261) 收集侧记，重新生成摘要并秒级合并写回原文件。
 
 ---
 
@@ -106,7 +106,7 @@
 #### 第一步：安全网关与 RAG 脱敏解析 (FactPack Builder)
 * **核心类/方法**：
   * 视角前置核验：[verify_facet_by_small_model](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L42)
-  * RAG 标签脱敏：[PurificationEngine.purify_single_think](file:///d:/REN/qa/core/purification_engine.py#L105-L124) 
+  * RAG 证据路由与标签脱敏：[PurificationEngine._route_evidence](file:///d:/REN/qa/core/purification_engine.py#L72) 
 * **枝叶流转**：
   * 使用小模型网关拦截不合格切面（如“数据不足无法规划”等拒答语），回滚或智能退避修补。
   * 解析 raw refs，剥离其前缀并重组为文献中性标识（如 `[文献_01]`），将 RAG 原始路径物理隔绝在 `provenance_map` 元数据中。
@@ -121,11 +121,14 @@
   * 利用 `scrub_unsupported_official_identifiers` 比对 refs 事实，删除未在文献中出现的官方标准代号、注册文号，防止大模型捏造事实，输出作为 CoT 重写的对齐边界。
 
 #### 第三步：CoT 探索性思考链重构 (CoT Purifier)
-* **核心方法**：[PurificationEngine.purify_single_think](file:///d:/REN/qa/core/purification_engine.py#L67)
+* **核心方法**：[PurificationEngine.purify_single_think](file:///d:/REN/qa/core/purification_engine.py#L532)
 * **枝叶流转**：
   * 传入上一步的已缩窄 `purified_answer_body`（已解决参数空转 Bug）。
   * 动态计算证据等级（HIGH/LOW/NO EVIDENCE），对低证据题启用极简 simplify 模式阻断微观受体脑补。
   * 提示词施加一致性对齐红线，调用高级大模型输出格式高度规范的 exploratory CoT 文本。
+  * **反馈控制环路（Feedback Loop）**：每轮生成后由 [LLMJudgeStrategy](file:///d:/REN/qa/strategies/quality_gate/llm_judge.py) 裁判打分，最多重试 3 次（MAX_RETRIES=3）。不达标则由 [_build_feedback_prompt](file:///d:/REN/qa/core/purification_engine.py#L495) 构建具体纠偏指令（包含滚分原因、事实错误清单）注入下一轮重试 Prompt。
+  * **方案四语义提纯网关（Semantic Purifier Gateway）**：当医学严谨度与逻辑深度均已达标但语义纯净度偏低时，自动触发 [_apply_semantic_purifier](file:///d:/REN/qa/core/purification_engine.py#L431)。该网关调用轻量级大模型对元叙事噪声进行二次精准提纯，并重新评分验证达标后方才替换。
+
 
 #### 第四步：本地多层校验防御门禁 (Validators)
 * **核心类/方法**：
@@ -136,16 +139,22 @@
   * **Trie-Tree/AC 禁词多文本联动校验**：在 [verify_purification.py](file:///d:/REN/qa/scripts/verify_purification.py) 中，同步扫描 `think`、`answer_body`、`summary` 三字段中是否存在泄露禁词。
   * **语义自愈**：利用 `Semantic Wash Map` 对残留代偿词（如实体信息 -> 相关文献记录）进行无损事实伪造的中性转译，正则修复孤立冒号。
 
-#### 第五步：参考引导裁判打分 (LLM Judge)
-* **核心类/方法**：[LLMJudgeStrategy.evaluate](file:///d:/REN/qa/strategies/quality_gate/llm_judge.py#L22)
+#### 第五步：参考引导裁判打分 (LLM Judge) 与事实审计防线
+* **核心类/方法**：
+  * 裁判策略：[LLMJudgeStrategy.evaluate](file:///d:/REN/qa/strategies/quality_gate/llm_judge.py)
+  * 事实审计网关：[FactAuditingGateway](file:///d:/REN/qa/services/fact_correction_service.py)
+  * 物理隔离安全门：[DBHotpatchManager](file:///d:/REN/qa/services/fact_correction_service.py)
 * **枝叶流转**：
   * Judge LLM 接收 Q、planner、purified_think、以及脱敏后的 `Cleaned Facts` 原子事实包。
-  * 依据三方裁判细则，若新增事实能被事实包支持，则判定为合规对齐并奖励分数；若不被支持，一票否决扣至 50 分以下，将打分打回并进入重试循环（Feedback Loop）。
+  * 依据三方裁判细则，若新增事实能被事实包支持，则判定为合规对齐并奖励分数；若不被支持，将打分打回并进入重试循环（Feedback Loop）。
+  * **企业级审计分流**：若裁判在第一阶段给出了低分且标记了事实冲突，触发 `FactAuditingGateway`。冲突事件首先由 [_log_conflict_to_registry](file:///d:/REN/qa/core/purification_engine.py#L222) 以 JSONL 格式追加写入 `logs/factual_conflicts_registry.jsonl` 供后续人工审计回溯。网关随后使用独立的审计大模型重新检视原始图谱事实与推理链，生成 `FactCorrectionProposal`（事实修复提案）。
 
-#### 第六步：局部事务管理与并发写写回机制 (Transaction Manager)
+  * **Safety Gate (物理防线熔断)**：`DBHotpatchManager` 拦截所有修复提案，强行禁止自动写回底层知识图谱数据库，而是将提案以 `PENDING_APPROVAL` 状态落盘写入本地物理 SQL 队列文件，强制隔离待人工评审。
+
+#### 第六步：局部事务管理与并发写回机制 (Transaction Manager)
 * **核心控制流**：
-  * 事务局部状态决策：在 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L806) 的局部事务控制分支。
-  * 安全并发合并写回：在 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py#L969-L981) 处执行并发合并冲突防御。
+  * 事务局部状态决策与安全并发合并写回：位于 [medicalqa_purifier.py](file:///d:/REN/qa/scripts/medicalqa_purifier.py) 的局部事务控制与合并逻辑分支。
 * **枝叶流转**：
   * 判定 `line_status` 与 `planner_status`，某一切面失败不连坐整行，成功切面可作为 `partial_success` 局部持久化，失败切面隔离到 `purification_failures.jsonl` 中。
-  * **Lost Update 并发保护**：在最终写入磁盘前，再次读取一次最新的数据集，与在提纯期间追加的语料行执行安全合并写回，防止并发覆盖。
+  * **Lost Update 并发保护**：在最终写入磁盘前，再次读取一次最新的数据集，与在提纯期间追加的语料行执行安全合并写回，防止多进程并发覆盖。
+  * **图谱实体追踪与对齐报告**：最后生成本次运行的差异对齐报告 (`purification_run_[...].md`)，并自动将生成期获取到的图谱实体关联数据 (`fetched_graph_entities.txt`) 无缝嵌入至报告底部的折叠专区供审计回溯，同时自动清空缓冲池避免数据无限膨胀。

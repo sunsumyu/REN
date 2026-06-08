@@ -65,6 +65,29 @@ class ILLMService(ABC):
         """
         pass
 
+class AsyncRateLimiter:
+    def __init__(self, max_rate: float, time_period: float = 1.0):
+        self.max_rate = max_rate
+        self.time_period = time_period
+        self.tokens = max_rate
+        self.last_update = asyncio.get_event_loop().time()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            while True:
+                now = asyncio.get_event_loop().time()
+                elapsed = now - self.last_update
+                self.tokens = min(self.max_rate, self.tokens + elapsed * (self.max_rate / self.time_period))
+                self.last_update = now
+
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                else:
+                    wait_time = (1.0 - self.tokens) * (self.time_period / self.max_rate)
+                    await asyncio.sleep(wait_time)
+
 class LLMService(ILLMService):
     def __init__(self, http_client: httpx.AsyncClient, global_semaphore: asyncio.Semaphore):
         """
@@ -77,6 +100,12 @@ class LLMService(ILLMService):
         self.client = http_client
         self.global_semaphore = global_semaphore
         self.supported_models: List[str] = []
+        
+        # Initialize token bucket rate limiter reusing GLOBAL_API_SEMAPHORE as RPS
+        self.rate_limiter = None
+        if hasattr(config, "GLOBAL_API_SEMAPHORE") and config.GLOBAL_API_SEMAPHORE > 0:
+            self.rate_limiter = AsyncRateLimiter(max_rate=float(config.GLOBAL_API_SEMAPHORE))
+            logger.info(f"Global LLM Rate Limiter initialized: {config.GLOBAL_API_SEMAPHORE} RPS (Derived from Semaphore)")
 
     STRUCTURED_LEAK_PATTERNS = [
         r"rigorous\s+data\s+processing\s+api",
@@ -317,8 +346,17 @@ class LLMService(ILLMService):
         last_error = None
         
         while True:
+            # 1. Jitter (Strategy B): Prevent thundering herd by adding random micro-delay
+            if hasattr(config, "LLM_REQUEST_JITTER") and config.LLM_REQUEST_JITTER > 0:
+                await asyncio.sleep(random.uniform(0, config.LLM_REQUEST_JITTER))
+                
+            # 2. Token Bucket Rate Limiter (Strategy C): Smooth out bursts using Semaphore-derived RPS
+            if hasattr(self, "rate_limiter") and self.rate_limiter:
+                await self.rate_limiter.acquire()
+                
             req_start_time = time.time()
             try:
+                # 3. Global Semaphore (Strategy A): Cap the maximum concurrent active connections
                 async with self.global_semaphore:
                     response = await self.client.request(method, url, timeout=120.0, **kwargs)
                     response.raise_for_status()

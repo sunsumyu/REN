@@ -440,6 +440,14 @@ context: [
 直接输出下一个问题文本，不要有任何 JSON 格式包裹，不要有代码块。
 """
 
+# 9. 紧急重规划模板 (Emergency Replan) - 默认自引导模版
+_BOOTSTRAP_EMERGENCY_REPLAN_TEMPLATE = """你是一个资深的{{ domain_name }}多视角数据集设计专家。
+对于主问题：'{{ query }}'
+我们之前规划的以下分析视角由于与问题不兼容/强套偏题已被丢弃：{{ old_facets | tojson }}
+请重新为主问题规划 2-3 个合理、严谨且与问题强契合的规范分析视角/切面。
+只返回 JSON 数组格式，例如：["视角1", "视角2"]，不要输出任何其他多余字符。
+"""
+
 def render_prompt(template_str: str, **kwargs) -> str:
     """
     Renders a prompt template using Jinja2.
@@ -465,7 +473,8 @@ PROMPT_NAMES = [
     "L3_DYNAMIC_CONTEXT_TEMPLATE",
     "FACET_REDUNDANCY_DETECTOR_TEMPLATE",
     "MULTI_ANSWER_SYNTHESIS_TEMPLATE", 
-    "NEXT_QUESTION_TEMPLATE"
+    "NEXT_QUESTION_TEMPLATE",
+    "EMERGENCY_REPLAN_TEMPLATE"
 ]
 
 # 自动引导灌入默认版本

@@ -11,3 +11,10 @@
 | 2026-06-04T09:53:45.175182 | 196 | planner purification failed or planner count changed | `塞来昔布如何发挥抗炎、镇痛和解热作用？` | 药理机制 |
 | 2026-06-04T12:02:03.605897 | 222 | planner purification failed or planner count changed | `长春烫伤膏属于哪一类药物？` | 功能主治分类 |
 | 2026-06-04T12:02:03.621792 | 231 | planner purification failed or planner count changed | `索磷布韦维帕他韦片可用于治疗哪些基因型的慢性丙型肝炎感染？` | 适应症 |
+| 2026-06-08T17:09:41.573609 | 254 | planner purification failed or planner count changed | `牛黄至宝丸适用于哪些症状？` | 适应症 |
+| 2026-06-08T17:09:41.574832 | 255 | planner purification failed or planner count changed | `热毒宁注射液在动物实验中表现出何种镇痛效果？` | 药理作用 |
+| 2026-06-08T17:09:41.575928 | 256 | planner purification failed or planner count changed | `哪些患者禁止使用替吉奥胶囊？` | 禁忌人群 |
+| 2026-06-08T17:09:41.577073 | 257 | planner purification failed or planner count changed | `替吉奥胶囊对哪类肝功能异常的患者禁用？` | 禁忌人群 |
+| 2026-06-08T17:09:41.578140 | 258 | planner purification failed or planner count changed | `贴贴舒-复方雌二醇贴片的禁忌人群包括哪些？` | 禁忌人群 |
+| 2026-06-08T17:09:41.579350 | 259 | planner purification failed or planner count changed | `在临床安全性试验中，每天服用卢帕他定100mg连续6天，最常见的不良反应是什么？` | 剂量依赖性 |
+| 2026-06-08T17:09:41.581479 | 260 | planner purification failed or planner count changed | `子时用药组实验中使用了何种动物？每组动物数量及总组数是多少？` | 临床事实核验 |

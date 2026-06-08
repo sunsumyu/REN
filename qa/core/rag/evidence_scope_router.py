@@ -104,7 +104,8 @@ class EvidenceScopeRouter:
                 
         return False
 
-    def route_references(self, query: str, intent: str, refs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    async def route_references(self, query: str, intent: str, refs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        import asyncio
         routed = {
             "CORE": [],
             "BOUNDARY": [],
@@ -125,24 +126,27 @@ class EvidenceScopeRouter:
         anchor_text = config.get("ANCHOR", "")
         blocked_anchor_text = config.get("BLOCKED_ANCHOR", "")
         
-        # Pre-compute anchor embeddings if vector routing is needed
         anchor_vec = None
         blocked_anchor_vec = None
         
         if self.embedding_model and anchor_text:
             try:
-                anchor_vec = self.embedding_model.encode([anchor_text], show_progress_bar=False)
-                anchor_vec = np.array(anchor_vec).astype('float32')
-                faiss.normalize_L2(anchor_vec)
-                
+                texts_to_encode = [anchor_text]
                 if blocked_anchor_text:
-                    blocked_anchor_vec = self.embedding_model.encode([blocked_anchor_text], show_progress_bar=False)
-                    blocked_anchor_vec = np.array(blocked_anchor_vec).astype('float32')
-                    faiss.normalize_L2(blocked_anchor_vec)
+                    texts_to_encode.append(blocked_anchor_text)
+                    
+                vecs = await asyncio.to_thread(self.embedding_model.encode, texts_to_encode, show_progress_bar=False)
+                vecs = np.array(vecs).astype('float32')
+                faiss.normalize_L2(vecs)
+                
+                anchor_vec = vecs[0:1]
+                if blocked_anchor_text:
+                    blocked_anchor_vec = vecs[1:2]
             except Exception as e:
                 logger.error(f"Failed to encode anchors: {e}")
-                anchor_vec = None
 
+        semantic_refs_to_process = []
+        
         for ref in refs:
             if not isinstance(ref, dict):
                 continue
@@ -161,23 +165,25 @@ class EvidenceScopeRouter:
                 routed["BOUNDARY"].append(ref)
                 continue
                 
-            # --- Scheme 3: Semantic Embedding Routing Fallback ---
-            ctx = ref.get("context", "")
-            src = ref.get("source", "")
-            full_text = f"{src} {ctx}"
+            semantic_refs_to_process.append(ref)
             
-            assigned = False
-            if self.embedding_model and anchor_vec is not None and full_text.strip():
-                try:
-                    ref_vec = self.embedding_model.encode([full_text], show_progress_bar=False)
-                    ref_vec = np.array(ref_vec).astype('float32')
-                    faiss.normalize_L2(ref_vec)
+        if not semantic_refs_to_process:
+            return routed
+            
+        # --- Scheme 3: Semantic Embedding Routing Fallback (Batched) ---
+        if self.embedding_model and anchor_vec is not None:
+            full_texts = [f"{ref.get('source', '')} {ref.get('context', '')}" for ref in semantic_refs_to_process]
+            
+            try:
+                ref_vecs = await asyncio.to_thread(self.embedding_model.encode, full_texts, show_progress_bar=False)
+                ref_vecs = np.array(ref_vecs).astype('float32')
+                faiss.normalize_L2(ref_vecs)
+                
+                for i, ref in enumerate(semantic_refs_to_process):
+                    core_score = np.dot(anchor_vec[0], ref_vecs[i])
+                    blocked_score = np.dot(blocked_anchor_vec[0], ref_vecs[i]) if blocked_anchor_vec is not None else 0.0
                     
-                    # Inner product (cosine similarity since L2 normalized)
-                    core_score = np.dot(anchor_vec[0], ref_vec[0])
-                    blocked_score = np.dot(blocked_anchor_vec[0], ref_vec[0]) if blocked_anchor_vec is not None else 0.0
-                    
-                    # 一票否决 (Highest priority in fallback)
+                    assigned = False
                     if not is_general and blocked_score > 0.65 and blocked_score > core_score:
                         routed["BLOCKED"].append(ref)
                         assigned = True
@@ -187,13 +193,24 @@ class EvidenceScopeRouter:
                     elif not is_general and core_score > 0.45:
                         routed["BOUNDARY"].append(ref)
                         assigned = True
-                except Exception as e:
-                    logger.debug(f"Embedding fallback routing failed for ref: {e}")
-                    
-            if not assigned:
+                        
+                    if not assigned:
+                        if is_general:
+                            routed["BOUNDARY"].append(ref)
+                        else:
+                            routed["UNUSED"].append(ref)
+            except Exception as e:
+                logger.debug(f"Batch embedding fallback routing failed: {e}")
+                for ref in semantic_refs_to_process:
+                    if is_general:
+                        routed["BOUNDARY"].append(ref)
+                    else:
+                        routed["UNUSED"].append(ref)
+        else:
+            for ref in semantic_refs_to_process:
                 if is_general:
                     routed["BOUNDARY"].append(ref)
                 else:
                     routed["UNUSED"].append(ref)
-                    
+
         return routed

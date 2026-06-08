@@ -12,6 +12,9 @@ if _no_proxy_val:
     os.environ["NO_PROXY"] = _no_proxy_val
     os.environ["no_proxy"] = _no_proxy_val
 
+# 系统当前业务所属领域 (用于动态解除硬编码的领域锁死，如 "医学"、"金融")
+DOMAIN_NAME = os.getenv("DOMAIN_NAME", "医学")
+
 # 医药知识图谱 API 配置
 GRAPH_API_URL = "https://ai.yzint.cn/api/knowledge/v1/graph/entity/random"
 DEFAULT_KNOWLEDGE_BASE_ID = 201
@@ -79,6 +82,9 @@ CONCURRENT_QA_LIMIT = int(os.getenv("CONCURRENT_QA_LIMIT", "4"))     # 并行解
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))                  # 单次并发生成的总样本数
 BATCH_CONCURRENCY_LIMIT = int(os.getenv("BATCH_CONCURRENCY_LIMIT", "3"))  # 同时进行的多轮对话生成任务上限
 GLOBAL_API_SEMAPHORE = int(os.getenv("GLOBAL_API_SEMAPHORE", "6"))      # 全局大模型并发限制（防429）
+
+# 请求前的随机抖动延迟上限（秒），用于打散并发请求，防止惊群效应 (0.0 表示不抖动)
+LLM_REQUEST_JITTER = float(os.getenv("LLM_REQUEST_JITTER", "0.1"))
 
 # 裁判打分阶段前的缓冲避让冷却（秒）
 SOFT_DELAY_BEFORE_JUDGE = float(os.getenv("SOFT_DELAY_BEFORE_JUDGE", "3.0"))

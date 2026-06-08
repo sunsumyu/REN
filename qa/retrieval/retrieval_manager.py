@@ -40,7 +40,7 @@ class RetrievalManager:
 
         # --- Tier 1: Local Private RAG ---
         try:
-            local_refs = self.local_rag.search(query, entity_name)
+            local_refs = await self.local_rag.search(query, entity_name)
             if local_refs:
                 logger.info(f"--- Routing Success: Hit TIER 1 (Local RAG) for '{entity_name}' ---")
                 formatted = [item.to_pipeline_format() for item in local_refs]

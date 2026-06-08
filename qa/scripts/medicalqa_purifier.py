@@ -66,10 +66,6 @@ async def verify_facet_by_small_model(client: APIClient, facet: str) -> bool:
         return True
 
 def infer_safe_repair_facet(question: str, facet: str) -> str:
-    """
-    Returns a safer facet name for single-planner rows that would otherwise be
-    over-pruned. This is deterministic and intentionally conservative.
-    """
     q = question or ""
     f = facet or ""
     if any(k in q for k in ["不良反应", "副作用", "毒性", "不适"]) and "分子机制" in f:
@@ -92,10 +88,6 @@ def infer_safe_repair_facet(question: str, facet: str) -> str:
 
 
 def should_downgrade_forced_skip(question: str, facet: str, planner_count: int) -> Tuple[bool, str, str]:
-    """
-    Some direct medical questions are compatible with a cautious, evidence-bound
-    short reasoning mode. Do not prune the only planner for those rows.
-    """
     if planner_count != 1:
         return False, "", ""
     repair_facet = infer_safe_repair_facet(question, facet)
@@ -111,14 +103,6 @@ def should_downgrade_forced_skip(question: str, facet: str, planner_count: int) 
 
 
 async def check_semantic_compatibility(client: APIClient, question: str, facet: str) -> str:
-    """
-    利用轻量级小模型（deepseek-v4-flash）对“问题”与“视角”进行语义匹配和兼容性校验。
-    返回:
-      - 'COMPATIBLE': 视角与问题高度兼容，正常执行深度提纯。
-      - 'COMPATIBLE_SIMPLE': 视角可用于解题，但由于问题本身极其简单（如查剂量、成分等事实问题），
-                             必须极简化处理，严禁脑补和虚构复杂机制。
-      - 'FORCED_SKIP': 属于明显的强行视角硬套或无谓的过度逻辑漂移，直接过滤丢弃该切面。
-    """
     system_prompt = (
         "你是一个极其严格的医疗问答视角语义匹配网关（Gatekeeper）。你的唯一任务是评估给定的【主问题】与【分析视角/切面】之间的语义适配性，以防范数据清洗过程中的‘视角强行套用’及由此引发的‘虚假因果关系编造’。\n\n"
         "### ⚖️ 评估判定规则：\n"
@@ -150,15 +134,9 @@ async def check_semantic_compatibility(client: APIClient, question: str, facet: 
         return "COMPATIBLE"
 
 async def purify_single_think(engine: PurificationEngine, q: str, planner: str, raw_think: str, purified_answer: str, line_num: int = None, refs: List[Dict[str, Any]] = None, simplify: bool = False) -> Tuple[str, Dict[str, Any]]:
-    """    Surgically delegate single thought trace purification to modularized PurificationEngine (reusing injected engine).
-    """
     return await engine.purify_single_think(q, planner, raw_think, purified_answer, line_num, refs, simplify)
 
 async def generate_diff_analysis(llm_service, item: dict) -> str:
-    """
-    使用轻量级大模型对单个视角的提纯差异进行智能分析，生成
-    "原始 CoT 存在的问题"、"提纯改动说明" 与 "后续改进建议" 三段结构化叙述。
-    """
     original = item.get("original_think", "")
     purified = item.get("purified_think", "")
     question = item.get("question", "")
@@ -206,13 +184,8 @@ async def generate_diff_analysis(llm_service, item: dict) -> str:
 
 
 def scrub_engineering_leakage(text: str) -> str:
-    """
-    Deterministically removes internal retrieval / refs wording from final answer bodies.
-    This is intentionally conservative: it strips pipeline labels, not medical facts.
-    """
     if not text:
         return text
-
     cleaned = text
     replacements = [
         (r"根据\s*(?:refs|RAG|rag)\s*《[^》]+》的?(?:描述|记载|显示|数据|图谱|关系|档案|文献|实体库)?(?:显示|可知|指出|表明|提供)?[，,]?", ""),
@@ -243,10 +216,6 @@ def refs_to_evidence_text(refs: List[Dict[str, Any]]) -> str:
 
 
 def scrub_unsupported_official_identifiers(text: str, refs: List[Dict[str, Any]]) -> str:
-    """
-    Remove official-looking identifiers from final answer bodies unless the same
-    code is present in the original refs for this row.
-    """
     if not text:
         return text
     evidence_text = refs_to_evidence_text(refs)
@@ -272,19 +241,11 @@ def scrub_unsupported_official_identifiers(text: str, refs: List[Dict[str, Any]]
 def extract_answer_body(answer: str) -> str:
     if not answer:
         return ""
-    match = re.match(r"^\s*<think>[\s\S]*?</think>\s*([\s\S]*)$", answer)
-    return match.group(1).strip() if match else answer.strip()
+    match = re.search(r"<think>([\s\S]*?)</think>\s*([\s\S]*)$", answer, re.IGNORECASE)
+    return match.group(2).strip() if match else answer.strip()
 
 
-async def rewrite_answer_body(
-    llm_service,
-    q: str,
-    original_answer: str,
-    refs: List[Dict[str, Any]],
-) -> str:
-    """
-    Calls lightweight LLM to rewrite and narrow the answer body, removing off-topic and overreached facts.
-    """
+async def rewrite_answer_body(llm_service, q: str, original_answer: str, refs: List[Dict[str, Any]]) -> str:
     refs_text = json.dumps(refs or [], ensure_ascii=False)
     prompt = f"""你是一个专业的医学学术编辑。你的任务是净化并重写医学回答的正文（Answer Body），使其高度聚焦于主问题 Q，并剔除由于视角规划偏题而脑补的冗余/越界内容。
     
@@ -315,13 +276,7 @@ async def rewrite_answer_body(
         return original_answer
 
 
-async def regenerate_summary_after_purification(
-    llm_service,
-    question: str,
-    planners: List[Dict[str, Any]],
-    refs: List[Dict[str, Any]],
-    line_num: int,
-) -> str:
+async def regenerate_summary_after_purification(llm_service, question: str, planners: List[Dict[str, Any]], refs: List[Dict[str, Any]], line_num: int) -> str:
     answer_blocks = []
     for idx, planner in enumerate(planners, start=1):
         facet = planner.get("planner", "")
@@ -389,12 +344,7 @@ def build_raw_q_index(raw_rows: List[Dict[str, Any] | None]) -> Dict[str, List[i
     return q_index
 
 
-def resolve_raw_record_for_current(
-    current_data: Dict[str, Any],
-    current_line: int,
-    raw_rows: List[Dict[str, Any] | None],
-    raw_q_index: Dict[str, List[int]],
-) -> Tuple[Dict[str, Any] | None, Dict[str, Any]]:
+def resolve_raw_record_for_current(current_data: Dict[str, Any], current_line: int, raw_rows: List[Dict[str, Any] | None], raw_q_index: Dict[str, List[int]]) -> Tuple[Dict[str, Any] | None, Dict[str, Any]]:
     current_key = normalize_mapping_key(current_data.get("Q", ""))
     meta = {
         "raw_line": None,
@@ -437,9 +387,6 @@ def resolve_raw_record_for_current(
 
 
 def update_env_start_line(env_path: Path, start_line: int):
-    """
-    Dynamically writes the determined starting line number back to the .env file.
-    """
     if not env_path.exists():
         return
     with open(env_path, 'r', encoding='utf-8') as f:
@@ -453,6 +400,396 @@ def update_env_start_line(env_path: Path, start_line: int):
         
     with open(env_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
+
+
+# ====================================================================================
+# ENTERPRISE PIPELINE COMPONENTS
+# ====================================================================================
+
+class PurificationContext:
+    """领域模型/DTO：封装单行记录的状态流转，避免在各层方法之间反复传递大量的散装参数。"""
+    def __init__(self, line_idx: int, line_str: str, should_purify: bool, skip_reason: str):
+        self.line_idx = line_idx
+        self.line_str = line_str
+        self.should_purify = should_purify
+        self.skip_reason = skip_reason
+        
+        self.original_data = None
+        self.data = None
+        self.refs = []
+        self.planners = []
+        self.q = ""
+        
+        self.raw_mapping_meta = {
+            "raw_line": None,
+            "raw_mapping_status": "NOT_USED",
+            "raw_mapping_warning": "",
+        }
+        
+        # 中间输出物
+        self.valid_planners = []
+        self.diff_logs = []
+        self.planner_audit = []
+        self.pruned_count = 0
+        self.has_failed = False
+        self.has_exception = False  # 代码级异常：永远不触发物理删除
+        
+        # 结果输出物
+        self.result_str = None
+        self.is_success = False
+        self.is_deleted = False
+
+class GlobalAuditTracker:
+    """集中式审计记录器，负责管理系统内的 side-effects (副作用)。"""
+    def __init__(self):
+        self.audit_events = []
+        self.purified_diff_logs = []
+
+    def record_audit_event(self, event: dict) -> None:
+        event.setdefault("run_status", "unknown")
+        event.setdefault("time", datetime.datetime.now().isoformat(timespec="seconds"))
+        self.audit_events.append(event)
+
+    def record_diff_logs(self, logs: list) -> None:
+        self.purified_diff_logs.extend(logs)
+
+
+class RecordPolicyEvaluator:
+    """评估行记录处理策略的规则引擎：决定 Skip，覆盖，或触发溯源查找。"""
+    def __init__(self, raw_rows, raw_q_index, force_repurify, delete_on_fail):
+        self.raw_rows = raw_rows
+        self.raw_q_index = raw_q_index
+        self.force_repurify = force_repurify
+        self.delete_on_fail = delete_on_fail
+
+    def evaluate(self, ctx: PurificationContext) -> Tuple[str, str]:
+        if not ctx.should_purify:
+            if ctx.skip_reason:
+                return "skip", ctx.skip_reason
+            return "skip", "Not marked for purification"
+            
+        if not self.force_repurify and "refs" not in ctx.original_data and "history" not in ctx.original_data:
+            return "skip", "no refs/history found; treated as already purified"
+            
+        ctx.data = copy.deepcopy(ctx.original_data)
+        ctx.refs = ctx.data.get("refs", [])
+        
+        if self.force_repurify:
+            raw_record, raw_mapping_meta = resolve_raw_record_for_current(
+                ctx.original_data,
+                ctx.line_idx + 1,
+                self.raw_rows,
+                self.raw_q_index,
+            )
+            ctx.raw_mapping_meta = raw_mapping_meta
+            if raw_mapping_meta.get("raw_mapping_warning"):
+                logger.warning(f"🚨 {raw_mapping_meta['raw_mapping_warning']}")
+            if raw_record is None:
+                reason = (
+                    "raw mapping failed during force re-purify; refusing to purify without safe raw refs/history "
+                    f"({raw_mapping_meta.get('raw_mapping_status')})"
+                )
+                logger.critical(f"🚨 Rollback Line {ctx.line_idx+1}: {reason}")
+                return "error", reason
+                
+            if not ctx.refs and raw_record.get("refs"):
+                ctx.refs = raw_record.get("refs", [])
+                ctx.data["refs"] = ctx.refs
+            if "history" not in ctx.data and "history" in raw_record:
+                ctx.data["history"] = copy.deepcopy(raw_record.get("history", []))
+                
+        ctx.q = ctx.data.get("Q", "")
+        ctx.planners = ctx.data.get("planners", [])
+        return "proceed", ""
+
+
+class FacetPurificationTask:
+    """视角处理核心单元，专一负责执行和管理单个 planner 的重写与评估。"""
+    def __init__(self, client, engine, sem, allow_prune):
+        self.client = client
+        self.engine = engine
+        self.sem = sem
+        self.allow_prune = allow_prune
+
+    async def process(self, p: dict, q: str, refs: list, line_idx: int, planners_count: int, raw_mapping_meta: dict):
+        original_planner = copy.deepcopy(p)
+        try:
+            raw_planner_name = p.get("planner", "")
+            raw_answer = p.get("answer", "")
+                
+            TEMPLATE_SIGNATURES = ["触发物理格式崩溃", "质量网关硬指标", "自动重新净化重写"]
+            SAFE_BODY_SIGNATURES = ["根据参考资料", "现有资料未提供"]
+                
+            if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
+                logger.warning(f"  🚨 Rollback Line {line_idx+1} facet '{raw_planner_name}' due to template signature.")
+                return original_planner, None, "failed", {"planner": raw_planner_name, "status": "failed", "reason": "template signature detected"}
+                    
+            if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
+                logger.warning(f"  🚨 Rollback Line {line_idx+1} facet '{raw_planner_name}' due to safety warning signature.")
+                return original_planner, None, "failed", {"planner": raw_planner_name, "status": "failed", "reason": "safety warning signature detected"}
+                
+            is_valid = await verify_facet_by_small_model(self.client, raw_planner_name)
+            if not is_valid:
+                logger.warning(f"  🚨 [小模型网关校验拦截] 发现行 {line_idx+1} 的非医学视角占位符: '{raw_planner_name}'。仅在成功清洗后写入安全视角名。")
+                planner_name = infer_safe_repair_facet(q, raw_planner_name) or "临床用药安全"
+            else:
+                planner_name = raw_planner_name
+                
+            compatibility = await check_semantic_compatibility(self.client, q, planner_name)
+            if compatibility == "FORCED_SKIP":
+                should_downgrade, repaired_facet, repair_reason = should_downgrade_forced_skip(q, planner_name, planners_count)
+                if should_downgrade:
+                    old_planner_name = planner_name
+                    planner_name = repaired_facet or planner_name
+                    compatibility = "COMPATIBLE_SIMPLE"
+                    is_valid = True
+                    logger.warning(f"  🟡 [FORCED_SKIP降级修复] 行 {line_idx+1} 的视角 '{old_planner_name}' 改为 '{planner_name}' 并进入极简清洗；原因: {repair_reason}。")
+                else:
+                    if self.allow_prune:
+                        logger.critical(f"  ✂️ [企业级网关强行视角剪枝] 行 {line_idx+1} 的强套视角 '{planner_name}' 被显式剪枝。")
+                        return None, None, "pruned", {"planner": planner_name, "status": "pruned", "reason": "semantic compatibility forced skip"}
+                    logger.critical(f"  🚨 [企业级网关强行视角拦截] 行 {line_idx+1} 的强套视角 '{planner_name}' 未通过；保留原 planner 并回滚整行。")
+                    return original_planner, None, "failed", {"planner": planner_name, "status": "failed", "reason": "semantic compatibility forced skip without prune permission"}
+                
+            simplify = (compatibility == "COMPATIBLE_SIMPLE")
+            if simplify:
+                logger.info(f"  💡 [企业级网关简化提示] 行 {line_idx+1} 的视角 '{planner_name}' 与简单问题匹配，开启极简重构。")
+                
+            think_match = re.search(r"<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer, re.IGNORECASE)
+            if think_match:
+                raw_think = think_match.group(1).strip()
+                answer_body = think_match.group(2).strip()
+                    
+                purified_answer_body = await rewrite_answer_body(self.client.llm_service, q, answer_body, refs)
+                original_answer_body = answer_body
+                answer_body_after_leakage_scrub = scrub_engineering_leakage(purified_answer_body)
+                purified_answer_body = scrub_unsupported_official_identifiers(answer_body_after_leakage_scrub, refs)
+
+                facet_match = re.search(r"(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
+                if facet_match:
+                    facet_tag = facet_match.group(1).strip()
+                    actual_raw_think = facet_match.group(2).strip()
+                    if planner_name != raw_planner_name:
+                        facet_tag = f"<facet = {planner_name}>"
+                else:
+                    facet_tag = f"<facet = {planner_name}>"
+                    actual_raw_think = raw_think
+                    
+                async with self.sem:
+                    logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
+                    purified_think, score_dict = await purify_single_think(
+                        self.engine, q, planner_name, actual_raw_think, purified_answer_body, line_num=line_idx+1, refs=refs, simplify=simplify
+                    )
+                    
+                if not score_dict.get("is_passed", False):
+                    logger.critical(f"   ❌ [Hallucination/Quality Gate Intercept] Keep original facet '{planner_name}' for Line {line_idx+1} due to Quality Gate Failure.")
+                    return original_planner, None, "failed", {
+                        "planner": planner_name,
+                        "status": "failed",
+                        "reason": "quality gate failure",
+                        "scores": score_dict,
+                    }
+                    
+                p_new = copy.deepcopy(p)
+                p_new["planner"] = planner_name
+                purified_full_answer = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{purified_answer_body}"
+                p_new["answer"] = purified_full_answer
+
+                operations = [
+                    "rewrite_think_with_fact_anchored_purification_engine",
+                    f"semantic_compatibility={compatibility}",
+                ]
+                if planner_name != raw_planner_name:
+                    operations.append(f"repair_planner_name:{raw_planner_name}->{planner_name}")
+                if simplify:
+                    operations.append("apply_simplified_reasoning_mode")
+                if purified_answer_body != original_answer_body:
+                    operations.append("rewrite_and_narrow_answer_body")
+                if answer_body_after_leakage_scrub != purified_answer_body:
+                    operations.append("scrub_engineering_leakage_from_answer_body")
+                if purified_answer_body != answer_body_after_leakage_scrub:
+                    operations.append("scrub_unsupported_official_identifiers_from_answer_body")
+                    
+                diff_log = {
+                    "line_number": line_idx + 1,
+                    "question": q,
+                    "facet": planner_name,
+                    "original_planner": raw_planner_name,
+                    "final_planner": planner_name,
+                    "original_think": raw_think,
+                    "purified_think": purified_think,
+                    "original_answer_body": original_answer_body,
+                    "purified_answer_body": answer_body,
+                    "purified_full_answer": purified_full_answer,
+                    "operations": operations,
+                    "scores": score_dict,
+                    "compatibility": compatibility,
+                    "simplify": simplify
+                }
+                return p_new, diff_log, "success", {"planner": planner_name, "status": "success", "reason": "purified", "compatibility": compatibility}
+            else:
+                return original_planner, None, "unchanged", {"planner": raw_planner_name, "status": "unchanged", "reason": "no think block"}
+        except Exception as e:
+            logger.error(f"❌ [Exception Intercept] Exception occurred when purifying line {line_idx+1} facet '{p.get('planner', '')}': {e}. Keep original planner and rollback this line.")
+            return original_planner, None, "exception", {"planner": p.get("planner", ""), "status": "exception", "reason": f"exception: {e}"}
+
+
+class RecordPurificationPipeline:
+    """中心化流水线编排器，遵循严格的 SRP。"""
+    def __init__(self, policy_evaluator: RecordPolicyEvaluator, facet_task: FacetPurificationTask, audit_tracker: GlobalAuditTracker, client: APIClient, delete_on_fail: bool):
+        self.policy = policy_evaluator
+        self.facet_task = facet_task
+        self.audit = audit_tracker
+        self.client = client
+        self.delete_on_fail = delete_on_fail
+
+    async def execute(self, ctx: PurificationContext) -> str:
+        if not ctx.line_str.strip():
+            ctx.result_str = ctx.line_str
+            return ctx.result_str
+            
+        try:
+            ctx.original_data = json.loads(ctx.line_str)
+        except Exception as e:
+            logger.error(f"❌ Error processing line {ctx.line_idx+1}: {e}")
+            self.audit.record_audit_event({"line_number": ctx.line_idx + 1, "run_status": "error", "reason": f"json decode: {e}"})
+            ctx.result_str = None if self.delete_on_fail else ctx.line_str
+            ctx.is_deleted = (ctx.result_str is None)
+            return ctx.result_str
+            
+        status, reason = self.policy.evaluate(ctx)
+        if status == "skip":
+            if reason != "Not marked for purification":
+                self.audit.record_audit_event({
+                    "line_number": ctx.line_idx + 1,
+                    "run_status": "skipped_already_purified" if "refs" in reason else "skipped",
+                    "reason": reason,
+                    "question": ctx.original_data.get("Q", ""),
+                })
+            ctx.result_str = ctx.line_str
+            return ctx.result_str
+            
+        if status == "error":
+            self.audit.record_audit_event({
+                "line_number": ctx.line_idx + 1,
+                "run_status": "error",
+                "reason": reason,
+                "question": ctx.original_data.get("Q", ""),
+                **ctx.raw_mapping_meta,
+            })
+            ctx.result_str = None if self.delete_on_fail else ctx.line_str
+            ctx.is_deleted = (ctx.result_str is None)
+            return ctx.result_str
+            
+        planner_tasks = [
+            self.facet_task.process(p, ctx.q, ctx.refs, ctx.line_idx, len(ctx.planners), ctx.raw_mapping_meta) 
+            for p in ctx.planners
+        ]
+        planner_results = await asyncio.gather(*planner_tasks)
+        
+        for p_new, diff_log, f_status, planner_event in planner_results:
+            ctx.planner_audit.append(planner_event)
+            if f_status == "exception":
+                ctx.has_exception = True
+                ctx.has_failed = True  # 仍标记为失败触发回滚，但不允许物理删除
+            elif f_status == "failed":
+                ctx.has_failed = True
+            if f_status == "pruned":
+                ctx.pruned_count += 1
+            if p_new is not None:
+                ctx.valid_planners.append(p_new)
+            if diff_log:
+                ctx.diff_logs.append(diff_log)
+                
+        if ctx.has_failed or (len(ctx.valid_planners) + ctx.pruned_count) != len(ctx.planners) or (ctx.planners and not ctx.valid_planners):
+            logger.warning(f"↩️ Rollback Line {ctx.line_idx+1}: planner purification failed or planner count changed.")
+            self.audit.record_audit_event({
+                "line_number": ctx.line_idx + 1,
+                "run_status": "rollback",
+                "reason": "planner purification failed or planner count changed",
+                "question": ctx.q,
+                **ctx.raw_mapping_meta,
+                "planner_count_before": len(ctx.planners),
+                "planner_count_after": len(ctx.valid_planners),
+                "pruned_count": ctx.pruned_count,
+                "planners": ctx.planner_audit,
+            })
+            # 代码级异常（exception）绝对不允许物理删除，强制保留原行
+            if ctx.has_exception:
+                logger.warning(f"🛡️ [安全保护] 行 {ctx.line_idx+1} 因代码级异常回滚，强制保留原始数据，不执行物理删除。")
+                ctx.result_str = ctx.line_str
+            else:
+                ctx.result_str = None if self.delete_on_fail else ctx.line_str
+            ctx.is_deleted = (ctx.result_str is None)
+
+            return ctx.result_str
+            
+        if not ctx.diff_logs and ctx.pruned_count == 0:
+            self.audit.record_audit_event({
+                "line_number": ctx.line_idx + 1,
+                "run_status": "unchanged",
+                "reason": "no local diff logs and no pruned planners",
+                "question": ctx.q,
+                **ctx.raw_mapping_meta,
+                "planner_count_before": len(ctx.planners),
+                "planner_count_after": len(ctx.valid_planners),
+                "planners": ctx.planner_audit,
+            })
+            ctx.result_str = ctx.line_str
+            return ctx.result_str
+            
+        original_summary = ctx.data.get("summary", "")
+        try:
+            regenerated_summary = await regenerate_summary_after_purification(
+                self.client.llm_service, ctx.q, ctx.valid_planners, ctx.refs, ctx.line_idx + 1,
+            )
+        except Exception as e:
+            logger.critical(f"↩️ Rollback Line {ctx.line_idx+1}: summary regeneration failed: {e}")
+            self.audit.record_audit_event({
+                "line_number": ctx.line_idx + 1,
+                "run_status": "rollback",
+                "reason": f"summary regeneration failed: {e}",
+                "question": ctx.q,
+                **ctx.raw_mapping_meta,
+                "planner_count_before": len(ctx.planners),
+                "planner_count_after": len(ctx.valid_planners),
+                "pruned_count": ctx.pruned_count,
+                "planners": ctx.planner_audit,
+            })
+            ctx.result_str = None if self.delete_on_fail else ctx.line_str
+            ctx.is_deleted = (ctx.result_str is None)
+            return ctx.result_str
+            
+        for item in ctx.diff_logs:
+            item["original_summary"] = original_summary
+            item["regenerated_summary"] = regenerated_summary
+            item.setdefault("operations", []).append("regenerate_summary_after_planner_purification")
+            
+        ctx.data["planners"] = ctx.valid_planners
+        ctx.data["summary"] = regenerated_summary
+        ctx.data.pop("history", None)
+        ctx.data.pop("refs", None)
+        
+        self.audit.record_diff_logs(ctx.diff_logs)
+        self.audit.record_audit_event({
+            "line_number": ctx.line_idx + 1,
+            "run_status": "success",
+            "reason": "purified",
+            "question": ctx.q,
+            **ctx.raw_mapping_meta,
+            "planner_count_before": len(ctx.planners),
+            "planner_count_after": len(ctx.valid_planners),
+            "pruned_count": ctx.pruned_count,
+            "purified_facets": len(ctx.diff_logs),
+            "summary_regenerated": True,
+            "planners": ctx.planner_audit,
+        })
+        ctx.result_str = json.dumps(ctx.data, ensure_ascii=False) + "\n"
+        ctx.is_success = True
+        return ctx.result_str
+
+
+# ====================================================================================
 
 async def main():
     start_time = time.time()
@@ -532,7 +869,6 @@ async def main():
     client = APIClient()
     logger.info("🚀 Initializing API Client for LLM Semantic Purifying & QA Judging...")
     
-    # 🟢 [Performance Optimization] Initialize the purification engine only once at startup
     engine = PurificationEngine(
         llm_service=client.llm_service,
         healing_service=HealingService(client.llm_service),
@@ -556,337 +892,14 @@ async def main():
         logger.warning("⚠️ No raw backup rows loaded. Re-purifying already-cleaned rows cannot recover refs/history.")
     
     sem = asyncio.Semaphore(PURIFY_CONCURRENCY)
-    
-    purified_diff_logs = []
-    audit_events = []
     force_repurify = os.getenv("PURIFY_FORCE_REPURIFY", "").strip().lower() in {"1", "true", "yes", "on"}
     allow_prune = os.getenv("PURIFY_ALLOW_PRUNE", "").strip().lower() in {"1", "true", "yes", "on"}
-
-    def record_audit_event(event: Dict[str, Any]) -> None:
-        event.setdefault("run_status", "unknown")
-        event.setdefault("time", datetime.datetime.now().isoformat(timespec="seconds"))
-        audit_events.append(event)
     
-    async def process_record(line_idx, line_str, should_purify=True, skip_reason: str = ""):
-        if not line_str.strip():
-            return line_str
-            
-        try:
-            original_data = json.loads(line_str)
-            if not should_purify:
-                if skip_reason:
-                    record_audit_event({
-                        "line_number": line_idx + 1,
-                        "run_status": "skipped",
-                        "reason": skip_reason,
-                        "question": original_data.get("Q", ""),
-                    })
-                return line_str
-
-            # 已清洗样本会移除 refs/history；默认不重复清洗，避免二次运行破坏已净化内容。
-            if not force_repurify and "refs" not in original_data and "history" not in original_data:
-                logger.info(f"⏭️ Skip Line {line_idx+1}: no refs/history found; treated as already purified.")
-                record_audit_event({
-                    "line_number": line_idx + 1,
-                    "run_status": "skipped_already_purified",
-                    "reason": "no refs/history found",
-                    "question": original_data.get("Q", ""),
-                })
-                return line_str
-
-            data = copy.deepcopy(original_data)
-            refs = data.get("refs", [])  # 🌟 提取原始图谱及外部文献引用作为刚性事实白名单锚点
-            raw_mapping_meta = {
-                "raw_line": None,
-                "raw_mapping_status": "NOT_USED",
-                "raw_mapping_warning": "",
-            }
-
-            if force_repurify:
-                raw_record, raw_mapping_meta = resolve_raw_record_for_current(
-                    original_data,
-                    line_idx + 1,
-                    raw_rows,
-                    raw_q_index,
-                )
-                if raw_mapping_meta.get("raw_mapping_warning"):
-                    logger.warning(f"🚨 {raw_mapping_meta['raw_mapping_warning']}")
-                if raw_record is None:
-                    reason = (
-                        "raw mapping failed during force re-purify; refusing to purify without safe raw refs/history "
-                        f"({raw_mapping_meta.get('raw_mapping_status')})"
-                    )
-                    logger.critical(f"🚨 Rollback Line {line_idx+1}: {reason}")
-                    record_audit_event({
-                        "line_number": line_idx + 1,
-                        "run_status": "error",
-                        "reason": reason,
-                        "question": original_data.get("Q", ""),
-                        **raw_mapping_meta,
-                    })
-                    return None if PURIFY_DELETE_ON_FAIL else line_str
-
-                if not refs and raw_record.get("refs"):
-                    refs = raw_record.get("refs", [])
-                    data["refs"] = refs
-                if "history" not in data and "history" in raw_record:
-                    data["history"] = copy.deepcopy(raw_record.get("history", []))
-            
-            q = data.get("Q", "")
-            planners = data.get("planners", [])
-                
-            TEMPLATE_SIGNATURES = [
-                "触发物理格式崩溃",
-                "质量网关硬指标",
-                "自动重新净化重写",
-            ]
-            SAFE_BODY_SIGNATURES = [
-                "根据参考资料",
-                "现有资料未提供",
-            ]
-                
-            async def process_planner(p):
-                original_planner = copy.deepcopy(p)
-                try:
-                    raw_planner_name = p.get("planner", "")
-                    raw_answer = p.get("answer", "")
-                        
-                    if any(sig in raw_answer for sig in TEMPLATE_SIGNATURES):
-                        reason = "template signature detected"
-                        logger.warning(f"  🚨 Rollback Line {line_idx+1} facet '{raw_planner_name}' due to template signature.")
-                        return original_planner, None, "failed", {"planner": raw_planner_name, "status": "failed", "reason": reason}
-                            
-                    if any(sig in raw_answer for sig in SAFE_BODY_SIGNATURES):
-                        reason = "safety warning signature detected"
-                        logger.warning(f"  🚨 Rollback Line {line_idx+1} facet '{raw_planner_name}' due to safety warning signature.")
-                        return original_planner, None, "failed", {"planner": raw_planner_name, "status": "failed", "reason": reason}
-                        
-                    # 🚦 接入轻量级小模型视角语义校验网关
-                    is_valid = await verify_facet_by_small_model(client, raw_planner_name)
-                    if not is_valid:
-                        logger.warning(f"  🚨 [小模型网关校验拦截] 发现行 {line_idx+1} 的非医学视角占位符: '{raw_planner_name}'。仅在成功清洗后写入安全视角名。")
-                        planner_name = infer_safe_repair_facet(q, raw_planner_name) or "临床用药安全"
-                    else:
-                        planner_name = raw_planner_name
-                        
-                    # 🚦 [企业级语义适配度校验网关]：检测主问题与当前视角是否强套
-                    compatibility = await check_semantic_compatibility(client, q, planner_name)
-                    if compatibility == "FORCED_SKIP":
-                        should_downgrade, repaired_facet, repair_reason = should_downgrade_forced_skip(q, planner_name, len(planners))
-                        if should_downgrade:
-                            old_planner_name = planner_name
-                            planner_name = repaired_facet or planner_name
-                            compatibility = "COMPATIBLE_SIMPLE"
-                            is_valid = True
-                            logger.warning(
-                                f"  🟡 [FORCED_SKIP降级修复] 行 {line_idx+1} 的视角 '{old_planner_name}' "
-                                f"改为 '{planner_name}' 并进入极简清洗；原因: {repair_reason}。"
-                            )
-                        else:
-                            if allow_prune:
-                                reason = "semantic compatibility forced skip"
-                                logger.critical(f"  ✂️ [企业级网关强行视角剪枝] 行 {line_idx+1} 的强套视角 '{planner_name}' 被显式剪枝。")
-                                return None, None, "pruned", {"planner": planner_name, "status": "pruned", "reason": reason}
-                            reason = "semantic compatibility forced skip without prune permission"
-                            logger.critical(f"  🚨 [企业级网关强行视角拦截] 行 {line_idx+1} 的强套视角 '{planner_name}' 未通过；保留原 planner 并回滚整行。")
-                            return original_planner, None, "failed", {"planner": planner_name, "status": "failed", "reason": reason}
-                        
-                    simplify = (compatibility == "COMPATIBLE_SIMPLE")
-                    if simplify:
-                        logger.info(f"  💡 [企业级网关简化提示] 行 {line_idx+1} 的视角 '{planner_name}' 与简单问题匹配，开启极简重构。")
-                        
-                    think_match = re.match(r"^\s*<think>([\s\S]*?)</think>([\s\S]*)$", raw_answer)
-                    if think_match:
-                        raw_think = think_match.group(1).strip()
-                        answer_body = think_match.group(2).strip()
-                            
-                        # 1. Answer rewrite and narrowing
-                        purified_answer_body = await rewrite_answer_body(
-                            client.llm_service,
-                            q,
-                            answer_body,
-                            refs
-                        )
-                        original_answer_body = answer_body
-                        answer_body_after_leakage_scrub = scrub_engineering_leakage(purified_answer_body)
-                        purified_answer_body = scrub_unsupported_official_identifiers(answer_body_after_leakage_scrub, refs)
-
-                        facet_match = re.match(r"^\s*(<facet\s*=\s*[^>]+>)\s*([\s\S]*)$", raw_think)
-                        if facet_match:
-                            facet_tag = facet_match.group(1).strip()
-                            actual_raw_think = facet_match.group(2).strip()
-                                
-                            # 若发生过网关修正或降级，需同步修正 think 块内的 facet_tag，避免结构不一致。
-                            if planner_name != raw_planner_name:
-                                facet_tag = f"<facet = {planner_name}>"
-                        else:
-                            facet_tag = f"<facet = {planner_name}>"
-                            actual_raw_think = raw_think
-                            
-                        async with sem:
-                            logger.info(f"⏳ Processing Record {line_idx+1}: Q='{q[:12]}...' | Facet='{planner_name}'")
-                            purified_think, score_dict = await purify_single_think(
-                                engine, q, planner_name, actual_raw_think, purified_answer_body,
-                                line_num=line_idx+1, refs=refs, simplify=simplify
-                            )
-                            
-                        # 🚨 核心网关：若最终质量网关判定未通过，则保留原 planner 并回滚整行，防止物理删除污染。
-                        if not score_dict.get("is_passed", False):
-                            logger.critical(f"   ❌ [Hallucination/Quality Gate Intercept] Keep original facet '{planner_name}' for Line {line_idx+1} due to Quality Gate Failure.")
-                            return original_planner, None, "failed", {
-                                "planner": planner_name,
-                                "status": "failed",
-                                "reason": "quality gate failure",
-                                "scores": score_dict,
-                            }
-                            
-                        p_new = copy.deepcopy(p)
-                        p_new["planner"] = planner_name
-                        purified_full_answer = f"<think>\n{facet_tag}\n{purified_think}\n</think>\n{purified_answer_body}"
-                        p_new["answer"] = purified_full_answer
-
-                        operations = [
-                            "rewrite_think_with_fact_anchored_purification_engine",
-                            f"semantic_compatibility={compatibility}",
-                        ]
-                        if planner_name != raw_planner_name:
-                            operations.append(f"repair_planner_name:{raw_planner_name}->{planner_name}")
-                        if simplify:
-                            operations.append("apply_simplified_reasoning_mode")
-                        if purified_answer_body != original_answer_body:
-                            operations.append("rewrite_and_narrow_answer_body")
-                        if answer_body_after_leakage_scrub != purified_answer_body:
-                            operations.append("scrub_engineering_leakage_from_answer_body")
-                        if purified_answer_body != answer_body_after_leakage_scrub:
-                            operations.append("scrub_unsupported_official_identifiers_from_answer_body")
-                            
-                        diff_log = {
-                            "line_number": line_idx + 1,
-                            "question": q,
-                            "facet": planner_name,
-                            "original_planner": raw_planner_name,
-                            "final_planner": planner_name,
-                            "original_think": raw_think,
-                            "purified_think": purified_think,
-                            "original_answer_body": original_answer_body,
-                            "purified_answer_body": answer_body,
-                            "purified_full_answer": purified_full_answer,
-                            "operations": operations,
-                            "scores": score_dict,
-                            "compatibility": compatibility,
-                            "simplify": simplify
-                        }
-                        return p_new, diff_log, "success", {"planner": planner_name, "status": "success", "reason": "purified", "compatibility": compatibility}
-                    else:
-                        return original_planner, None, "unchanged", {"planner": raw_planner_name, "status": "unchanged", "reason": "no think block"}
-                except Exception as e:
-                    logger.error(f"❌ [Exception Intercept] Exception occurred when purifying line {line_idx+1} facet '{p.get('planner', '')}': {e}. Keep original planner and rollback this line.")
-                    return original_planner, None, "failed", {"planner": p.get("planner", ""), "status": "failed", "reason": f"exception: {e}"}
- 
-            # 并发执行单行内的所有切面
-            planner_tasks = [process_planner(p) for p in planners]
-            planner_results = await asyncio.gather(*planner_tasks)
-                
-            valid_planners = []
-            local_diff_logs = []
-            has_failed = False
-            pruned_count = 0
-            planner_audit = []
-            for p_new, diff_log, status, planner_event in planner_results:
-                planner_audit.append(planner_event)
-                if status == "failed":
-                    has_failed = True
-                if status == "pruned":
-                    pruned_count += 1
-                if p_new is not None:
-                    valid_planners.append(p_new)
-                if diff_log:
-                    local_diff_logs.append(diff_log)
-
-            if has_failed or (len(valid_planners) + pruned_count) != len(planners) or (planners and not valid_planners):
-                logger.warning(f"↩️ Rollback Line {line_idx+1}: planner purification failed or planner count changed ({len(planners)} -> {len(valid_planners)}).")
-                record_audit_event({
-                    "line_number": line_idx + 1,
-                    "run_status": "rollback",
-                    "reason": "planner purification failed or planner count changed",
-                    "question": q,
-                    **raw_mapping_meta,
-                    "planner_count_before": len(planners),
-                    "planner_count_after": len(valid_planners),
-                    "pruned_count": pruned_count,
-                    "planners": planner_audit,
-                })
-                return None if PURIFY_DELETE_ON_FAIL else line_str
-
-            if not local_diff_logs and pruned_count == 0:
-                record_audit_event({
-                    "line_number": line_idx + 1,
-                    "run_status": "unchanged",
-                    "reason": "no local diff logs and no pruned planners",
-                    "question": q,
-                    **raw_mapping_meta,
-                    "planner_count_before": len(planners),
-                    "planner_count_after": len(valid_planners),
-                    "planners": planner_audit,
-                })
-                return line_str
-
-            original_summary = data.get("summary", "")
-            try:
-                regenerated_summary = await regenerate_summary_after_purification(
-                    client.llm_service,
-                    q,
-                    valid_planners,
-                    refs,
-                    line_idx + 1,
-                )
-            except Exception as e:
-                logger.critical(f"↩️ Rollback Line {line_idx+1}: summary regeneration failed after planner purification: {e}")
-                record_audit_event({
-                    "line_number": line_idx + 1,
-                    "run_status": "rollback",
-                    "reason": f"summary regeneration failed: {e}",
-                    "question": q,
-                    **raw_mapping_meta,
-                    "planner_count_before": len(planners),
-                    "planner_count_after": len(valid_planners),
-                    "pruned_count": pruned_count,
-                    "planners": planner_audit,
-                })
-                return None if PURIFY_DELETE_ON_FAIL else line_str
-
-            for item in local_diff_logs:
-                item["original_summary"] = original_summary
-                item["regenerated_summary"] = regenerated_summary
-                item.setdefault("operations", []).append("regenerate_summary_after_planner_purification")
-
-            data["planners"] = valid_planners
-            data["summary"] = regenerated_summary
-            data.pop("history", None)
-            data.pop("refs", None)
-            purified_diff_logs.extend(local_diff_logs)
-            record_audit_event({
-                "line_number": line_idx + 1,
-                "run_status": "success",
-                "reason": "purified",
-                "question": q,
-                **raw_mapping_meta,
-                "planner_count_before": len(planners),
-                "planner_count_after": len(valid_planners),
-                "pruned_count": pruned_count,
-                "purified_facets": len(local_diff_logs),
-                "summary_regenerated": True,
-                "planners": planner_audit,
-            })
-            return json.dumps(data, ensure_ascii=False) + "\n"
-        except Exception as e:
-            logger.error(f"❌ Error processing line {line_idx+1}: {e}")
-            record_audit_event({
-                "line_number": line_idx + 1,
-                "run_status": "error",
-                "reason": str(e),
-            })
-            return None if PURIFY_DELETE_ON_FAIL else line_str
+    # === 初始化 Enterprise Pipeline 组件 ===
+    audit_tracker = GlobalAuditTracker()
+    policy_evaluator = RecordPolicyEvaluator(raw_rows, raw_q_index, force_repurify, PURIFY_DELETE_ON_FAIL)
+    facet_task = FacetPurificationTask(client, engine, sem, allow_prune)
+    pipeline = RecordPurificationPipeline(policy_evaluator, facet_task, audit_tracker, client, PURIFY_DELETE_ON_FAIL)
             
     purify_counter = 0
     tasks = []
@@ -915,7 +928,7 @@ async def main():
                         skip_reason = "no refs/history found; treated as already purified"
 
                 has_think = any(
-                    bool(re.match(r"^\s*<think>([\s\S]*?)</think>", p.get("answer", "")))
+                    bool(re.search(r"<think>([\s\S]*?)</think>", p.get("answer", ""), re.IGNORECASE))
                     for p in data.get("planners", [])
                 )
                 if should_purify and has_think:
@@ -935,7 +948,9 @@ async def main():
                 if explicitly_requested:
                     skip_reason = "line JSON parse failed before purification"
         
-        tasks.append(process_record(i, line, should_purify, skip_reason))
+        # 构建 DTO 上下文并启动流水线处理
+        ctx = PurificationContext(i, line, should_purify, skip_reason)
+        tasks.append(pipeline.execute(ctx))
         
     processed_results = await asyncio.gather(*tasks)
 
@@ -951,13 +966,13 @@ async def main():
             old_to_new_line[old_line] = None
 
     # 更新 purified_diff_logs 和 audit_events 的 line_number 为新行号
-    for item in purified_diff_logs:
+    for item in audit_tracker.purified_diff_logs:
         old_ln = item["line_number"]
         new_ln = old_to_new_line.get(old_ln)
         if new_ln is not None:
             item["line_number"] = new_ln
             
-    for event in audit_events:
+    for event in audit_tracker.audit_events:
         old_ln = event.get("line_number")
         if old_ln is not None:
             new_ln = old_to_new_line.get(old_ln)
@@ -967,8 +982,6 @@ async def main():
                 event["line_number"] = new_ln
     
     # 🌟 [企业级安全并发合并写回机制 - 防止 Lost Update 并发覆盖]
-    # 在写回磁盘前，重新读取一次磁盘上最新的数据集。防止在提纯大模型调用期间（通常长达数十秒至数分钟）
-    # 后台并发的生成器进程又追加写入了新的原始语料，导致提纯写回时以 w 模式将这些新语料无情覆盖抹杀。
     try:
         with open(dataset_path, 'r', encoding='utf-8') as f:
             latest_disk_lines = f.readlines()
@@ -993,7 +1006,54 @@ async def main():
         logger.error(f"Failed to read raw backup lines for sync: {e}")
         current_raw_lines = []
 
+    # 🌟 [失败隔离记录] 对所有 rollback / error 行写入全局失败文档，
+    # 与是否物理删除（delete_on_fail）解耦——回滚后保留原行时也必须记录
+    failures_jsonl_path = logs_dir / "purification_failures.jsonl"
+    failures_md_path = logs_dir / "purification_failures.md"
+    for event in audit_tracker.audit_events:
+        if event.get("run_status") not in {"rollback", "error"}:
+            continue
+        line_number = event.get("line_number")
+        if line_number is None:
+            continue
+        idx = line_number - 1
+        if not (0 <= idx < len(lines)):
+            continue
+        original_line_str = lines[idx]
+        if not original_line_str.strip():
+            continue
+        try:
+            original_data = json.loads(original_line_str)
+        except Exception:
+            original_data = {}
+        timestamp_str = datetime.datetime.now().isoformat()
+        failure_event = {
+            "timestamp": timestamp_str,
+            "original_line_number": line_number,
+            "reason": event.get("reason", "rollback"),
+            "planners": event.get("planners", []),
+            "data": original_data,
+        }
+        try:
+            with open(failures_jsonl_path, "a", encoding="utf-8") as jf:
+                jf.write(json.dumps(failure_event, ensure_ascii=False) + "\n")
+            write_header = not failures_md_path.exists()
+            with open(failures_md_path, "a", encoding="utf-8") as mf:
+                if write_header:
+                    mf.write("# 🩺 医疗问答思维链提纯净化「历史失败/隔离行」汇总墓地\n\n")
+                    mf.write("本描述文件记录了在数据集提纯净化阶段中因语义不兼容、格式崩溃或质检评分未通过而被**回滚或物理丢弃隔离**的所有样本，作为后续诊断和微调优化的依据。\n\n")
+                    mf.write("| 时间戳 | 原始行号 | 失败原因 | 主问题 (Q) | 视角 (Facets) |\n")
+                    mf.write("| :--- | :--- | :--- | :--- | :--- |\n")
+                planners_list = [p.get("planner", "") for p in original_data.get("planners", [])]
+                q_text = original_data.get("Q", "N/A")
+                reason_text = event.get("reason", "rollback")
+                mf.write(f"| {timestamp_str} | {line_number} | {reason_text} | `{q_text}` | {', '.join(planners_list)} |\n")
+            logger.info(f"📝 Logged rollback/error for line {line_number} to failures graveyard.")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to log failure details for line {line_number}: {e}")
+
     any_deleted = any(res is None for res in processed_results[:len(lines)])
+
     if any_deleted:
         failures_jsonl_path = logs_dir / "purification_failures.jsonl"
         failures_backup_path = logs_dir / "purification_failures_backup.jsonl"
@@ -1011,45 +1071,8 @@ async def main():
                 final_raw_lines.append(current_raw_lines[i])
         else:
             logger.info(f"🗑️ [物理删除行] 过滤并同步删除原始数据集和 raw 备份中的第 {i+1} 行")
-            try:
-                original_line_str = lines[i]
-                if original_line_str.strip():
-                    original_data = json.loads(original_line_str)
-                    timestamp_str = datetime.datetime.now().isoformat()
-                    
-                    reason = "purification failed or rolled back"
-                    for event in audit_events:
-                        if event.get("line_number") == i + 1 and event.get("run_status") in {"rollback", "error"}:
-                            reason = event.get("reason", reason)
-                            break
-                            
-                    failure_event = {
-                        "timestamp": timestamp_str,
-                        "original_line_number": i + 1,
-                        "reason": reason,
-                        "data": original_data
-                    }
-                    
-                    failures_jsonl_path = logs_dir / "purification_failures.jsonl"
-                    with open(failures_jsonl_path, "a", encoding="utf-8") as jf:
-                        jf.write(json.dumps(failure_event, ensure_ascii=False) + "\n")
-                    logger.info(f"📝 Appended line {i+1} failure metadata to global graveyard: {failures_jsonl_path.name}")
-                    
-                    failures_md_path = logs_dir / "purification_failures.md"
-                    write_header = not failures_md_path.exists()
-                    with open(failures_md_path, "a", encoding="utf-8") as mf:
-                        if write_header:
-                            mf.write("# 🩺 医疗问答思维链提纯净化「历史失败/隔离行」汇总墓地\n\n")
-                            mf.write("本描述文件记录了在数据集提纯净化阶段中因语义不兼容、格式崩溃或质检评分未通过而被**物理丢弃隔离**的所有样本，作为后续诊断和微调优化的依据。\n\n")
-                            mf.write("| 时间戳 | 原始行号 | 失败原因 | 主问题 (Q) | 视角 (Facets) |\n")
-                            mf.write("| :--- | :--- | :--- | :--- | :--- |\n")
-                        
-                        planners = [p.get("planner", "") for p in original_data.get("planners", [])]
-                        q_text = original_data.get("Q", "N/A")
-                        mf.write(f"| {timestamp_str} | {i+1} | {reason} | `{q_text}` | {', '.join(planners)} |\n")
-                    logger.info(f"📝 Appended line {i+1} failure report to global graveyard: {failures_md_path.name}")
-            except Exception as e:
-                logger.error(f"⚠️ Failed to log failure details for line {i+1}: {e}")
+            # 失败记录已由前置的独立 rollback 记录循环统一处理，此处仅执行物理删除
+
 
     if len(processed_results) > len(lines):
         extra_lines = processed_results[len(lines):]
@@ -1065,12 +1088,12 @@ async def main():
         
     from collections import defaultdict
     grouped_logs = defaultdict(list)
-    for item in purified_diff_logs:
+    for item in audit_tracker.purified_diff_logs:
         grouped_logs[item["line_number"]].append(item)
         
     unique_qas_count = len(grouped_logs)
     audit_by_status = defaultdict(int)
-    for event in audit_events:
+    for event in audit_tracker.audit_events:
         audit_by_status[event.get("run_status", "unknown")] += 1
     skipped_total = sum(
         count for status, count in audit_by_status.items()
@@ -1078,10 +1101,10 @@ async def main():
     )
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    audited_lines = sorted({e["line_number"] for e in audit_events if e.get("line_number")})
+    audited_lines = sorted({e["line_number"] for e in audit_tracker.audit_events if e.get("line_number")})
     if audited_lines:
         line_range = f"[{audited_lines[0]}-{audited_lines[-1]}]_"
-    elif purified_diff_logs:
+    elif audit_tracker.purified_diff_logs:
         sorted_lines = sorted(grouped_logs.keys())
         line_range = f"[{sorted_lines[0]}-{sorted_lines[-1]}]_"
     else:
@@ -1094,12 +1117,11 @@ async def main():
     latest_audit_path = logs_dir / "purification_audit.jsonl"
     latest_diff_jsonl_path = logs_dir / "purification_diff.jsonl"
 
-    # 🧠 [批量差异分析] 在写报告前，并发调用轻量级大模型对每个视角生成原始问题分析与改动说明
-    if purified_diff_logs:
-        logger.info(f"🔬 Running batch diff analysis for {len(purified_diff_logs)} facets using lightweight LLM...")
-        analysis_tasks = [generate_diff_analysis(client.llm_service, item) for item in purified_diff_logs]
+    if audit_tracker.purified_diff_logs:
+        logger.info(f"🔬 Running batch diff analysis for {len(audit_tracker.purified_diff_logs)} facets using lightweight LLM...")
+        analysis_tasks = [generate_diff_analysis(client.llm_service, item) for item in audit_tracker.purified_diff_logs]
         analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
-        for item, analysis in zip(purified_diff_logs, analyses):
+        for item, analysis in zip(audit_tracker.purified_diff_logs, analyses):
             item["diff_analysis"] = analysis if isinstance(analysis, str) else "分析生成失败。"
 
     logger.info(f"📝 Writing detailed diff logs to: {diff_log_path}...")
@@ -1108,7 +1130,7 @@ async def main():
         lf.write("# 🩺 医疗问答思维链提纯净化 Diff 对照差异报告\n\n")
         lf.write("本差异报告详细记录了对数据集 `medical_qa_dataset.jsonl` 执行大模型思维链提纯净化前后的对比信息，包含各个视角的裁判评分详情。\n\n")
         lf.write(f"- **已提纯净化主问题总数 (Total QAs purified)**: {unique_qas_count} 个\n")
-        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(purified_diff_logs)} 个\n\n")
+        lf.write(f"- **完成提纯净化视角总数 (Total facets purified)**: {len(audit_tracker.purified_diff_logs)} 个\n\n")
         lf.write("## 🧾 本次运行状态汇总\n\n")
         lf.write(f"- **实际审计/尝试行数**: {len(audited_lines)} 行\n")
         lf.write(f"- **成功写回行数**: {audit_by_status.get('success', 0)} 行\n")
@@ -1118,7 +1140,7 @@ async def main():
         lf.write(f"- **未变化行数**: {audit_by_status.get('unchanged', 0)} 行\n")
         lf.write(f"- **错误行数**: {audit_by_status.get('error', 0)} 行\n")
         lf.write(f"- **机器可追踪审计日志**: `{audit_log_path.name}`\n\n")
-        failed_events = [e for e in audit_events if e.get("run_status") in {"rollback", "error"}]
+        failed_events = [e for e in audit_tracker.audit_events if e.get("run_status") in {"rollback", "error"}]
         if failed_events:
             lf.write("## ⚠️ 回滚/失败行详情\n\n")
             for event in sorted(failed_events, key=lambda x: x.get("line_number", 0)):
@@ -1141,7 +1163,7 @@ async def main():
                 lf.write("; ".join(planner_bits) if planner_bits else "N/A")
                 lf.write("\n")
             lf.write("\n")
-        skipped_events = [e for e in audit_events if str(e.get("run_status", "")).startswith("skipped")]
+        skipped_events = [e for e in audit_tracker.audit_events if str(e.get("run_status", "")).startswith("skipped")]
         if skipped_events:
             lf.write("## ⏭️ 跳过/未处理行详情\n\n")
             for event in sorted(skipped_events, key=lambda x: x.get("line_number", 0)):
@@ -1248,14 +1270,32 @@ async def main():
                 
             lf.write("---\n\n")
 
+        # 将生成的图谱实体数据追加到 MD 日志末尾并使用 details 折叠
+        graph_log_path = logs_dir / "fetched_graph_entities.txt"
+        if graph_log_path.exists():
+            try:
+                with open(graph_log_path, 'r', encoding='utf-8') as g_file:
+                    graph_content = g_file.read()
+                if graph_content.strip():
+                    lf.write("## 🕸️ 关联图谱实体参考数据 (Graph Entities Reference)\n\n")
+                    lf.write("<details>\n<summary>点击展开查看获取的图数据库实体详情</summary>\n\n")
+                    lf.write("```jsonl\n")
+                    lf.write(graph_content)
+                    lf.write("```\n\n</details>\n\n")
+                
+                # 读取后清空该临时文件，避免下次运行累积重复数据
+                open(graph_log_path, 'w', encoding='utf-8').close()
+            except Exception as e:
+                logger.error(f"⚠️ Failed to append graph entities to diff log: {e}")
+
     logger.info(f"🧾 Writing machine-readable purification audit logs to: {audit_log_path}...")
     with open(audit_log_path, 'w', encoding='utf-8') as af:
-        for event in sorted(audit_events, key=lambda x: x.get("line_number", 0)):
+        for event in sorted(audit_tracker.audit_events, key=lambda x: x.get("line_number", 0)):
             af.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     logger.info(f"🧾 Writing machine-readable purification diff logs to: {diff_jsonl_path}...")
     with open(diff_jsonl_path, 'w', encoding='utf-8') as df:
-        for item in sorted(purified_diff_logs, key=lambda x: (x.get("line_number", 0), x.get("facet", ""))):
+        for item in sorted(audit_tracker.purified_diff_logs, key=lambda x: (x.get("line_number", 0), x.get("facet", ""))):
             df.write(json.dumps(item, ensure_ascii=False) + "\n")
              
     try:
@@ -1268,7 +1308,7 @@ async def main():
     except Exception as e:
         logger.warning(f"⚠️ Failed to sync standard log copy: {e}")
             
-    bypass_list = [item for item in purified_diff_logs if item["scores"].get("purity_bypass")]
+    bypass_list = [item for item in audit_tracker.purified_diff_logs if item["scores"].get("purity_bypass")]
     if bypass_list:
         logger.warning("\n" + "="*60)
         logger.warning("⚠️ [WARNING] 发现大模型存在高度拷贝且有残留工程废料的绕过违规 (Purity Bypass Detected):")
@@ -1286,9 +1326,9 @@ async def main():
         else:
             logger.info("\n🎉 本次目标行均已完成高质量提纯净化，未发现任何绕过违规！\n")
             
-    if purified_diff_logs and not PURIFY_LINES:
+    if audit_tracker.purified_diff_logs and not PURIFY_LINES:
         blocking_events = [
-            e for e in audit_events
+            e for e in audit_tracker.audit_events
             if e.get("run_status") in {"rollback", "error"} and e.get("line_number") and not e.get("is_deleted")
         ]
         if blocking_events:

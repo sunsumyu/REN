@@ -181,23 +181,24 @@ class LocalRAGService:
             ))
         return results
 
-    def search(self, query: str, entity_name: str) -> List[NormalizedClinicalRef]:
+    async def search(self, query: str, entity_name: str) -> List[NormalizedClinicalRef]:
         """
         本地私有 RAG 统一检索入口 (三级自愈退让)
         """
+        import asyncio
         # --- 通道一：FAISS 余弦相似度语义检索 ---
         if self.vector_enabled and self.embedding_engine and self.vector_index:
             try:
                 # 获取并使用模型编码
                 model = self.embedding_engine.get_model()
-                raw_vector = model.encode([query], show_progress_bar=False)
+                raw_vector = await asyncio.to_thread(model.encode, [query], show_progress_bar=False)
                 query_vector = np.array(raw_vector).astype('float32')
                 
                 # 强制归一化以支持 IndexFlatIP 内积计算余弦相似度
                 faiss.normalize_L2(query_vector)
                 
                 # 相似度召回 (k=5)
-                scores, indices = self.vector_index.search(query_vector, 5)
+                scores, indices = await asyncio.to_thread(self.vector_index.search, query_vector, 5)
                 
                 results = []
                 for score, idx in zip(scores[0], indices[0]):

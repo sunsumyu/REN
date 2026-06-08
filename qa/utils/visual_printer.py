@@ -152,10 +152,37 @@ def print_tiered_refs(query: str, name: str, tier_label: str, tiered_refs: list)
 def print_graph_data(graph_data: dict):
     """
     在终端中以富文本表格形式优雅地显示从 API 抓取来的原始知识图谱数据 (Entities & Relationships)
+    并且同步写入日志文件。
     """
     import json
+    import os
+    from datetime import datetime
+
     if not graph_data:
         return
+        
+    # 写入日志文件
+    try:
+        logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        log_path = os.path.join(logs_dir, "fetched_graph_entities.txt")
+        
+        timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        entities = graph_data.get("entities", [])
+        
+        with open(log_path, "a", encoding="utf-8") as f:
+            for ent in entities:
+                entry = {
+                    "timestamp": timestamp,
+                    "entity_id": ent.get("id"),
+                    "name": ent.get("name"),
+                    "type": ent.get("type"),
+                    "description": ent.get("description")
+                }
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to log graph entities to file: {e}")
+
         
     entities = graph_data.get("entities", [])
     relationships = graph_data.get("relationships", [])
