@@ -483,7 +483,17 @@ class PipelineWorkflow:
             # 切面数量为2，直接返回两个最贴切且互补的切面
             return facets
 
-    async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, simplify: bool = False, boundary_refs: List[Dict[str, str]] = None, task_id_label: str = "") -> Tuple[str, str]:
+    async def answer_single_facet(
+        self,
+        query: str,
+        facet: str,
+        refs: List[Dict[str, str]],
+        semaphore: asyncio.Semaphore,
+        simplify: bool = False,
+        boundary_refs: List[Dict[str, str]] = None,
+        evidence_contract: Dict[str, Any] = None,
+        task_id_label: str = ""
+    ) -> Tuple[str, str]:
         """
         为单个视角（切面）调用图问答智能体进行深度问答。
         核心生成步骤：必须路由至高级模型执行。
@@ -499,6 +509,7 @@ class PipelineWorkflow:
         :return: 元组，包含(切面名称, 生成的回答内容)，若质量把控失败则回答内容为None
         """
         from strategies.quality_gate.answer_guard import check_answer_quality
+        from core.evidence_contract import detect_forbidden_expansion, render_evidence_contract_prompt
 
         is_valid_facet, invalid_reason = validate_facet_label(facet)
         if not is_valid_facet:
@@ -518,7 +529,8 @@ class PipelineWorkflow:
             system_prompt = PromptRenderer.get_l1_meta()
             task_prompt = PromptRenderer.get_l2_execution(facet)
             context_prompt = PromptRenderer.get_l3_context(query, refs, [])
-            user_prompt = f"{task_prompt}\n\n{context_prompt}"
+            contract_prompt = render_evidence_contract_prompt(evidence_contract)
+            user_prompt = f"{task_prompt}\n\n{context_prompt}{contract_prompt}"
             
             if simplify:
                 user_prompt += "\n\n【⚠️ 极简推理特别指令】：当前问题属于简单事实查询。你必须极度简化推理和回答。在 evidences、reasoning_chains 和 answer_body 中，严禁脑补复杂的生化机制、受体或分子通路，只列出直接相关的临床证据，进行 1-2 步极简因果推导即可。"
@@ -556,6 +568,27 @@ class PipelineWorkflow:
                         getattr(result, "_reasoning_content", ""),
                         simplify=simplify
                     )
+                    if is_passed:
+                        structured_check_text = "\n".join([
+                            result.answer_body,
+                            getattr(result, "_reasoning_content", ""),
+                            result.final_conclusion_summary,
+                            "\n".join(e.summary for e in result.evidences),
+                            "\n".join(step.logic for step in result.reasoning_chains),
+                        ])
+                        violations = detect_forbidden_expansion(structured_check_text, evidence_contract)
+                        if violations:
+                            is_passed = False
+                            reason = f"evidence contract violation: {violations}"
+                            record_generation_audit({
+                                "stage": "answer_evidence_contract",
+                                "status": "violation",
+                                "task_id": task_id_label,
+                                "query": query,
+                                "facet": facet,
+                                "attempt": q_attempt + 1,
+                                "violations": violations,
+                            })
                     if is_passed:
                         break
                     logger.warning(f"Quality Guardrail FAILED on structured QA attempt {q_attempt} for facet '{facet}': {reason}. Retrying...")
@@ -622,6 +655,24 @@ class PipelineWorkflow:
                                 reasoning_content = parts[1].strip()
                         
                     is_passed, reason = check_answer_quality(check_body, reasoning_content, simplify=simplify)
+                    if is_passed:
+                        violations = detect_forbidden_expansion(
+                            f"{check_body}\n{reasoning_content}",
+                            evidence_contract,
+                        )
+                        if violations:
+                            is_passed = False
+                            reason = f"evidence contract violation: {violations}"
+                            record_generation_audit({
+                                "stage": "answer_evidence_contract",
+                                "status": "violation",
+                                "task_id": task_id_label,
+                                "query": query,
+                                "facet": facet,
+                                "attempt": fb_attempt + 1,
+                                "fallback": True,
+                                "violations": violations,
+                            })
                     if is_passed:
                         break
                     logger.warning(f"Quality Guardrail FAILED on fallback attempt {fb_attempt}: {reason}. Retrying...")
@@ -714,7 +765,13 @@ class PipelineWorkflow:
             logger.error(f"Failed to replan facets for query '{query}': {e}")
         return []
 
-    async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
+    async def run_parallel_answers(
+        self,
+        query: str,
+        facets: List[str],
+        refs: List[Dict[str, str]],
+        task_id_label: str = ""
+    ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
         """
         并发运行所有切面的问答智能体。
         使用信号量控制最大并发数。
@@ -751,6 +808,7 @@ class PipelineWorkflow:
 
         # 2. 🚦 证据域 RAG 检索分级路由过滤
         router = EvidenceScopeRouter()
+        from core.evidence_contract import build_evidence_contract
         from core.governance.facet_strategy import classify_intent_by_rule
         intent = classify_intent_by_rule(query)
         routed_refs = await router.route_references(query, intent, refs or [])
@@ -758,10 +816,21 @@ class PipelineWorkflow:
         # 隔离物理屏蔽与无用证据，只保留 CORE 和 BOUNDARY
         active_refs = routed_refs["CORE"] + routed_refs["BOUNDARY"]
         boundary_refs = routed_refs["BOUNDARY"]
+        evidence_contract = build_evidence_contract(query, refs or [], routed_refs)
         
         # 记录 RAG 路由审计日志
         blocked_count = len(routed_refs["BLOCKED"])
         unused_count = len(routed_refs["UNUSED"])
+        record_generation_audit({
+            "stage": "evidence_contract",
+            "status": evidence_contract.get("evidence_status", "unknown"),
+            "task_id": task_id_label,
+            "query": query,
+            "allowed_fact_count": evidence_contract.get("allowed_fact_count", 0),
+            "core_fact_count": evidence_contract.get("core_fact_count", 0),
+            "boundary_fact_count": evidence_contract.get("boundary_fact_count", 0),
+            "forbidden_expansions": evidence_contract.get("forbidden_expansions", []),
+        })
         if blocked_count > 0 or unused_count > 0:
             log_msg = f"EvidenceScopeRouter: filtered out {blocked_count} blocked and {unused_count} unused refs."
             logger.info(log_msg)
@@ -784,6 +853,7 @@ class PipelineWorkflow:
                 semaphore, 
                 simplify=f_info["simplify"], 
                 boundary_refs=boundary_refs,
+                evidence_contract=evidence_contract,
                 task_id_label=task_id_label
             ) 
             for f_info in governed_facets
@@ -799,9 +869,15 @@ class PipelineWorkflow:
                 "planner": facet,
                 "answer": answer
             })
-        return planners
+        return planners, evidence_contract
 
-    async def synthesize_answers(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> str:
+    async def synthesize_answers(
+        self,
+        query: str,
+        planners: List[Dict[str, str]],
+        task_id_label: str = "",
+        evidence_contract: Dict[str, Any] = None
+    ) -> str:
         """
         将过滤后的各切面回答综合凝练为单一的连贯最终摘要回答。
         路由至轻量级大模型执行。
@@ -824,10 +900,40 @@ class PipelineWorkflow:
             
         # 渲染综合凝练提示词并调用轻量级大模型
         prompt = PromptRenderer.render(prompts.MULTI_ANSWER_SYNTHESIS_TEMPLATE, query=query, answers=answers_clean)
+        if evidence_contract:
+            from core.evidence_contract import detect_forbidden_expansion, render_evidence_contract_prompt
+            prompt += render_evidence_contract_prompt(evidence_contract)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        summary = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面问答综合凝练")
-        logger.info("Successfully synthesized final answer summary.")
-        return summary
+        feedback = ""
+        for attempt in range(3):
+            summary = await self.llm_service.call_llm(
+                prompt + feedback,
+                model_pool="lightweight",
+                stage=f"{stage_prefix}切面问答综合凝练 attempt-{attempt + 1}"
+            )
+            violations = detect_forbidden_expansion(summary, evidence_contract) if evidence_contract else []
+            if not violations:
+                logger.info("Successfully synthesized final answer summary.")
+                return summary
+
+            record_generation_audit({
+                "stage": "summary_evidence_contract",
+                "status": "violation",
+                "task_id": task_id_label,
+                "query": query,
+                "attempt": attempt + 1,
+                "violations": violations,
+            })
+            logger.warning(
+                f"{stage_prefix}Summary evidence contract violation on attempt {attempt + 1}: {violations}"
+            )
+            feedback = (
+                "\n\n【上一版输出违反证据契约】\n"
+                f"违规项: {violations}\n"
+                "请重新综合。只能保留允许事实；对于证据未提供的信息，只能说明证据不足，禁止补写具体药代、替代药或临床研究结论。\n"
+            )
+
+        raise SampleQuarantineException(f"Summary repeatedly violated evidence contract for query: {query}")
 
     async def generate_next_question(self, context_list: List[Dict[str, str]], history: List[Dict[str, Any]], previous_summary: str, task_id_label: str = "") -> str:
         """
@@ -904,7 +1010,7 @@ class PipelineWorkflow:
             raise SampleQuarantineException(f"Facet preprocessing produced fewer than 2 valid facets; sample quarantined for query: {query}")
 
         # 3. 并发生成各切面回答
-        planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
+        planners, evidence_contract = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
         if not planners:
             raise SampleQuarantineException(f"No valid facet answers generated; sample quarantined for query: {query}")
         
@@ -918,14 +1024,20 @@ class PipelineWorkflow:
             non_redundant_planners = planners
             
         # 5. 综合凝练最终摘要
-        summary = await self.synthesize_answers(query, non_redundant_planners, task_id_label=task_id_label)
+        summary = await self.synthesize_answers(
+            query,
+            non_redundant_planners,
+            task_id_label=task_id_label,
+            evidence_contract=evidence_contract
+        )
         
         # 组装单轮结果数据
         round_data = {
             "Q": query,
             "planners": non_redundant_planners,
             "history": list(history) if history else [],
-            "summary": summary
+            "summary": summary,
+            "evidence_contract": evidence_contract
         }
         return round_data
 

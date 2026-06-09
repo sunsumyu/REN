@@ -269,7 +269,13 @@ class MedicalQAPipeline:
                 1. 生成的答案内容。
                 2. 推理过程或中间状态信息。
         """
-        return await self.workflow.answer_single_facet(query, facet, refs, semaphore, task_id_label)
+        return await self.workflow.answer_single_facet(
+            query,
+            facet,
+            refs,
+            semaphore,
+            task_id_label=task_id_label,
+        )
 
     async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
         """
@@ -286,7 +292,8 @@ class MedicalQAPipeline:
         Returns:
             List[Dict[str, str]]: 包含每个 facet 答案结果的字典列表。
         """
-        return await self.workflow.run_parallel_answers(query, facets, refs, task_id_label)
+        planners, _ = await self.workflow.run_parallel_answers(query, facets, refs, task_id_label)
+        return planners
 
     async def synthesize_answers(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> str:
         """
