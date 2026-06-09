@@ -45,6 +45,96 @@ def extract_json_block(text: str) -> str:
         return text[start:end+1]
     return text
 
+
+def repair_truncated_json(text: str) -> str:
+    """
+    Repair common LLM JSON tail truncation, such as a missing final `}` after
+    an otherwise complete object. This is intentionally narrow: it only balances
+    brackets/braces outside quoted strings and removes trailing commas.
+    """
+    import re
+
+    repaired = (text or "").strip()
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+
+    stack = []
+    in_string = False
+    escape = False
+    pairs = {"{": "}", "[": "]"}
+    closers = set(pairs.values())
+
+    for ch in repaired:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in pairs:
+            stack.append(pairs[ch])
+        elif ch in closers:
+            if stack and ch == stack[-1]:
+                stack.pop()
+            else:
+                return repaired
+
+    if in_string:
+        return repaired
+    return repaired + "".join(reversed(stack))
+
+
+def extract_questions_fallback(text: str) -> Any:
+    """
+    Salvage a valid `"questions": [...]` array when surrounding JSON is broken,
+    commonly because a discarded `think` field contains unescaped quotes.
+    """
+    import re
+
+    raw = text or ""
+    match = re.search(r'"questions"\s*:\s*\[', raw)
+    if not match:
+        return None
+
+    start = raw.find("[", match.start())
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                array_text = raw[start:idx + 1]
+                try:
+                    questions = json.loads(array_text)
+                except json.JSONDecodeError:
+                    return None
+                if isinstance(questions, list):
+                    return {"questions": questions}
+                return None
+    return None
+
 def parse_json_safely(text: str, default_value: Any = None) -> Any:
     """
     安全地解析 JSON 字符串。
@@ -63,6 +153,15 @@ def parse_json_safely(text: str, default_value: Any = None) -> Any:
     try:
         return json.loads(clean_text)
     except json.JSONDecodeError as e:
+        repaired_text = repair_truncated_json(clean_text)
+        if repaired_text != clean_text:
+            try:
+                return json.loads(repaired_text)
+            except json.JSONDecodeError:
+                pass
+        questions_payload = extract_questions_fallback(text)
+        if questions_payload is not None:
+            return questions_payload
         logger.error(f"JSON parsing error: {e}. Raw text was:\n{text}")
         return default_value
 
@@ -277,4 +376,3 @@ class MedicalQAPipeline:
         """
         from strategies.quality_gate.answer_guard import check_answer_quality
         return check_answer_quality(answer_body, reasoning_content)
-

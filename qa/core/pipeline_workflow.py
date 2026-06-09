@@ -18,6 +18,76 @@ from core.prompt_renderer import PromptRenderer
 logger = logging.getLogger("MedicalQA.PipelineWorkflow")
 GENERATION_AUDIT_PATH = Path(__file__).resolve().parent.parent / "logs" / "generation_audit.jsonl"
 
+HARD_FACT_RETRIEVAL_PATTERNS = [
+    r"推荐用法用量",
+    r"用法用量是什么",
+    r"主要不良反应",
+    r"不良反应有哪些",
+    r"什么类型.{0,8}临床试验",
+    r"临床试验.{0,8}什么类型",
+    r"规格是",
+    r"批准文号",
+    r"生产厂家",
+    r"具体数值",
+    r"具体剂量",
+    r"总\w{0,3}组数",
+    r"总\w{0,3}数量",
+    r"每组\w{0,4}数",
+    r"共\w{0,2}组",
+]
+
+SOFT_FACT_RETRIEVAL_PATTERNS = [
+    r"是多少",
+    r"有什么",
+    r"有哪些",
+    r"是什么",
+    r"什么类型",
+    r"如何分类",
+    r"列举",
+    r"有几",
+    r"是第几",
+    r"是哪\w{0,2}年",
+]
+
+CLINICAL_FRICTION_MARKERS = [
+    "患者",
+    "合并",
+    "既往",
+    "正在服用",
+    "肝功能",
+    "肾功能",
+    "禁忌",
+    "风险",
+    "权衡",
+    "机制",
+    "因果",
+    "鉴别",
+    "调整",
+    "特殊人群",
+    "外推",
+    "获益",
+    "冲突",
+    "边界",
+    "监测",
+]
+
+
+def is_fact_retrieval_question(question: str) -> bool:
+    """
+    Detect one-hop lookup questions that are too shallow for Think CoT training.
+    This gate is intentionally conservative: rejected samples are quarantined,
+    not written to the dataset.
+    """
+    q = (question or "").strip()
+    if not q:
+        return True
+    if any(re.search(pattern, q) for pattern in HARD_FACT_RETRIEVAL_PATTERNS):
+        return True
+    if not any(re.search(pattern, q) for pattern in SOFT_FACT_RETRIEVAL_PATTERNS):
+        return False
+    has_clinical_friction = any(marker in q for marker in CLINICAL_FRICTION_MARKERS)
+    return not (has_clinical_friction and len(q) >= 45)
+
 
 class SampleQuarantineException(Exception):
     """
@@ -209,50 +279,50 @@ class PipelineWorkflow:
         :return: 被随机选中的初始问题字符串
         :raises Exception: 如果未能从上下文中生成任何问题则抛出异常
         """
+        # 第一道物理防线：语料字数前置拦截
+        total_context_len = sum(len(c.get("context", "")) for c in context_list)
+        if total_context_len < 100:
+            logger.warning(f"[{task_id_label}] 第一道防线拦截：语料信息量极低 (仅 {total_context_len} 字)，直接阻断。")
+            raise SampleQuarantineException(f"上下文信息量过低（{total_context_len} 字），不足以支撑复杂推理题的构建。")
+
         # 渲染问题生成提示词
         prompt = PromptRenderer.render(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        # 调用轻量级大模型
-        response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}初始问题生成")
+        # 调用旗舰大模型（具备高指令服从度，支持源头熔断机制）
+        response = await self.llm_service.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}初始问题生成")
         
         # 安全解析JSON响应
         from pipeline import parse_json_safely
-        questions = parse_json_safely(response, [])
+        parsed_result = parse_json_safely(response, {})
+        
+        if isinstance(parsed_result, dict):
+            questions = parsed_result.get("questions", [])
+        elif isinstance(parsed_result, list):
+            questions = parsed_result
+        else:
+            questions = []
+            
         if not questions:
             raise Exception("Failed to generate questions from context.")
 
         # 层次三：正则网关——移除事实提取型问题候选，最多重试 2 次
-        import re as _re
-        _FACT_RETRIEVAL_PATTERNS = [
-            r"是多少",
-            r"有几",
-            r"是第几",
-            r"是哪\w{0,2}年",
-            r"具体数值",
-            r"具体剂量",
-            r"规格是",
-            r"批准文号",
-            r"生产厂家",
-            r"总\w{0,3}组数",
-            r"总\w{0,3}数量",
-            r"每组\w{0,4}数",
-            r"共\w{0,2}组",
-        ]
-
-        def _is_fact_retrieval(q: str) -> bool:
-            return any(_re.search(p, q) for p in _FACT_RETRIEVAL_PATTERNS)
-
-        filtered = [q for q in questions if not _is_fact_retrieval(q)]
+        filtered = [q for q in questions if not is_fact_retrieval_question(q)]
         retry_count = 0
         while not filtered and retry_count < 2:
             retry_count += 1
             logger.warning(f"{stage_prefix}所有候选问题均为事实提取型，重新生成（第 {retry_count} 次重试）...")
-            resp2 = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}初始问题生成(重试{retry_count})")
-            questions2 = parse_json_safely(resp2, [])
-            filtered = [q for q in questions2 if not _is_fact_retrieval(q)]
+            resp2 = await self.llm_service.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}初始问题生成(重试{retry_count})")
+            parsed2 = parse_json_safely(resp2, {})
+            if isinstance(parsed2, dict):
+                questions2 = parsed2.get("questions", [])
+            elif isinstance(parsed2, list):
+                questions2 = parsed2
+            else:
+                questions2 = []
+            filtered = [q for q in questions2 if not is_fact_retrieval_question(q)]
         if not filtered:
-            logger.warning(f"{stage_prefix}重试后仍无推理型问题，降级使用全部候选题。")
-            filtered = questions
+            logger.error(f"{stage_prefix}第三道防线拦截：连续 {retry_count+1} 次生成的候选问题均为单跳事实查询题，斩断退路。")
+            raise SampleQuarantineException("连续生成的候选问题均为单跳事实查询题，系统拒绝入库。")
 
         filtered_out = len(questions) - len(filtered)
         if filtered_out > 0:
@@ -778,11 +848,31 @@ class PipelineWorkflow:
             summary=previous_summary
         )
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        # 调用轻量级大模型
-        next_q = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}多轮对话下一问生成")
-        # 清理多余的引号和空格
-        next_q = next_q.strip().strip('"').strip("'")
-        return next_q
+        feedback = ""
+        for attempt in range(3):
+            retry_prompt = prompt + feedback
+            next_q = await self.llm_service.call_llm(
+                retry_prompt,
+                model_pool="lightweight",
+                stage=f"{stage_prefix}多轮对话下一问生成 attempt-{attempt + 1}"
+            )
+            # 清理多余的引号和空格
+            next_q = next_q.strip().strip('"').strip("'")
+            if not is_fact_retrieval_question(next_q):
+                return next_q
+
+            logger.warning(
+                f"{stage_prefix}下一轮问题命中事实提取型拦截（attempt {attempt + 1}）：{next_q}"
+            )
+            feedback = (
+                "\n\n<previous_validation_failure>\n"
+                f"上一次输出 `{next_q}` 属于单跳事实查询题，会被质量网关判定为推演复杂度不及格。"
+                "请改写为带患者背景、合并症/禁忌/药代冲突或证据边界权衡的临床推理题；"
+                "不要问“是什么/有哪些/用法用量/试验类型”等可直接摘录的问题。\n"
+                "</previous_validation_failure>"
+            )
+
+        raise SampleQuarantineException("连续生成的下一轮问题均为单跳事实查询题，系统拒绝入库。")
 
     async def generate_single_round(
         self, 
@@ -897,9 +987,11 @@ class PipelineWorkflow:
                 
         logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Theme: '{selected_theme}' ---")
         
-        # 3. 准备上下文和参考引用，生成初始问题
+        # 3. 准备上下文和参考引用
         context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
         logger.info(f"{log_prefix}AAABPrepared context_list: {len(context_list)} items, refs: {len(refs)} items")
+
+        # 生成初始问题
         q1 = await self.generate_initial_question(context_list, task_id_label=task_id_label)
         
         history = []

@@ -18,3 +18,4 @@
 | 2026-06-08T17:09:41.578140 | 258 | planner purification failed or planner count changed | `贴贴舒-复方雌二醇贴片的禁忌人群包括哪些？` | 禁忌人群 |
 | 2026-06-08T17:09:41.579350 | 259 | planner purification failed or planner count changed | `在临床安全性试验中，每天服用卢帕他定100mg连续6天，最常见的不良反应是什么？` | 剂量依赖性 |
 | 2026-06-08T17:09:41.581479 | 260 | planner purification failed or planner count changed | `子时用药组实验中使用了何种动物？每组动物数量及总组数是多少？` | 临床事实核验 |
+| 2026-06-09T16:51:49.412370 | 267 | planner purification failed or planner count changed | `海龙胶口服液的有效期是从什么时间起算的？` | 贮藏条件 |

@@ -36,15 +36,19 @@ from eval_models import JudgeMetric, ComprehensiveJudgeMetrics, EvalResultItem
 
 # 裁判大模型综合 Prompt 模板
 JUDGE_COMPREHENSIVE_PROMPT = """你是一个顶级医院的临床质量安全总监、循证医学教授与大模型红蓝对抗专家。
-你当前需要对一份大模型生成的医疗切面问答样本进行“事实忠实度”、“领域隔离度”、“可解释性”、“专业性”和“相关性”的五维综合打分。
+你当前需要对一份大模型生成的医疗切面问答样本进行“成功度”、“查全率”、“精确度”、“事实忠实度”、“相关性”、“专业度”、“可解释性”、“领域隔离度”、“推演复杂度”的九维综合打分。
 
 # 判定依据
-1. 事实忠实度 (grounding)：仔细核对 refs 背景指南事实。如果包含了 refs 中没有提到过的新实体或明显违背常识的捏造，严重扣分。完美无幻觉打分为 10.0 分。
-2. 领域隔离度 (isolation)：如果生成的 answer 混入了“法律合规”、“合规审计”、“数据隐私”、“供应链”等非医学跑题词汇，严重扣分！纯净医学专业陈述打分为 10.0 分。
-3. 可解释性 (explainability)：评估答案是否有清晰的逻辑推导和证据来源引用（如：根据《XX说明书》）。生硬直接给结论扣分。
-4. 专业性 (professionalism)：评估使用的医学术语是否规范，整体结构与用词是否像严谨的临床医学专家。
+1. 成功度 (success)：评估生成的输出是否完整包含所需结构（如<think>等），以及任务是否完整执行。
+2. 查全率 (recall)：评估无发现或拒答时是否有合理的边界扫描证据，而非随意拒答。
+3. 精确度 (precision)：评估医学推论、剂量匹配或药效陈述是否百分百精确无误。
+4. 事实忠实度 (faithfulness)：仔细核对 refs 背景指南事实。如果包含了 refs 中没有提到过的新实体或明显违背常识的捏造，严重扣分。
 5. 相关性 (relevance)：评估回答是否直击提问者的核心诉求，有无大量无意义的套话和废话。
-6. 打分原因必须可追踪：如果问题来自某个 facet 回答，请明确指出 facet 编号/名称；如果问题来自最终 summary，请明确指出 summary。不要只写笼统评价。
+6. 专业度 (professionalism)：评估使用的医学术语是否规范，整体结构与用词是否像严谨的临床医学专家。
+7. 可解释性 (interpretability)：评估答案是否有清晰的逻辑推导和证据来源引用（如：根据《XX说明书》）。生硬直接给结论扣分。
+8. 领域隔离度 (isolation)：如果生成的 answer 混入了“法律合规”、“数据隐私”、“供应链”等非医学跑题词汇，严重扣分！纯净医学专业陈述打分为 10.0 分。
+9. 推演复杂度 (complexity)：评估问题本身的认知深度。如果核心医学问题是可以直接查字典回答的单跳事实（如医保类型、规格），强制打严重低分（<5.0）。高分必须满足至少3步以上逻辑推导的要求。
+10. 打分原因必须可追踪：**请将所有分析内容统一写在 `reason` 字段的字符串内部，绝对禁止生造新的 JSON Key。** 如果问题来自某个 facet 回答，请在 `reason` 字符串开头明确指出 facet 编号/名称；如果来自最终 summary，请明确指出 summary。不要只写笼统评价。
 
 # 输入数据
 - 核心医学问题: "{{ query }}"
@@ -52,7 +56,7 @@ JUDGE_COMPREHENSIVE_PROMPT = """你是一个顶级医院的临床质量安全总
 - 待评估的医学回答: "{{ answer }}"
 
 # 输出格式契合 (Pydantic Schema)
-你必须且只能输出符合指定的 JSON 格式。包含以上 5 个维度的客观打分与详尽打分原因。
+你必须且只能输出符合指定的 JSON 格式。包含以上 9 个维度的客观打分与详尽打分原因。
 """
 
 def calculate_recall(answer: str, expected_keywords: List[str]) -> float:
@@ -167,20 +171,28 @@ async def run_evaluation():
             default_score = 10.0 if refusal_avoided and schema_ok else 2.0
             def_jm = JudgeMetric(score=default_score, reason=f"Judge failed: {e}")
             metrics = ComprehensiveJudgeMetrics(
-                grounding=def_jm,
-                isolation=def_jm,
-                explainability=def_jm,
+                success=def_jm,
+                recall=def_jm,
+                precision=def_jm,
+                faithfulness=def_jm,
+                relevance=def_jm,
                 professionalism=def_jm,
-                relevance=def_jm
+                interpretability=def_jm,
+                isolation=def_jm,
+                complexity=def_jm
             )
             
         # 6. Calculate Business Success Rate
         all_judge_scores = [
-            metrics.grounding.score,
-            metrics.isolation.score,
-            metrics.explainability.score,
+            metrics.success.score,
+            metrics.recall.score,
+            metrics.precision.score,
+            metrics.faithfulness.score,
+            metrics.relevance.score,
             metrics.professionalism.score,
-            metrics.relevance.score
+            metrics.interpretability.score,
+            metrics.isolation.score,
+            metrics.complexity.score
         ]
         is_success = schema_ok and refusal_avoided and (recall_rate >= 0.5) and all(s >= 6.0 for s in all_judge_scores)
         
@@ -199,7 +211,7 @@ async def run_evaluation():
         elif category == "refusal_boundary":
             intent_type = "循证医学边界与忠实度"
             intent_logic = "测试模型在本地无对应说明书证据时是否会凭空编造事实。当[事实忠实度]评分 >= 6.0 分时，证明模型符合严谨求实、绝不胡编乱造假古籍的医学循证设计意图。"
-            aligned_success = metrics.grounding.score >= 6.0
+            aligned_success = metrics.faithfulness.score >= 6.0
         else: # standard_clinical
             intent_type = "标准临床问答与Markdown排版"
             intent_logic = "测试核心临床药理与用药规范知识输出。排除硬编码的JSON括号格式判定，以大模型未拒答、字面召回率 >= 40%、且裁判主观评分均 >= 6.0 作为真实业务判定依据。"
@@ -235,18 +247,22 @@ async def run_evaluation():
             "missed_keywords": missed_kws,
             "recall_rate": recall_rate,
             "judge_metrics": {
-                "grounding": {"score": metrics.grounding.score, "reason": metrics.grounding.reason},
-                "isolation": {"score": metrics.isolation.score, "reason": metrics.isolation.reason},
-                "explainability": {"score": metrics.explainability.score, "reason": metrics.explainability.reason},
+                "success": {"score": metrics.success.score, "reason": metrics.success.reason},
+                "recall": {"score": metrics.recall.score, "reason": metrics.recall.reason},
+                "precision": {"score": metrics.precision.score, "reason": metrics.precision.reason},
+                "faithfulness": {"score": metrics.faithfulness.score, "reason": metrics.faithfulness.reason},
+                "relevance": {"score": metrics.relevance.score, "reason": metrics.relevance.reason},
                 "professionalism": {"score": metrics.professionalism.score, "reason": metrics.professionalism.reason},
-                "relevance": {"score": metrics.relevance.score, "reason": metrics.relevance.reason}
+                "interpretability": {"score": metrics.interpretability.score, "reason": metrics.interpretability.reason},
+                "isolation": {"score": metrics.isolation.score, "reason": metrics.isolation.reason},
+                "complexity": {"score": metrics.complexity.score, "reason": metrics.complexity.reason}
             },
             "aligned_success": aligned_success,
             "aligned_score": aligned_score
         }
         case_reports.append(case_report)
         
-        logger.info(f"   [RESULT] Success: {is_success} | Aligned Intent: {'✅ 通过' if aligned_success else '❌ 拦截'} ({aligned_score:.0f}%) | Avg Judge Score: {sum(all_judge_scores)/5:.1f}/10")
+        logger.info(f"   [RESULT] Success: {is_success} | Aligned Intent: {'✅ 通过' if aligned_success else '❌ 拦截'} ({aligned_score:.0f}%) | Avg Judge Score: {sum(all_judge_scores)/9:.1f}/10")
         
     await client.close()
     
@@ -256,11 +272,15 @@ async def run_evaluation():
     success_rate = (sum(1 for r in results if r.is_success) / total_cases) * 100 if total_cases > 0 else 0
     aligned_success_rate = (sum(1 for cr in case_reports if cr["aligned_success"]) / total_cases) * 100 if total_cases > 0 else 0
     
-    avg_grounding = sum(r.judge_metrics.grounding.score for r in results) / total_cases if total_cases > 0 else 0
-    avg_isolation = sum(r.judge_metrics.isolation.score for r in results) / total_cases if total_cases > 0 else 0
-    avg_explainability = sum(r.judge_metrics.explainability.score for r in results) / total_cases if total_cases > 0 else 0
-    avg_professionalism = sum(r.judge_metrics.professionalism.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_success = sum(r.judge_metrics.success.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_recall_judge = sum(r.judge_metrics.recall.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_precision = sum(r.judge_metrics.precision.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_faithfulness = sum(r.judge_metrics.faithfulness.score for r in results) / total_cases if total_cases > 0 else 0
     avg_relevance = sum(r.judge_metrics.relevance.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_professionalism = sum(r.judge_metrics.professionalism.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_interpretability = sum(r.judge_metrics.interpretability.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_isolation = sum(r.judge_metrics.isolation.score for r in results) / total_cases if total_cases > 0 else 0
+    avg_complexity = sum(r.judge_metrics.complexity.score for r in results) / total_cases if total_cases > 0 else 0
     
     conformance_rate = (sum(1 for r in results if r.schema_ok) / total_cases) * 100 if total_cases > 0 else 0
     refusal_avoided_rate = (sum(1 for r in results if r.refusal_avoided) / total_cases) * 100 if total_cases > 0 else 0
@@ -273,11 +293,15 @@ async def run_evaluation():
             "average_recall": round(avg_recall, 2),
             "schema_conformance_rate": round(conformance_rate, 2),
             "refusal_avoidance_rate": round(refusal_avoided_rate, 2),
-            "average_grounding_score": round(avg_grounding, 2),
-            "average_isolation_score": round(avg_isolation, 2),
-            "average_explainability_score": round(avg_explainability, 2),
+            "average_success_score": round(avg_success, 2),
+            "average_recall_judge_score": round(avg_recall_judge, 2),
+            "average_precision_score": round(avg_precision, 2),
+            "average_faithfulness_score": round(avg_faithfulness, 2),
+            "average_relevance_score": round(avg_relevance, 2),
             "average_professionalism_score": round(avg_professionalism, 2),
-            "average_relevance_score": round(avg_relevance, 2)
+            "average_interpretability_score": round(avg_interpretability, 2),
+            "average_isolation_score": round(avg_isolation, 2),
+            "average_complexity_score": round(avg_complexity, 2)
         },
         "results": [json.loads(r.model_dump_json()) for r in results],
         "case_reports": case_reports
@@ -307,15 +331,19 @@ async def run_evaluation():
         print(f"       - 已匹配词项: {matched_str}")
         print(f"       - 未匹配词项: {missed_str}")
         
-        # Five dimensions
-        print(f"   【裁判大模型主观打分】(五维评分):")
+        # Nine dimensions
+        print(f"   【裁判大模型主观打分】(九维评分):")
         for m_key, m_val in cr['judge_metrics'].items():
             chinese_name = {
-                "grounding": "事实忠实度",
+                "success": "成功度",
+                "recall": "查全率",
+                "precision": "精确度",
+                "faithfulness": "事实忠实度",
+                "relevance": "相关性",
+                "professionalism": "专业度",
+                "interpretability": "可解释性",
                 "isolation": "领域隔离度",
-                "explainability": "可解释性",
-                "professionalism": "专业性",
-                "relevance": "相关性"
+                "complexity": "推演复杂度"
             }.get(m_key, m_key)
             print(f"       * {chinese_name:<10}: {m_val['score']:.1f} / 10.0 (判定原因: {m_val['reason']})")
             
@@ -333,11 +361,15 @@ async def run_evaluation():
     print(f"  ⚠️  硬编码业务成功率 (Business Success)    : {report['summary']['success_rate']}%  (包含JSON格式大括号强约束)")
     print(f"  🚀 符合测试意图成功率 (Aligned Success)    : {report['summary']['aligned_success_rate']}%  (真实业务/Markdown排版对齐)")
     print(f"--------------------------------------------------------------------------------")
-    print(f"  事实忠实度 (Avg Grounding)       : {report['summary']['average_grounding_score']} / 10.0")
-    print(f"  领域隔离度 (Avg Isolation)       : {report['summary']['average_isolation_score']} / 10.0")
-    print(f"  可解释性   (Avg Explainability)  : {report['summary']['average_explainability_score']} / 10.0")
-    print(f"  专业性     (Avg Professionalism) : {report['summary']['average_professionalism_score']} / 10.0")
+    print(f"  成功度     (Avg Success)         : {report['summary']['average_success_score']} / 10.0")
+    print(f"  查全率     (Avg Recall Judge)    : {report['summary']['average_recall_judge_score']} / 10.0")
+    print(f"  精确度     (Avg Precision)       : {report['summary']['average_precision_score']} / 10.0")
+    print(f"  事实忠实度 (Avg Faithfulness)    : {report['summary']['average_faithfulness_score']} / 10.0")
     print(f"  相关性     (Avg Relevance)       : {report['summary']['average_relevance_score']} / 10.0")
+    print(f"  专业度     (Avg Professionalism) : {report['summary']['average_professionalism_score']} / 10.0")
+    print(f"  可解释性   (Avg Interpretability): {report['summary']['average_interpretability_score']} / 10.0")
+    print(f"  领域隔离度 (Avg Isolation)       : {report['summary']['average_isolation_score']} / 10.0")
+    print(f"  推演复杂度 (Avg Complexity)      : {report['summary']['average_complexity_score']} / 10.0")
     print(f"--------------------------------------------------------------------------------")
     print(f"  📁 详细质量评估报告已保存至: {report_file}")
     print("="*80 + "\n")

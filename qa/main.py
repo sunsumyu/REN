@@ -24,11 +24,15 @@ setup_logging(log_file=os.path.join(os.path.dirname(__file__), "pipeline_executi
 logger = logging.getLogger("MedicalQA.Main")
 
 QUALITY_METRIC_LABELS = [
-    ("grounding", "事实忠实度"),
-    ("isolation", "领域隔离度"),
-    ("explainability", "可解释性"),
-    ("professionalism", "专业性"),
+    ("success", "成功度"),
+    ("recall", "查全率"),
+    ("precision", "精确度"),
+    ("faithfulness", "事实忠实度"),
     ("relevance", "相关性"),
+    ("professionalism", "专业度"),
+    ("interpretability", "可解释性"),
+    ("isolation", "领域隔离度"),
+    ("complexity", "推演复杂度"),
 ]
 
 # Global counter stats
@@ -301,13 +305,17 @@ async def generate_and_save_single_task(
                 stage=f"[{task_label}] 生成数据集质检打分"
             )
             all_scores = [
-                metrics.grounding.score,
-                metrics.isolation.score,
-                metrics.explainability.score,
+                metrics.success.score,
+                metrics.recall.score,
+                metrics.precision.score,
+                metrics.faithfulness.score,
+                metrics.relevance.score,
                 metrics.professionalism.score,
-                metrics.relevance.score
+                metrics.interpretability.score,
+                metrics.isolation.score,
+                metrics.complexity.score
             ]
-            avg_score = sum(all_scores) / 5.0
+            avg_score = sum(all_scores) / 9.0
             
             # 4. 防拒答与主观打分双向过关判定
             import re
@@ -317,7 +325,7 @@ async def generate_and_save_single_task(
             is_success = refusal_avoided and all(s >= 6.0 for s in all_scores)
             
             logger.info(f"{log_prefix}质量网关评估完成 - 平均分: {avg_score:.1f}/10 (通过状态: {'✅ 通过' if is_success else '❌ 拦截'})")
-            logger.info(f"{log_prefix}[评分明细] 忠实度: {metrics.grounding.score}, 隔离: {metrics.isolation.score}, 可解释: {metrics.explainability.score}, 专业: {metrics.professionalism.score}, 相关: {metrics.relevance.score}")
+            logger.info(f"{log_prefix}[评分明细] 成功: {metrics.success.score}, 查全: {metrics.recall.score}, 精确: {metrics.precision.score}, 忠实: {metrics.faithfulness.score}, 相关: {metrics.relevance.score}, 专业: {metrics.professionalism.score}, 解释: {metrics.interpretability.score}, 隔离: {metrics.isolation.score}, 复杂: {metrics.complexity.score}")
             quality_audit = build_quality_gate_audit(task_label, dataset, metrics, avg_score, refusal_avoided, is_success)
             
             if not is_success:
