@@ -76,6 +76,25 @@ class LocalRAGService:
             
         _ACTIVE_RAG_SERVICES.append(self)
 
+    def _normalize_entity_name(self, name: str) -> str:
+        """
+        对实体名称进行归一化清洗：
+        1. 全部转为小写
+        2. 剔除所有空白字符与常见符号/连字符 (_, -, ~, ®, ™ 等)
+        3. 剔除中西药常见剂型/规格后缀 (片, 胶囊, 注射液, 口服溶液, 胶浆, 颗粒, 软膏)
+        """
+        if not name:
+            return ""
+        name = name.lower()
+        # 去除所有空格和标点符号
+        name = re.sub(r'[\s\-~_\(\)（）\+®™/\.\,，。]', '', name)
+        # 去除常见剂型/产品后缀
+        suffixes = ["片", "胶囊", "注射液", "口服溶液", "口服液", "胶浆", "颗粒", "软膏", "凝胶", "滴眼液", "泡腾片", "贴膏"]
+        for suf in suffixes:
+            if name.endswith(suf) and len(name) > len(suf):
+                name = name[:-len(suf)]
+        return name
+
     def _ensure_sqlite_schemas(self):
         cursor = self.conn.cursor()
         # 普通物理事实表
@@ -187,7 +206,22 @@ class LocalRAGService:
         cursor = self.conn.cursor()
         results = []
         clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
-        words = [w for w in clean_query.split() if len(w) > 1]
+        
+        words = []
+        for w in clean_query.split():
+            if len(w) <= 1:
+                continue
+            if re.search(r'[\u4e00-\u9fa5]', w):
+                if len(w) > 4:
+                    for i in range(len(w) - 1):
+                        words.append(w[i:i+2])
+                    for i in range(len(w) - 2):
+                        words.append(w[i:i+3])
+                else:
+                    words.append(w)
+            else:
+                words.append(w)
+        words = list(set([wd.strip() for wd in words if len(wd.strip()) > 1]))
         
         if words:
             search_term = " OR ".join(words)
@@ -285,7 +319,27 @@ class LocalRAGService:
         # 2. 倒排通道搜索 (Sparse Search via FTS5)
         fts_hits = []
         clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
-        words = [w for w in clean_query.split() if len(w) > 1]
+        
+        words = []
+        for w in clean_query.split():
+            if len(w) <= 1:
+                continue
+            if re.search(r'[\u4e00-\u9fa5]', w):
+                if len(w) > 4:
+                    for i in range(len(w) - 1):
+                        words.append(w[i:i+2])
+                    for i in range(len(w) - 2):
+                        words.append(w[i:i+3])
+                else:
+                    words.append(w)
+            else:
+                words.append(w)
+                
+        if entity_name:
+            words.append(entity_name)
+            
+        words = list(set([wd.strip() for wd in words if len(wd.strip()) > 1]))
+        
         if words:
             search_term = " OR ".join(words)
             try:
@@ -326,19 +380,21 @@ class LocalRAGService:
                 candidates[doc_id] = hit
             rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (60.0 + rank)
 
-        # 4. 实体硬匹配过滤 (Entity Filtering)
+        # 4. 弹性实体硬匹配与退避过滤 (Elastic Entity Filtering & Backoff)
         entity_matches = []
         other_matches = []
-        target_entity_clean = entity_name.strip() if entity_name else ""
+        
+        target_norm = self._normalize_entity_name(entity_name) if entity_name else ""
 
         for doc_id, score in rrf_scores.items():
             cand = candidates[doc_id]
             cand_entity = cand.get("entity_name", "")
+            cand_norm = self._normalize_entity_name(cand_entity)
             
             is_entity_match = False
-            if target_entity_clean:
-                # 检查互包含关系
-                if (target_entity_clean in cand_entity) or (cand_entity in target_entity_clean):
+            if target_norm:
+                # 优先检查清洗后的互包含关系
+                if (target_norm in cand_norm) or (cand_norm in target_norm):
                     is_entity_match = True
             
             if is_entity_match:
@@ -349,19 +405,40 @@ class LocalRAGService:
         # 决定使用的候选集
         final_candidates = []
         retrieval_method_tag = "hybrid_rrf"
+        
         if entity_matches:
             entity_matches.sort(key=lambda x: x[1], reverse=True)
             final_candidates = entity_matches
             retrieval_method_tag += "_entity"
         else:
-            if not target_entity_clean:
+            if not target_norm:
                 # 只有当没有指定具体实体时，才允许使用 general 的其他匹配
                 other_matches.sort(key=lambda x: x[1], reverse=True)
                 final_candidates = other_matches
                 retrieval_method_tag += "_general"
             else:
-                # 指定了实体却没匹配到，说明 Tier 1 未命中该实体，直接返回空，触发 Tier 2/3 降级
-                logger.info(f"Local RAG: Specified entity '{entity_name}' had 0 matching docs in Tier 1. Bypassing other_matches to trigger fallback.")
+                # 【退避防御优化】：如果指定了实体但物理上没有硬匹配成功的文档，
+                # 不应粗暴地直接返回空！这会导致极其优秀的语义匹配结果（如 CYP2C9 vs 塞来昔布）被强行抛弃。
+                # 只要候选文档的相似度较高 (>= 0.70)，或者是 FTS/倒排高频命中，且 RRF 排序在 Top-3，则被召回。
+                backup_candidates = []
+                for doc_id, score in other_matches:
+                    cand = candidates[doc_id]
+                    sim = cand.get("similarity_score")
+                    
+                    is_high_value = False
+                    if sim is not None and sim >= max(0.45, self.similarity_threshold - 0.10):
+                        is_high_value = True
+                    
+                    if is_high_value:
+                        backup_candidates.append((doc_id, score))
+                
+                if backup_candidates:
+                    backup_candidates.sort(key=lambda x: x[1], reverse=True)
+                    final_candidates = backup_candidates[:3] # 取前3个高质量备选
+                    retrieval_method_tag += "_fallback_high_sim"
+                    logger.info(f"Local RAG: Specified entity '{entity_name}' had 0 hard entity matches, but retrieved {len(final_candidates)} high-value fallback candidates.")
+                else:
+                    logger.info(f"Local RAG: Specified entity '{entity_name}' had 0 matching docs in Tier 1. Bypassing other_matches to trigger fallback.")
 
         # 5. 相似度门禁过滤与通道决定
         results = []
