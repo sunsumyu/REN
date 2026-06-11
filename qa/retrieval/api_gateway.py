@@ -210,8 +210,8 @@ class APIGatewayService:
 
         loop = asyncio.get_event_loop()
 
-        # 定义带限流和 HTTP 429 自愈重试的通用 HTTP 获取器
-        async def fetch_url_with_retry(base_url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        # 定义带限流和 HTTP 429 自愈重试的通用 HTTP 获取器，返回原始文本
+        async def fetch_url_raw(base_url: str, params: Dict[str, Any]) -> str:
             max_retries = 3
             backoff = 1.0
             for attempt in range(max_retries):
@@ -221,12 +221,12 @@ class APIGatewayService:
                     def do_request():
                         url = f"{base_url}?{urllib.parse.urlencode(params)}"
                         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, timeout=3.0) as r:
-                            return json.loads(r.read().decode('utf-8'))
+                        with urllib.request.urlopen(req, timeout=5.0) as r:
+                            return r.read().decode('utf-8', errors='ignore')
                     return await loop.run_in_executor(None, do_request)
                 except urllib.error.HTTPError as he:
                     if he.code == 429:
-                        # 429 专属自愈等待：根据 Retry-After 避让或执行指数退避
+                        # 429 自愈等待
                         retry_after = he.headers.get("Retry-After")
                         wait_sec = float(retry_after) if (retry_after and retry_after.isdigit()) else backoff
                         logger.warning(f"PubMed API HTTP 429 (Too Many Requests). Attempt {attempt+1}/{max_retries}. Waiting {wait_sec}s before retry...")
@@ -237,42 +237,95 @@ class APIGatewayService:
             raise Exception("Failed to fetch from PubMed API due to persistent HTTP 429 rate limit errors.")
 
         try:
-            # 1. 检索 PMID 列表
+            # 1. 检索 PMID 列表 (使用 JSON)
             search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-            search_res = await fetch_url_with_retry(search_url, search_params)
+            search_raw = await fetch_url_raw(search_url, search_params)
+            search_res = json.loads(search_raw)
             id_list = search_res.get("esearchresult", {}).get("idlist", [])
             
             if not id_list:
                 logger.info(f"PubMed Search yielded 0 results for term '{term}'")
                 return []
 
-            # 2. 批量合并提取 PMID 文献摘要 (Summary)
-            summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-            summary_params = {
+            # 2. 批量合并提取 PMID 文献详情与摘要 (使用 XML)
+            fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            fetch_params = {
                 "db": "pubmed",
                 "id": ",".join(id_list),
-                "retmode": "json"
+                "retmode": "xml"
             }
             if self.pubmed_api_key:
-                summary_params["api_key"] = self.pubmed_api_key
+                fetch_params["api_key"] = self.pubmed_api_key
 
-            summary_res = await fetch_url_with_retry(summary_url, summary_params)
-            uid_results = summary_res.get("result", {})
+            xml_data = await fetch_url_raw(fetch_url, fetch_params)
+            
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml_data.encode('utf-8'))
             
             extracted_refs = []
-            for uid in id_list:
-                doc = uid_results.get(uid, {})
-                title = doc.get("title", "Unknown Title")
-                pub_date = doc.get("pubdate", "Unknown Date")
-                source = doc.get("source", "PubMed")
-                authors = ", ".join([a.get("name", "") for a in doc.get("authors", [])])
+            # 解析 XML 中的每个 PubmedArticle
+            for article in root.findall('.//PubmedArticle'):
+                # 提取 PMID
+                pmid_el = article.find('.//PMID')
+                uid = pmid_el.text if pmid_el is not None else "Unknown"
                 
-                context = f"【临床研究文献报道】: 题目《{title}》，发表于 {pub_date}。主要作者: {authors}。研究刊载于《{source}》。"
+                # 提取标题 (清洗换行等)
+                title_el = article.find('.//ArticleTitle')
+                title = "".join(title_el.itertext()).strip() if title_el is not None else "Unknown Title"
+                
+                # 提取出版日期
+                pubdate_el = article.find('.//JournalIssue/PubDate')
+                pub_date = "Unknown Date"
+                if pubdate_el is not None:
+                    year = pubdate_el.find('Year')
+                    month = pubdate_el.find('Month')
+                    medline = pubdate_el.find('MedlineDate')
+                    if year is not None:
+                        pub_date = year.text
+                        if month is not None:
+                            pub_date += f" {month.text}"
+                    elif medline is not None:
+                        pub_date = medline.text
+                
+                # 提取作者
+                authors_list = []
+                for author in article.findall('.//AuthorList/Author'):
+                    last_name = author.find('LastName')
+                    fore_name = author.find('ForeName')
+                    if last_name is not None:
+                        ln = last_name.text if last_name.text else ""
+                        fn = fore_name.text if fore_name is not None and fore_name.text else ""
+                        authors_list.append(f"{ln} {fn}".strip())
+                authors = ", ".join(authors_list) if authors_list else "Unknown Authors"
+                
+                # 提取期刊名称
+                journal_el = article.find('.//Journal/Title')
+                source = journal_el.text if journal_el is not None else "PubMed"
+                
+                # 提取摘要正文
+                abstract_texts = []
+                for abs_text in article.findall('.//Abstract/AbstractText'):
+                    label = abs_text.attrib.get('Label', '')
+                    text = "".join(abs_text.itertext()).strip()
+                    if label:
+                        abstract_texts.append(f"{label}: {text}")
+                    else:
+                        abstract_texts.append(text)
+                abstract = "\n".join(abstract_texts) if abstract_texts else "暂无正文摘要"
+                
+                # 组装包含完整摘要正文的 context
+                context = (
+                    f"【临床研究文献报道】: 题目《{title}》，发表于 {pub_date}。主要作者: {authors}。研究刊载于《{source}》。\n"
+                    f"【文献正文摘要】:\n{abstract}"
+                )
+                
+                logger.info(f"PubMed XML Processing: Extracted abstract for PMID {uid}. Title: '{title[:40]}...'. Abstract length: {len(abstract)} chars. First 60 chars: '{abstract[:60].replace(chr(10), ' ')}...'")
+                
                 item = {
                     "source": f"PubMed (PMID: {uid})",
                     "context": context,
                     "category": "文献证据",
-                    "metadata": {"title": title, "authors": authors, "pmid": uid}
+                    "metadata": {"title": title, "authors": authors, "pmid": uid, "abstract": abstract}
                 }
                 extracted_refs.append(item)
 

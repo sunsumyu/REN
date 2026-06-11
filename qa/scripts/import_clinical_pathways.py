@@ -247,12 +247,13 @@ def run_import(source_dir: str, db_path: str, index_path: str, max_docs: int = 3
         print(f"-> Extracted metadata: ICD-10={metadata['icd_code']}, StandardDays={metadata['standard_days']}")
         print(f"-> Sliced into {len(chunks)} raw chunks.")
         
-        # 头部上下文信息增强注入
-        enriched_chunks = ClinicalPathwayPurifier.enrich_chunks(chunks, metadata)
-        
+        # 2026-06-11 Decoupling metadata header to prevent embedding pollution
         source_name = f"refs:《国家卫健委-2019版临床路径-{os.path.splitext(os.path.basename(filepath))[0]}》"
         
-        for chunk_idx, chunk in enumerate(enriched_chunks):
+        for chunk_idx, chunk in enumerate(chunks):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
             # 去重检测
             if (entity, chunk) not in existing_records:
                 # 写入 SQLite Ordinary 表

@@ -878,7 +878,276 @@ flowchart TD
 - `write_task_outcome()`
 - `write_generation_rejection_report()`
 
+---
 
+## 11. PubMed 数据获取、处理与 LLM 协同注入生命周期明细
+
+系统提供了一套高弹性的外部学术文献检索与协同注入机制，主要通过 NCBI E-Utilities API 抓取 PubMed 学术文献，并将其转化为对大模型的硬性证据契约约束。以下是完整的全生命周期时序图与处理流程：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant RM as RetrievalManager
+    participant AG as APIGatewayService
+    participant ESR as EvidenceScopeRouter
+    participant EC as EvidenceContract
+    participant LLM as LLMService (Premium)
+    participant PW as PipelineWorkflow (Audit)
+
+    Note over RM, AG: 1. 抓取与对齐阶段
+    RM->>AG: search(query, entity_name)
+    AG->>AG: translate_entity_to_english() -> English Term
+    AG->>AG: fetch_pubmed_abstracts() (NCBI JSON & XML APIs)
+    AG-->>RM: List[NormalizedClinicalRef] (PMID, Title, Abstract)
+
+    Note over RM, ESR: 2. 路由与评分阶段 (Routing & Scoring)
+    RM->>ESR: route_references(query, intent, refs)
+    ESR->>ESR: embedding_model.encode(refs & intent Anchors)
+    Note over ESR: 余弦相似度计算 (Cosine Similarity):<br/>core_score = cos(ref, ANCHOR)<br/>blocked_score = cos(ref, BLOCKED_ANCHOR)
+    Note over ESR: 判定规则 (Routing Decision):<br/>- blocked_score > 0.65 -> BLOCKED<br/>- core_score > 0.60 -> CORE<br/>- core_score > 0.45 -> BOUNDARY<br/>- else -> UNUSED
+    ESR-->>RM: Routed Refs (CORE, BOUNDARY, etc.)
+    Note over ESR: 💡 输出日志: PubMed Semantic Processing: Evaluated... Similarity (Core: 0.8124, Blocked: 0.1203) -> Routed to: CORE
+
+    Note over RM, EC: 3. 契约构建阶段 (Evidence Contract)
+    RM->>EC: build_evidence_contract(query, CORE + BOUNDARY refs)
+    EC-->>RM: allowed_facts (F001, F002...) + forbidden_expansions
+
+    Note over RM, LLM: 4. 注入与生成阶段 (Injection & LLM)
+    RM->>LLM: user_prompt (refs JSON + allowed_facts + hard rules)
+    Note over LLM: 💡 输出日志: Injecting PubMed references to LLM for facet '...'
+    LLM-->>RM: FacetQAOutput (evidences + reasoning_chains)
+
+    Note over RM, PW: 5. 校验与追溯阶段 (Audit Check)
+    RM->>PW: verify_citations(FacetQAOutput)
+    Note over PW: 检测 LLM 是否使用 PMID 并关联到正确推理步骤 (e.g. P4)
+    Note over PW: 💡 输出日志: ★ [PubMed Citation Verified] LLM successfully utilized...
+```
+
+### 11.1 触发与回退机制 (Fallback Triggering)
+- **调度协调**：整个检索生命周期由 [retrieval_manager.py](file:///d:/REN/qa/retrieval/retrieval_manager.py) 中的 `RetrievalManager.get_grounding_references()` 负责协调。
+- **三级降级路径**：优先检索 Tier 1 本地私有 RAG（由 [local_rag.py](file:///d:/REN/qa/retrieval/local_rag.py) 提供）。若 Tier 1 对目标实体返回 0 个匹配（已绕过 fuzzy `other_matches` 干扰项），则降级调用 Tier 2 专业医学接口网关 `APIGatewayService.search()`。
+
+### 11.2 中英医疗术语翻译与对齐 (Entity Translation & Alignment)
+- **术语翻译函数**：[api_gateway.py](file:///d:/REN/qa/retrieval/api_gateway.py) 中的 `APIGatewayService.translate_entity_to_english()`。
+- **对齐通道**：
+  1. **通道一 (本地静态对照表)**：高频词表 `STATIC_TRANSLATION_MAP` 快速精确命中，例如“布洛芬” -> “Ibuprofen”，“甲氨蝶呤” -> “Methotrexate”。
+  2. **通道二 (LLM 动态对齐)**：若本地对照表未匹配，则调用轻量级大模型（model_pool 为 `lightweight`）引导完成英文通用名、MeSH 词或基因缩写转换。输出后通过正则 `[^a-zA-Z0-9\s\-\*\/]` 剔除所有标点符号与干扰字符。
+  3. **降级兜底**：若大模型调用异常，则通过正则表达式保留原实体名中的英文字符，剔除所有中文字符。
+
+### 11.3 NCBI API 检索与自愈防抖 (NCBI API Fetching)
+- **执行方法**：`APIGatewayService.fetch_pubmed_abstracts()`。
+- **两阶段抓取**：
+  1. **eSearch 检索**：调用 `esearch.fcgi` 以 JSON 模式检索目标学术术语，获取相关联的 PMID 列表（由 `limit` 约束，默认返回最新的 3 篇）。
+  2. **eFetch 详情拉取**：将 PMID 拼接成 CSV 字符串，以 HTTP POST 请求发送至 `efetch.fcgi`，指定 `retmode=xml` 获取原始 XML 学术详情及摘要段落。
+- **自愈与控频 (AsyncRateLimiter)**：
+  - NCBI 限制未授权调用在 3 RPS 以下（已配置 `PUBMED_API_KEY` 时为 10 RPS）。系统利用 `AsyncRateLimiter` 协程锁严格控频。
+  - 对于高并发下可能出现的 HTTP 429 限制，系统通过读取 HTTP 头的 `Retry-After` 信息或采用指数退避机制进行最多 3 次自愈重试。
+
+### 11.4 XML 树状解析与格式归一化 (XML Parsing & Normalization)
+- **解析器**：在 `APIGatewayService.fetch_pubmed_abstracts()` 中，使用标准库 `xml.etree.ElementTree` 树状结构解析 XML 文本。
+- **核心数据提取**：
+  - 提取 PMID（`<PMID>`）、文章标题（`<ArticleTitle>`）、出版日期（`<PubDate>` 优先读取 Year+Month，缺失则读取 `<MedlineDate>` 兜底）、文献作者（`<AuthorList/Author>` 中的 FirstName + LastName）和期刊名（`<Journal/Title>`）。
+  - 提取文献摘要正文：遍历所有的 `<Abstract/AbstractText>`，提取多段式摘要段落（包含 `Label` 属性，如 `BACKGROUND`/`METHODS`/`RESULTS` 等），并自动拼接为一整段无截断摘要文本。
+- **归一化输出**：拼装为包含 `source: "PubMed (PMID: {uid})"`、`context` 预览及 `metadata` 的 `NormalizedClinicalRef` 对象。
+
+### 11.5 本地持久化缓存保护 (SQLite3 API Cache)
+- **持久化路径**：[api_gateway.py](file:///d:/REN/qa/retrieval/api_gateway.py) 初始化时拉起零依赖的本地 SQLite3 缓存数据库 `medical_cache.db`（表 `api_cache`）。
+- **复合哈希机制**：采用 `sha256(service_name:query)` 生成唯一键值，再次秒级启动相同任务时可瞬间从缓存读取已抓取的 XML 详情，彻底规避 NCBI 调用超时或反爬被封的物理风险。
+
+### 11.6 证据语义路由隔离 (Semantic Scope Routing)
+- **执行协调**：[evidence_scope_router.py](file:///d:/REN/qa/core/rag/evidence_scope_router.py) 的 `EvidenceScopeRouter.route_references()`。
+- **意图与元数据过滤**：依据问答分类意图检索其规则。如果匹配 `META_CORE`、`META_BOUNDARY` 或 `META_BLOCKED` 直接分类。
+- **语义相似度 double 阈值过滤**：未命中元数据匹配的文献，使用 `LocalEmbeddingEngine`（基于 `shibing624/text2vec-base-chinese`）计算文献与意图锚点 `ANCHOR` 和强制隔离锚点 `BLOCKED_ANCHOR` 的余弦相似度向量夹角：
+  - **`CORE` 作用域** (相似度 > 0.60)：核心证据，用于大模型主要推理回答。
+  - **`BOUNDARY` 作用域** (相似度 > 0.45)：次要证据，限制大模型简要提到（最多各一句），严禁展开。
+  - **`BLOCKED` 作用域** (阻断相似度 > 0.65 且高于核心相似度)：屏蔽低相关或无证据内容（例如无文献支撑的微观药代理论等），从 Prompt 中物理清除，防止大模型幻觉泛化。
+  - **`UNUSED` 作用域**：语义无关噪音，丢弃。
+
+### 11.7 证据契约构建与硬性约束注入 (Evidence Contract & Prompt Injection)
+- **事实契约构建**：[evidence_contract.py](file:///d:/REN/qa/core/evidence_contract.py) 中的 `build_evidence_contract()` 将 `CORE` 与 `BOUNDARY` 状态的文献提取为 `allowed_fact_count` 事实数组（为每条事实赋予 `F001`, `F002`... 等物理 ID 锚点），并根据文献提及的文本事实自动推理出 `forbidden_expansions` 禁止外推列表。
+- **Prompt 物理注入路径**：
+  1. 在 `PipelineWorkflow.answer_single_facet()` 中，利用 [prompt_renderer.py](file:///d:/REN/qa/core/prompt_renderer.py) 的 `PromptRenderer.get_l3_context(query, active_refs, [])` 方法。
+  2. 该方法内部渲染了位于 [prompts.py](file:///d:/REN/qa/prompts.py) 的 `L3_DYNAMIC_CONTEXT_TEMPLATE` 模板，该模板将 PubMed 的内容以结构化的 JSON-like 格式注入到 `# 输入数据 (Input Context)` 的 `## 2. 图谱与说明书线索 (refs)` 块中：
+     ```jinja2
+     ## 2. 图谱与说明书线索 (refs)
+     [
+       {% for item in refs %}
+       { "source": "{{ item.source }}", "context": "{{ item.context }}" }{% if not loop.last %},{% endif %}
+       {% endfor %}
+     ]
+     ```
+  3. 随后，调用 `render_evidence_contract_prompt(evidence_contract)` 把允许的事实及禁止外推清单注入到最终的 `user_prompt` 中，提交给高级推理大模型。
+- **约束渲染注入**：证据契约被翻译为可嵌入提示词，向 LLM 声明如下内容：
+  - 强制声明证据状态。
+  - 给出只读的“允许事实清单”（每项关联特定事实 ID 与来源，如 `[F001] [core] PubMed (PMID: 38249092)`）。
+  - 给出禁止扩写药代、无证据替代药与虚构数值的“禁止外推清单”。
+  - 强制 `evidences` 字段只允许引用清单中的 PMID。
+
+### 11.8 大模型推理生成与引用溯源核验 (LLM Generation & Citation Verification)
+- **结构化输出**：大模型使用 `model_pool="premium"` 的高级模型在约束下进行 CoT 链式思考，并返回 `FacetQAOutput`。
+- **违规审计与隔离 (detect_forbidden_expansion)**：大模型生成文本后，调用 `detect_forbidden_expansion()` 检测其正文及推理链是否触碰了“禁止外推清单”中的规则词（如违规生化机制、未授权说明书字段等）。若未通过，则进行重新生成；若连续违规 3 次，整个样本将抛出 `SampleQuarantineException` 予以强制隔离并移送 Quarantined 归档，防止脏数据入库。
+- **成功审计与利用证实 (Citation Check)**：
+  - 质检通过的样本会在日志中详细审计 PMID 是否被真实利用：
+    ```text
+    ★ [PubMed Citation Verified] LLM successfully utilized and cited PubMed references in its structured output for facet '...':
+        ▶ [证据来源]: PubMed (PMID: 42264861) (定位: ...)
+        ▶ [提取核心事实]: ...
+        ▶ [医学推理逻辑 (step_1)]: ...
+    ```
+  - 如果大模型未真正提及注入的文献，则会在日志中给出警告 `⚠ [PubMed Citation Check] LLM did NOT reference the provided PubMed references ...`。
+
+### 11.9 持久落盘与 outcomes 审计
+- **并行写锁**：[main.py](file:///d:/REN/qa/main.py) 的 `generate_and_save_single_task()` 在数据质检通过（平均分 >= 6 且防拒答校验通过）后，通过 `db_write_lock` 异步写锁，实现 JSONL 和 SQLite3 `qa_datasets.db` 的安全写入。
+- **最终 outcome 追踪**：将该次 Task 无论是 passed/rejected/quarantined/exception 的完整状态、对应的 PMID 数量、allowed_fact_count 事实总数及失败根因信息完整记录在 `logs/generation_task_outcomes.jsonl`，实现每条数据全链路生命周期可闭环复盘。
+
+### 11.10 PubMed 协同注入真实运行样例剖析
+
+为了更好地理解该生命周期在实际批处理运行中的运作模式，我们可以通过一次真实的系统日志输出（对应任务 `Task-1` 的切面 `哺乳期用药安全与哮喘治疗管理`）进行细致的流程还原：
+
+#### 1. 抓取与缓存命中阶段 (NCBI API & Cache Fetching)
+系统针对当前涉及的主题或实体（如“哺乳期哮喘治疗”等相关词汇）发起对 PubMed 的请求。由于该检索词已被系统处理过，系统首先从本地的零依赖缓存 `medical_cache.db` 中进行秒级读取（Cache HIT）。
+- **文献标识**：PMID: `38249092`。
+- **获取到的文献正文摘要**：包含了哮喘常规管理指南、吸入性糖皮质激素（ICS）与白三烯受体拮抗剂（LTRA）的应用逻辑等。
+
+#### 2. 契约构建与 Prompt 注入阶段 (Evidence Contract & Prompt Injection)
+- **语义路由分流**：`EvidenceScopeRouter` 检测该文献内容，评估其关于“哺乳期哮喘控制”的语义相似度，评定其与问答意图的相关性分数为较高水平，因此被路由至 `CORE`（核心证据）作用域。
+- **构建允许事实 (Allowed Fact)**：该文献在证据契约中被注册为一个合法事实，形如：
+  ```json
+  {
+    "fact_id": "F001",
+    "support_level": "core",
+    "source": "PubMed (PMID: 38249092)",
+    "context_preview": "哮喘管理原则：吸入性糖皮质激素（ICS）是哮喘治疗的基石，白三烯受体拮抗剂（LTRA）等也是可选方案；管理需个体化，以控制症状、预防恶化。"
+  }
+  ```
+- **Prompt 物理装配**：上述契约内容被自动格式化并随同允许事实清单注入给大模型（model_pool="premium"）的输入 Prompt 中。
+
+#### 3. LLM 结构化推理与引用生成阶段 (LLM Reasoning & Output)
+大模型在阅读了注入的 `Allowed Facts` 后，严格在证据契约约束下进行 CoT 链式推理，输出包含 evidences 和 reasoning_chains 的 `FacetQAOutput` 结构化对象：
+- **LLM 生成的 evidence 项**：
+  - 声明引用的证据来源为：`PubMed (PMID: 38249092)`。
+  - 定位信息为：`正文摘要`。
+  - 提取的对应事实点为：`哮喘管理原则：吸入性糖皮质激素（ICS）是...`（与允许事实契约完美对齐）。
+- **LLM 生成的推理步骤 (P4)**：
+  - 逻辑表述：`根据哮喘管理指南，后续治疗可考虑更换为其他吸入性糖皮质激素（如布地奈德，其哺乳期安全性数据较充分）或白三烯受体拮抗剂（refs:PMID 38249092）...`
+  - 该步骤通过 `refs:PMID 38249092` 标记回扣到前面的证据，完成无偏差、无泛化的临床逻辑推导。
+
+#### 4. 后置核验与日志审计阶段 (Verification & Log Audit)
+[pipeline_workflow.py](file:///d:/REN/qa/core/pipeline_workflow.py) 中的审计核验模块读取大模型返回的 `FacetQAOutput`。检测发现：
+1. **证据无越界**：大模型没有编造任何不在允许事实清单中的药代参数或新临床试验数据（后置越界检测通过）。
+2. **引用被真实引用**：大模型在其 `evidences` 中确实使用了 `PMID: 38249092`，并且其推理链的逻辑步骤也引用了该事实。
+
+因此，系统在终端与 `pipeline_execution.log` 日志中打印出高可读性的证实信息：
+```text
+2026-06-11 15:09:48.214  INFO 416 --- [Task-1]   M.PipelineWorkflow   : ★ [PubMed Citation Verified] LLM successfully utilized and cited PubMed references in its structured output for facet '哺乳期用药安全与哮喘治疗管理':
+2026-06-11 15:09:48.215  INFO 416 --- ---        M.PipelineWorkflow   :     ▶ [证据来源]: PubMed (PMID: 38249092) (定位: 正文摘要)       
+2026-06-11 15:09:48.215  INFO 416 --- ---        M.PipelineWorkflow   :     ▶ [提取核心事实]: 哮喘管理原则：吸入性糖皮质激素（ICS）是哮喘治疗的基石，白三烯受体拮抗剂（LTRA）等也是可选方案；管理需个体化，以控制症状、预防恶化。
+2026-06-11 15:09:48.215  INFO 416 --- ---        M.PipelineWorkflow   :     ▶ [医学推理逻辑 (P4)]: 根据哮喘管理指南，后续治疗可考虑更换为其他吸入性糖皮质激素（如布地奈德，其哺乳期安全性数据较充分）或白三烯受体拮抗剂（refs:PMID 38249092）。具体方案需结合患者哮喘控制水平和哺乳期药物安全性资料，并在直接医学监测下进行，以实现哮喘控制与哺乳安全的平衡。
+```
+这表明该数据成功通过了证据契约的严格事实性限制，成为了一个包含科学循证推理的高价值 Think CoT 训练样本，并安全进入 SQLite3 数据库。
+
+### 11.11 项目中 PubMed 证据使用的边界与逻辑范围
+
+在整个问答数据工程中，PubMed 学术文献的引入和使用有非常明确的生命周期边界：
+
+#### 1. 哪些阶段要用到 PubMed？
+PubMed 检索与提取的核心目的，是为大模型对具体问题的**回答生成与逻辑推理提供外部权威医学证据**。具体作用于以下阶段：
+- **回答生成阶段 (Answer Generation)**：在 `PipelineWorkflow.answer_single_facet()` 中，被路由通过的 PubMed 文献拼装在 `user_prompt` 的 `refs` JSON 数组中喂给 LLM，直接限制模型思维链和最终正文只能引用这些事实点。
+- **回答综合阶段 (Synthesis)**：在 `PipelineWorkflow.synthesize_answers()` 中，通过 `evidence_contract` 来约束生成的综合 summary，确保其同样受文献证据的保护，未越界外推。
+- **质检评估阶段 (Quality Gate)**：在 `main.py` 的裁判打分阶段，大模型裁判利用 PubMed 的 `refs` 原文对生成样本的“查全率（recall）”、“事实忠实度（faithfulness）”和“领域隔离度（isolation）”进行交叉质量评判。
+
+#### 2. 生成问题时是否需要 PubMed？
+- **不需要**。初始问题生成阶段 (`PipelineWorkflow.generate_initial_question()`) 与多轮对话的下一轮问题生成阶段 (`PipelineWorkflow.generate_next_question()`) 均**完全不依赖** PubMed 检索结果。
+- 问题生成器仅接收由图谱实体库和图谱关系拼接而成的简洁上下文 `context_list`，并在此背景上生成带临床冲突和推理深度的“好问题”，而不是直接面向检索文献出题。
+
+#### 3. 生成问题失败进行重试时，是否会引入 PubMed？
+- **不会引入**。
+- 如果初始问题在第一轮被正则拦截（如连续检测到生成的都是单跳事实查询题，如“用法用量是什么”），系统会触发重试逻辑进行重新生成。
+- 重试时使用的 Prompt 模板依然基于先前构建好的 `context_list`，它并不会调用检索管理器进行 PubMed 接口请求或在 Prompt 中动态拼接 `refs`。
+- 只有在**问题完全通过复杂度校验并最终确定**后，系统才会首次执行 `EvidenceScopeRouter` 的路由策略和 PubMed 数据在回答端的注入。问题生成与文献检索在逻辑上是完全解耦的。
+
+### 11.12 PubMed 证据链完整溯源与日志审查指南
+
+当系统执行批处理任务时，开发人员可以通过下述四类日志和文件实现对 PubMed 数据的精准路由追溯、契约核验和故障审计：
+
+#### 1. 语义评分与路由分类追踪 (ESR Routing Trace)
+- **日志文件**：`pipeline_execution.log`
+- **检索关键词**：`PubMed Semantic Processing` 或 `RAG Router`
+- **解析要点**：
+  - 此处记录了 RAG 检索回来的文献如何通过 Embedding 模型进行余弦相似度计算，以及被分发到了哪个作用域。
+  - **真实日志样式**：
+    ```text
+- 只有在**问题完全通过复杂度校验并最终确定**后，系统才会首次执行 `EvidenceScopeRouter` 的路由策略和 PubMed 数据在回答端的注入。问题生成与文献检索在逻辑上是完全解耦的。
+
+### 11.12 PubMed 证据链完整溯源与日志审查指南
+
+当系统执行批处理任务时，开发人员可以通过下述四类日志和文件实现对 PubMed 数据的精准路由追溯、契约核验和故障审计：
+
+#### 1. 语义评分与路由分类追踪 (ESR Routing Trace)
+- **日志文件位置**：项目根目录下的 [pipeline_execution.log](file:///d:/REN/qa/pipeline_execution.log)。
+- **检索关键词**：`PubMed Semantic Processing` 或 `RAG Router`
+- **解析要点**：
+  - 此处记录了 RAG 检索回来的文献如何通过 Embedding 模型进行余弦相似度计算，以及被分发到了哪个作用域。
+  - **真实日志样式**：
+    ```text
+    2026-06-11 15:09:30.123  INFO 416 --- [Task-1]   M.EvidenceScopeRouter : [Task-1] PubMed Semantic Processing: Evaluated PubMed (PMID: 38249092) for intent 'DOSAGE_LIMIT'. Semantic Similarity (Core: 0.8124, Blocked: 0.1203) -> Routed to: CORE
+    ```
+    *解释*：该文献与“剂量/用法限制（DOSAGE_LIMIT）”意图锚点的匹配相似度为 `0.8124`（大于阈值 `0.60`），且未被阻断，因此被判为 `CORE` 作用域。已经升级支持 `[Task-1]` 前缀以便在多并发终端中高亮过滤关联。
+
+#### 2. LLM Prompt 注入情况审计 (Prompt Injection Audit)
+- **日志文件位置**：项目根目录下的 [pipeline_execution.log](file:///d:/REN/qa/pipeline_execution.log)。
+- **检索关键词**：`Injecting PubMed references`
+- **解析要点**：
+  - 用于验证对应的 PubMed 事实是否确实喂给了大模型（排除因路由错误导致未被注入的 bug）。
+  - **真实日志样式**：
+    ```text
+    2026-06-11 15:09:41.002  INFO 416 --- [Task-1]  M.PipelineWorkflow   : [Task-1] Injecting PubMed references to LLM for facet '哺乳期用药安全与哮喘治疗管理': PubMed (PMID: 38249092)
+    ```
+
+#### 3. LLM 真实引用核验与逻辑链路绑定 (Citation verified Trace)
+- **日志文件位置**：项目根目录下的 [pipeline_execution.log](file:///d:/REN/qa/pipeline_execution.log)。
+- **检索关键词**：`PubMed Citation Verified` 或 `PubMed Citation Check`
+- **解析要点**：
+  - 回答生成后，系统会自动核验 evidences 字段与推理逻辑链。
+  - **引用成功日志样式**：
+    ```text
+    2026-06-11 15:09:48.214  INFO 416 --- [Task-1]  M.PipelineWorkflow   : ★ [PubMed Citation Verified] LLM successfully utilized and cited PubMed references in its structured output for facet '哺乳期用药安全与哮喘治疗管理':
+        ▶ [证据来源]: PubMed (PMID: 38249092) (定位: 正文摘要)       
+        ▶ [提取核心事实]: 哮喘管理原则...
+        ▶ [医学推理逻辑 (P4)]: 根据哮喘管理指南，后续治疗可考虑更换为... (refs:PMID 38249092)
+    ```
+  - **引用漏挂警告样式**（表示注入了文献但大模型未提及）：
+    ```text
+    2026-06-11 15:09:48.216  WARN 416 --- [Task-1]  M.PipelineWorkflow   : ⚠ [PubMed Citation Check] LLM did NOT reference the provided PubMed references (PubMed (PMID: 38249092)) in its structured output for facet '...'
+    ```
+
+#### 4. 任务状态及最终结果审计 (Outcome Audit)
+- **物理文件位置**：项目根目录下的 [logs/generation_task_outcomes.jsonl](file:///d:/REN/qa/logs/generation_task_outcomes.jsonl)。
+- **解析要点**：
+  - 每个任务跑完后，都会以单行 JSON 格式记录其最终情况，包含抓取的 PMID 数量和证据契约里的允许事实数。
+  - **通过样本 (passed) 记录**：
+    ```json
+    {"task_label": "Task-2", "final_status": "passed", "failed_stage": "", "question": "...", "refs_count": 27, "facets": ["妊娠状态鉴别"], "evidence_status": "sufficient", "allowed_fact_count": 12, "root_cause": ""}
+    ```
+  - **隔离样本 (quarantined) 记录**（由于文献不相关导致证据状态判定为不足 `insufficient`，或回答多次违反证据契约而被系统物理隔离）：
+    ```json
+    {"task_label": "Task-1", "final_status": "quarantined", "failed_stage": "generation_precheck_or_governance", "question": "", "refs_count": 0, "facets": [], "root_cause": "SampleQuarantineException: 上下文信息量过低..."
+    ```
+
+#### 5. 💡 如何在海量并发日志中进行多日志关联追踪？
+当并发数为 `BATCH_CONCURRENCY_LIMIT`（如 4 或 10）时，多个 Task 的日志会在 [pipeline_execution.log](file:///d:/REN/qa/pipeline_execution.log) 中交错打印。可以通过以下两维特征将不同阶段的日志完全关联绑定：
+
+- **第一维：Process ID (进程ID) 追踪**
+  - 每行日志正文前面的 `INFO 416` 中，`416` 即代表当前运行的系统进程锁 PID（例如您截图中的 `INFO 416`）。只要 PID 保持一致，即说明是同一次批处理主进程拉起的日志，用于在多次重启任务之间做物理隔离。
+- **第二维：Task Label (任务线程标签) 追踪**
+  - 在路由打分、注入与核验的日志中，凡是针对单个 QA 的操作，都会带有类似 `[Task-1]` 或 `[Task-2]` 的线程上下文标识（如 `[Task-1] M.PipelineWorkflow`）。
+  - **完整追踪链路闭环示例**：
+    1. 搜索 `[Task-1]`：能看到 Task-1 启动并调用 `EvidenceScopeRouter` 进行打分。即使 `EvidenceScopeRouter` 本身因为共享线程打印了 `M.EvidenceScopeRouter`（未直接带 `[Task-1]`），我们也可以通过**紧密邻近的上下文时间戳**（如前后差值在毫秒级）和同一个进程号 `416` 确认这是正在为 `Task-1` 服务的计算动作。
+    2. 紧接着在 `15:09:41.002` 观察到 `[Task-1] : Injecting PubMed... (PMID: 38249092)`，确认契约已成功构建并生成了注入动作。
+    3. 随后在 `15:09:48.214` 观察到 `[Task-1] : ★ [PubMed Citation Verified]... (PMID: 38249092)`，核验成功。
+    4. 最终在 [logs/generation_task_outcomes.jsonl](file:///d:/REN/qa/logs/generation_task_outcomes.jsonl) 中过滤 `"task_label": "Task-1"` 即可确认它最终写盘成功的整条完整链路。
+
+---
 
 ---
 
@@ -939,6 +1208,14 @@ services/graph_service.py
 
 retrieval/retrieval_manager.py
   RetrievalManager.get_grounding_references()
+
+retrieval/api_gateway.py
+  APIGatewayService.search()
+  APIGatewayService.translate_entity_to_english()
+  APIGatewayService.fetch_pubmed_abstracts()
+
+retrieval/local_rag.py
+  LocalRAGService.search()
 
 scripts/medicalqa_purifier.py
   RecordPurificationPipeline.execute()

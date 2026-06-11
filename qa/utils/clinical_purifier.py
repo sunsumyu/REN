@@ -150,21 +150,31 @@ class ClinicalPathwayPurifier:
         normalized_text = cls.normalize_markdown(truncated_text)
         return normalized_text, metadata
 
-    @staticmethod
-    def enrich_chunks(chunks: list[str], metadata: dict) -> list[str]:
+    @classmethod
+    def enrich_chunks(cls, chunks: list[str], metadata: dict) -> list[str]:
         """
         上下文注入：在每个切片块的头部注入关联的结构化元数据，
         提升大模型在 RAG 检索时的语境识别和问答精准度。
         """
         enriched = []
+        for chunk in chunks:
+            val = cls.enrich_single_chunk(chunk, metadata)
+            if val:
+                enriched.append(val)
+        return enriched
+
+    @staticmethod
+    def enrich_single_chunk(chunk: str, metadata: dict) -> str:
+        """
+        在单个切片块的头部注入关联的结构化元数据。
+        """
+        if not chunk or not chunk.strip():
+            return ""
         header = (
             f"【临床路径知识库】\n"
-            f"- 关联病种: {metadata.get('disease_name', '未知')}\n"
+            f"- 关联病种: {metadata.get('disease_name') or metadata.get('entity_name') or '未知'}\n"
             f"- 疾病编码 (ICD-10): {metadata.get('icd_code', '未知')}\n"
             f"- 标准住院日: {metadata.get('standard_days', '未知')}\n"
             f"----------------------------------------\n"
         )
-        for chunk in chunks:
-            if chunk.strip():
-                enriched.append(header + chunk.strip())
-        return enriched
+        return header + chunk.strip()

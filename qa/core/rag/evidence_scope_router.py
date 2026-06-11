@@ -104,7 +104,7 @@ class EvidenceScopeRouter:
                 
         return False
 
-    async def route_references(self, query: str, intent: str, refs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    async def route_references(self, query: str, intent: str, refs: List[Dict[str, Any]], task_id_label: str = "") -> Dict[str, List[Dict[str, Any]]]:
         import asyncio
         routed = {
             "CORE": [],
@@ -184,21 +184,32 @@ class EvidenceScopeRouter:
                     blocked_score = np.dot(blocked_anchor_vec[0], ref_vecs[i]) if blocked_anchor_vec is not None else 0.0
                     
                     assigned = False
+                    scope_assigned = "UNUSED"
                     if not is_general and blocked_score > 0.65 and blocked_score > core_score:
                         routed["BLOCKED"].append(ref)
                         assigned = True
+                        scope_assigned = "BLOCKED"
                     elif core_score > 0.60:
                         routed["CORE"].append(ref)
                         assigned = True
+                        scope_assigned = "CORE"
                     elif not is_general and core_score > 0.45:
                         routed["BOUNDARY"].append(ref)
                         assigned = True
+                        scope_assigned = "BOUNDARY"
                         
                     if not assigned:
                         if is_general:
                             routed["BOUNDARY"].append(ref)
+                            scope_assigned = "BOUNDARY"
                         else:
                             routed["UNUSED"].append(ref)
+                            scope_assigned = "UNUSED"
+                            
+                    ref_source = ref.get("source", "")
+                    if "PubMed" in ref_source:
+                        prefix = f"[{task_id_label}] " if task_id_label else ""
+                        logger.info(f"{prefix}PubMed Semantic Processing: Evaluated {ref_source} for intent '{intent}'. Semantic Similarity (Core: {core_score:.4f}, Blocked: {blocked_score:.4f}) -> Routed to: {scope_assigned}")
             except Exception as e:
                 logger.debug(f"Batch embedding fallback routing failed: {e}")
                 for ref in semantic_refs_to_process:

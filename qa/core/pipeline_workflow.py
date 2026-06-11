@@ -562,6 +562,14 @@ class PipelineWorkflow:
             contract_prompt = render_evidence_contract_prompt(evidence_contract)
             user_prompt = f"{task_prompt}\n\n{context_prompt}{contract_prompt}"
             
+            # 打印注入大模型的 PubMed 文献日志，便于用户追踪
+            pubmed_sources = [r.get("source") for r in refs if r and "PubMed" in r.get("source", "")]
+            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+            if pubmed_sources:
+                logger.info(f"{stage_prefix}Injecting PubMed references to LLM for facet '{facet}': {', '.join(pubmed_sources)}")
+            else:
+                logger.info(f"{stage_prefix}No PubMed references injected to LLM for facet '{facet}'.")
+            
             if simplify:
                 user_prompt += "\n\n【⚠️ 极简推理特别指令】：当前问题属于简单事实查询。你必须极度简化推理和回答。在 evidences、reasoning_chains 和 answer_body 中，严禁脑补复杂的生化机制、受体或分子通路，只列出直接相关的临床证据，进行 1-2 步极简因果推导即可。"
                 
@@ -626,6 +634,24 @@ class PipelineWorkflow:
                 # 如果多次尝试仍未通过质量检查，抛出异常进入降级流程
                 if not is_passed:
                     raise ValueError(f"Quality guardrail failed repeatedly for structured output: {reason}")
+                
+                # 打印日志以说明 LLM 最终生成的结果中是否包含了对 PubMed 的真实使用，以及具体的利用方式
+                used_evidences = [ev for ev in result.evidences if "PubMed" in ev.source]
+                if used_evidences:
+                    logger.info(f"{stage_prefix}★ [PubMed Citation Verified] LLM successfully utilized and cited PubMed references in its structured output for facet '{facet}':")
+                    for ev in used_evidences:
+                        logger.info(f"    ▶ [证据来源]: {ev.source} (定位: {ev.location})")
+                        logger.info(f"    ▶ [提取核心事实]: {ev.summary}")
+                    
+                    # 查找并打印利用了该证据的推理链步骤
+                    for step in result.reasoning_chains:
+                        # 检查推理步骤是否提到 PMID 或证据
+                        if any(ev.source in step.logic or "pmid" in step.logic.lower() for ev in used_evidences):
+                            logger.info(f"    ▶ [医学推理逻辑 ({step.step_id})]: {step.logic}")
+                else:
+                    pubmed_sources = [r.get("source") for r in refs if r and "PubMed" in r.get("source", "")]
+                    if pubmed_sources:
+                        logger.warning(f"{stage_prefix}⚠ [PubMed Citation Check] LLM did NOT reference the provided PubMed references ({', '.join(pubmed_sources)}) in its structured output for facet '{facet}'.")
                 
                 # 处理推理过程内容
                 reasoning_content = getattr(result, "_reasoning_content", "")
@@ -847,12 +873,20 @@ class PipelineWorkflow:
         from core.evidence_contract import build_evidence_contract
         from core.governance.facet_strategy import classify_intent_by_rule
         intent = classify_intent_by_rule(query)
-        routed_refs = await router.route_references(query, intent, refs or [])
+        routed_refs = await router.route_references(query, intent, refs or [], task_id_label=task_id_label)
         
         # 隔离物理屏蔽与无用证据，只保留 CORE 和 BOUNDARY
         active_refs = routed_refs["CORE"] + routed_refs["BOUNDARY"]
         boundary_refs = routed_refs["BOUNDARY"]
         evidence_contract = build_evidence_contract(query, refs or [], routed_refs)
+        
+        # 打印详细的 RAG 路由与过滤日志，便于分析为什么没有注入
+        original_sources = [r.get("source") for r in (refs or [])]
+        active_sources = [r.get("source") for r in active_refs]
+        logger.info(f"[{task_id_label}] RAG Router Intent: '{intent}'")
+        logger.info(f"[{task_id_label}] Original reference sources: {original_sources}")
+        logger.info(f"[{task_id_label}] Active references (CORE+BOUNDARY) sources: {active_sources}")
+        logger.info(f"[{task_id_label}] Blocked/Unused references count: BLOCKED={len(routed_refs['BLOCKED'])}, UNUSED={len(routed_refs['UNUSED'])}")
         
         # 记录 RAG 路由审计日志
         blocked_count = len(routed_refs["BLOCKED"])
