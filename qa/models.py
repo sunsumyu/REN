@@ -1,7 +1,9 @@
 import re
-from typing import List, Literal
+from typing import List
 
 from pydantic import BaseModel, Field, field_validator
+
+from core.enums import FacetCategory, RiskLevel
 
 
 FACET_FORBIDDEN_PATTERNS = [
@@ -30,19 +32,7 @@ class FacetCandidate(BaseModel):
         min_length=2,
         max_length=16,
     )
-    category: Literal[
-        "composition",
-        "efficacy",
-        "dosage",
-        "contraindication",
-        "adverse_reaction",
-        "pharmacokinetics",
-        "mechanism_boundary",
-        "storage_quality",
-        "population_safety",
-        "clinical_evidence",
-        "other_medical",
-    ] = Field(description="该视角所属的医学/药理类别枚举。")
+    category: FacetCategory = Field(description="该视角所属的医学/药理类别枚举。")
     answer_scope: str = Field(
         description="一句话说明该视角如何回答主问题，不得复述Schema或输出提示语。",
         min_length=4,
@@ -53,7 +43,7 @@ class FacetCandidate(BaseModel):
         min_length=4,
         max_length=80,
     )
-    risk_level: Literal["low", "medium", "high"] = Field(
+    risk_level: RiskLevel = Field(
         description="该视角诱发无依据外推的风险等级。简单事实题的深机制视角通常为 medium/high。"
     )
 

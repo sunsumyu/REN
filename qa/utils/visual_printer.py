@@ -275,6 +275,58 @@ def print_generated_questions(questions: list):
             print(f"  [{idx + 1}] {q}")
         print("\n")
 
+def print_facet_governance_audit(query: str, audit_logs: list, task_id_label: str = ""):
+    """
+    在终端中以富文本表格形式优雅地显示视角切面（Facets）准入与策略修复决策的审计日志
+    """
+    if not audit_logs:
+        return
+        
+    stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+    
+    if _has_rich:
+        from rich.text import Text
+        
+        # 1. 打印关联主问题提示
+        _console.print(f"\n[bold cyan]❓ {stage_prefix}Query: '{query}'[/bold cyan]")
+        
+        # 2. 构造富文本审计决策表
+        table = Table(
+            box=ROUNDED, 
+            show_header=True, 
+            header_style="bold magenta", 
+            title="[bold magenta]🛡️ Facet Governance Audit / 视角切面准入治理决策审计[/bold magenta]"
+        )
+        table.add_column("No.", style="dim", width=4, justify="center")
+        table.add_column("Audit Action / 治理决策与策略修复明细", style="white")
+        
+        for idx, log in enumerate(audit_logs):
+            log_text = Text(log)
+            # 自定义不同决策类型的配色与高亮方案
+            if "Redirected" in log or "Repaired" in log:
+                log_text.stylize("yellow")
+                log_text.highlight_words(["COMPATIBLE_SIMPLE", "Redirected", "Repaired", "facet", "Q:"], "bold green")
+            elif "Dropped" in log or "dropped" in log.lower():
+                log_text.stylize("red")
+                log_text.highlight_words(["Dropped", "dropped"], "bold reverse red")
+            elif "Keep" in log or "keep" in log.lower():
+                log_text.stylize("green")
+                log_text.highlight_words(["Keep", "keep"], "bold green")
+                
+            table.add_row(
+                str(idx + 1),
+                log_text
+            )
+            
+        _console.print(table)
+        _console.print("\n")
+    else:
+        print(f"\n=== {stage_prefix}Facet Governance Audit ===")
+        print(f"Query: {query}")
+        for idx, log in enumerate(audit_logs):
+            print(f"  [{idx + 1}] {log}")
+        print("\n")
+
 def apply_aop_aspects():
     """
     通过 Monkey Patch 动态织入（Weave）AOP 切面，拦截指定方法的执行，
@@ -287,48 +339,60 @@ def apply_aop_aspects():
         import config
         
         # 1. 织入对 _prepare_context_and_refs 的切面拦截
-        orig_prepare = PipelineWorkflow._prepare_context_and_refs
-        
-        async def wrapped_prepare(self, graph_data, query=""):
-            res = await orig_prepare(self, graph_data, query)
-            try:
-                context_list, refs = res
-                print_context_and_refs(context_list, refs)
-            except Exception as e:
-                logger.error(f"[AOP Aspect Error] Failed to print context_list/refs in wrapped_prepare: {e}")
-            return res
+        if getattr(PipelineWorkflow._prepare_context_and_refs, "_visual_printer_wrapped", False):
+            logger.info("AOP Aspect already woven: PipelineWorkflow._prepare_context_and_refs")
+        else:
+            orig_prepare = PipelineWorkflow._prepare_context_and_refs
             
-        PipelineWorkflow._prepare_context_and_refs = wrapped_prepare
-        logger.info("AOP Aspect successfully woven: PipelineWorkflow._prepare_context_and_refs")
+            async def wrapped_prepare(self, graph_data, query=""):
+                res = await orig_prepare(self, graph_data, query)
+                try:
+                    context_list, refs = res
+                    print_context_and_refs(context_list, refs)
+                except Exception as e:
+                    logger.error(f"[AOP Aspect Error] Failed to print context_list/refs in wrapped_prepare: {e}")
+                return res
+                
+            wrapped_prepare._visual_printer_wrapped = True
+            PipelineWorkflow._prepare_context_and_refs = wrapped_prepare
+            logger.info("AOP Aspect successfully woven: PipelineWorkflow._prepare_context_and_refs")
         
         # 2. 织入对 get_grounding_references 的切面拦截
-        orig_grounding = RetrievalManager.get_grounding_references
-        
-        async def wrapped_grounding(self, query, name):
-            res = await orig_grounding(self, query, name)
-            try:
-                tiered_refs, tier_label = res
-                print_tiered_refs(query, name, tier_label, tiered_refs)
-            except Exception as e:
-                logger.error(f"[AOP Aspect Error] Failed to print tiered_refs in wrapped_grounding: {e}")
-            return res
+        if getattr(RetrievalManager.get_grounding_references, "_visual_printer_wrapped", False):
+            logger.info("AOP Aspect already woven: RetrievalManager.get_grounding_references")
+        else:
+            orig_grounding = RetrievalManager.get_grounding_references
             
-        RetrievalManager.get_grounding_references = wrapped_grounding
-        logger.info("AOP Aspect successfully woven: RetrievalManager.get_grounding_references")
+            async def wrapped_grounding(self, query, name):
+                res = await orig_grounding(self, query, name)
+                try:
+                    tiered_refs, tier_label = res
+                    print_tiered_refs(query, name, tier_label, tiered_refs)
+                except Exception as e:
+                    logger.error(f"[AOP Aspect Error] Failed to print tiered_refs in wrapped_grounding: {e}")
+                return res
+                
+            wrapped_grounding._visual_printer_wrapped = True
+            RetrievalManager.get_grounding_references = wrapped_grounding
+            logger.info("AOP Aspect successfully woven: RetrievalManager.get_grounding_references")
         
         # 3. 织入对 fetch_random_knowledge_graph 的切面拦截
-        orig_fetch = GraphService.fetch_random_knowledge_graph
-        
-        async def wrapped_fetch(self, count=config.DEFAULT_ENTITY_COUNT, kb_id=config.DEFAULT_KNOWLEDGE_BASE_ID, hop_count=config.DEFAULT_HOP_COUNT):
-            res = await orig_fetch(self, count, kb_id, hop_count)
-            try:
-                print_graph_data(res)
-            except Exception as e:
-                logger.error(f"[AOP Aspect Error] Failed to print graph_data in wrapped_fetch: {e}")
-            return res
+        if getattr(GraphService.fetch_random_knowledge_graph, "_visual_printer_wrapped", False):
+            logger.info("AOP Aspect already woven: GraphService.fetch_random_knowledge_graph")
+        else:
+            orig_fetch = GraphService.fetch_random_knowledge_graph
             
-        GraphService.fetch_random_knowledge_graph = wrapped_fetch
-        logger.info("AOP Aspect successfully woven: GraphService.fetch_random_knowledge_graph")
+            async def wrapped_fetch(self, count=config.DEFAULT_ENTITY_COUNT, kb_id=config.DEFAULT_KNOWLEDGE_BASE_ID, hop_count=config.DEFAULT_HOP_COUNT):
+                res = await orig_fetch(self, count, kb_id, hop_count)
+                try:
+                    print_graph_data(res)
+                except Exception as e:
+                    logger.error(f"[AOP Aspect Error] Failed to print graph_data in wrapped_fetch: {e}")
+                return res
+                
+            wrapped_fetch._visual_printer_wrapped = True
+            GraphService.fetch_random_knowledge_graph = wrapped_fetch
+            logger.info("AOP Aspect successfully woven: GraphService.fetch_random_knowledge_graph")
         
         # 4. 织入对 generate_initial_question 的展示切面；保留核心工作流的
         # JSON 修复、复杂度网关、重试和隔离逻辑。

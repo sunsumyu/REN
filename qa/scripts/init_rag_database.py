@@ -117,13 +117,17 @@ def load_local_pdfs(pdf_dir: str):
                     combined_text = "\n".join(full_text)
                     clean_text = sanitize_markdown(combined_text)
                     
-                    # 按照 400 字滑动窗口进行切片，重叠 50 字以保证语义完整性
+                    # 按照 400 字滑动窗口进行语义切片，重叠 50 字以保证语义完整性
                     chunk_size = 400
                     overlap = 50
-                    i = 0
+                    
+                    import sys, os
+                    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+                    from utils.text_splitter import semantic_slice_text
+                    
+                    chunks = semantic_slice_text(clean_text, chunk_size, overlap)
                     chunk_idx = 1
-                    while i < len(clean_text):
-                        chunk = clean_text[i:i+chunk_size]
+                    for chunk in chunks:
                         # 使用 PDF 文件名（通常为指南或临床路径名）作为关联实体名
                         entity_name = os.path.splitext(file)[0][:20]
                         pdf_facts.append({
@@ -132,7 +136,6 @@ def load_local_pdfs(pdf_dir: str):
                             "context": chunk,
                             "category": "临床诊疗"
                         })
-                        i += (chunk_size - overlap)
                         chunk_idx += 1
                 except Exception as e:
                     print(f"[Error] Failed to parse PDF {file}: {e}")
@@ -278,7 +281,9 @@ def build_database_and_vectors(
             entity_name TEXT,
             source TEXT,
             context TEXT,
-            category TEXT
+            category TEXT,
+            icd_code TEXT,
+            standard_days TEXT
         );
     """)
     
@@ -290,6 +295,8 @@ def build_database_and_vectors(
                 context,
                 entity_name,
                 category UNINDEXED,
+                icd_code UNINDEXED,
+                standard_days UNINDEXED,
                 tokenize="unicode61"
             );
         """)
@@ -302,19 +309,21 @@ def build_database_and_vectors(
     contexts = []
     for item in items:
         clean_context = sanitize_markdown(item["context"])
+        icd_code = item.get("icd_code")
+        standard_days = item.get("standard_days")
         
         # 写入普通表
         cursor.execute("""
-            INSERT INTO local_rag_index (entity_name, source, context, category)
-            VALUES (?, ?, ?, ?);
-        """, (item["entity_name"], item["source"], clean_context, item["category"]))
+            INSERT INTO local_rag_index (entity_name, source, context, category, icd_code, standard_days)
+            VALUES (?, ?, ?, ?, ?, ?);
+        """, (item["entity_name"], item["source"], clean_context, item["category"], icd_code, standard_days))
         
         # 写入倒排检索表
         if fts_ok:
             cursor.execute("""
-                INSERT INTO local_rag_fts_index (entity_name, source, context, category)
-                VALUES (?, ?, ?, ?);
-            """, (item["entity_name"], item["source"], clean_context, item["category"]))
+                INSERT INTO local_rag_fts_index (entity_name, source, context, category, icd_code, standard_days)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (item["entity_name"], item["source"], clean_context, item["category"], icd_code, standard_days))
         
         contexts.append(clean_context)
         

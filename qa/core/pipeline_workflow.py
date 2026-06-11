@@ -303,7 +303,37 @@ class PipelineWorkflow:
             questions = []
             
         if not questions:
-            raise Exception("Failed to generate questions from context.")
+            # 提取图谱/路径的实体和来源诊断信息
+            sources = sorted(list(set(c.get("source", "Unknown") for c in context_list)))
+            entity_names = []
+            for src in sources:
+                # 尝试从临床路径格式中匹配病种
+                match = re.search(r'临床路径-(.+?)(?:临床路径)?(?:（\d+年版）)?$', src)
+                if match:
+                    entity_names.append(match.group(1))
+                else:
+                    # 或者从一般的《xxx》格式中匹配
+                    match2 = re.search(r'《(.+?)》', src)
+                    if match2:
+                        entity_names.append(match2.group(1))
+            entity_names = sorted(list(set(entity_names))) if entity_names else ["未知病种"]
+
+            error_msg = (
+                f"Failed to generate questions from context.\n"
+                f"  - Task Label: {task_id_label}\n"
+                f"  - Associated Entities: {entity_names}\n"
+                f"  - Sources: {sources}\n"
+                f"  - Raw LLM Response: {repr(response)}\n"
+                f"  - Parsed Result: {repr(parsed_result)}"
+            )
+            logger.error(f"{stage_prefix}{error_msg}")
+
+            raise Exception(
+                f"Failed to generate questions from context.\n"
+                f"    - Associated Entities: {entity_names}\n"
+                f"    - Context Sources: {sources[:3]}\n"
+                f"    - Raw Response Snippet (First 150 chars): {repr(response)[:150]}"
+            )
 
         # 层次三：正则网关——移除事实提取型问题候选，最多重试 2 次
         filtered = [q for q in questions if not is_fact_retrieval_question(q)]
@@ -730,7 +760,13 @@ class PipelineWorkflow:
                 })
 
         if gov_context["audit_log"]:
-            logger.info(f"Facet governance audit for query '{query}': {gov_context['audit_log']}")
+            try:
+                from utils.visual_printer import print_facet_governance_audit
+                print_facet_governance_audit(query, gov_context["audit_log"], task_id_label)
+            except Exception as e:
+                logger.error(f"[VisualPrinter Error] Failed to print facet governance audit: {e}")
+                logger.info(f"Facet governance audit for query '{query}': {gov_context['audit_log']}")
+                
             for log in gov_context["audit_log"]:
                 record_generation_audit({
                     "stage": "facet_governance",

@@ -13,6 +13,9 @@ import sqlite3
 import re
 import argparse
 
+# 确保把父目录（工作区根目录）加入 sys.path，以便执行脚本时能够成功导入 utils 等本地包
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 # 尝试导入向量引擎依赖
 try:
     import faiss
@@ -22,6 +25,9 @@ try:
 except ImportError:
     DEPS_OK = False
 
+# 引入临床路径企业级净化清洗器
+from utils.clinical_purifier import ClinicalPathwayPurifier
+
 # 默认病种临床路径物理路径
 DEFAULT_SOURCE_DIR = r"C:\Users\cf\Downloads\1733999360046_18385\224个病种临床路径（2019年版）"
 DEFAULT_DB_PATH = "local_rag.db"
@@ -30,7 +36,7 @@ MODEL_NAME = "shibing624/text2vec-base-chinese"
 
 def sanitize_markdown(text: str) -> str:
     """
-    清洗文本中的 HTML 标签与多余空行
+    清洗文本中的 HTML 标签与多余空行 (保留为备用)
     """
     if not text:
         return ""
@@ -42,10 +48,7 @@ def clean_entity_name(filename: str) -> str:
     """
     从临床路径文件名中抽取出纯净的病种名称
     """
-    # 移除“临床路径”、“2019年版”、“（内科）”以及后缀名
-    name = re.sub(r'(?:临床路径)?(?:（2019年版）|\(2019年版\))?\.doc[x]?$', '', filename).strip()
-    name = re.sub(r'（[^）]+）|\([^)]+\)', '', name).strip()
-    return name[:20]
+    return ClinicalPathwayPurifier.clean_disease_name(filename)[:20]
 
 def extract_text_from_doc(doc_path: str) -> str:
     """
@@ -96,26 +99,23 @@ def extract_text_from_doc(doc_path: str) -> str:
 
 def slice_text(text: str, chunk_size: int = 400, overlap: int = 50):
     """
-    对文本进行固定长度的滑动窗口切片
+    对文本进行基于语义的递归滑动窗口切片
     """
-    clean_text = sanitize_markdown(text)
-    chunks = []
-    i = 0
-    while i < len(clean_text):
-        chunk = clean_text[i:i+chunk_size]
-        if len(chunk.strip()) > 10:  # 忽略没有实际字数的空片段
-            chunks.append(chunk)
-        i += (chunk_size - overlap)
-    return chunks
+    import sys, os
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from utils.text_splitter import semantic_slice_text
+    
+    # 严格保留换行结构，直接传入 purified 后的 markdown 文本，防止分段结构坍缩
+    return semantic_slice_text(text, chunk_size, overlap)
 
 def scan_doc_files(source_dir: str):
     """
-    递归扫描目录下的所有 .doc 文件
+    递归扫描目录下的所有 .docx 文件
     """
     doc_files = []
     for root, dirs, files in os.walk(source_dir):
         for file in files:
-            if file.endswith(".doc") and not file.startswith("~$"):
+            if file.endswith(".docx") and not file.startswith("~$"):
                 doc_files.append(os.path.join(root, file))
     return sorted(doc_files)
 
@@ -129,7 +129,7 @@ def run_import(source_dir: str, db_path: str, index_path: str, max_docs: int = 3
         sys.exit(1)
         
     doc_files = scan_doc_files(source_dir)
-    print(f"Found {len(doc_files)} total .doc clinical pathway documents.")
+    print(f"Found {len(doc_files)} total .docx clinical pathway documents.")
     
     # 限制处理的文档篇数，防止 CPU OOM 或过载
     if max_docs > 0 and len(doc_files) > max_docs:
@@ -142,38 +142,85 @@ def run_import(source_dir: str, db_path: str, index_path: str, max_docs: int = 3
 
     # 1. 扫描并加载现存的 SQLite 数据以执行增量去重
     conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    cursor = conn.conn.cursor() if hasattr(conn, 'conn') else conn.cursor()
     
-    # 确保数据库表和 FTS 索引存在（防止 local_rag.db 被删除后运行报错）
+    # 确保数据库表和 FTS 索引存在，并且向后兼容地添加新列 icd_code 和 standard_days
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS local_rag_index (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_name TEXT,
             source TEXT,
             context TEXT,
-            category TEXT
+            category TEXT,
+            icd_code TEXT,
+            standard_days TEXT
         );
     """)
+    
+    # 执行 SQLite3 schema 增量迁移检查与更新
+    cursor.execute("PRAGMA table_info(local_rag_index);")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "icd_code" not in columns:
+        try:
+            cursor.execute("ALTER TABLE local_rag_index ADD COLUMN icd_code TEXT;")
+            cursor.execute("ALTER TABLE local_rag_index ADD COLUMN standard_days TEXT;")
+            print("-> [Schema] Successfully altered 'local_rag_index' to include 'icd_code' and 'standard_days'.")
+        except Exception as e:
+            print(f"-> [Warning] Failed to migrate local_rag_index columns: {e}")
+            
     fts_ok = True
     try:
+        # FTS5 支持 unindexed 选项以直接存非索引内容
         cursor.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS local_rag_fts_index USING fts5(
                 source,
                 context,
                 entity_name,
                 category UNINDEXED,
+                icd_code UNINDEXED,
+                standard_days UNINDEXED,
                 tokenize="unicode61"
             );
         """)
     except sqlite3.OperationalError:
         fts_ok = False
         
+    # 如果 FTS5 已经存在，但没有新字段，则进行重建
+    if fts_ok:
+        try:
+            cursor.execute("PRAGMA table_info(local_rag_fts_index);")
+            fts_columns = [row[1] for row in cursor.fetchall()]
+            if fts_columns and "icd_code" not in fts_columns:
+                print("-> [Schema] FTS index schema is outdated. Recreating FTS virtual table...")
+                cursor.execute("DROP TABLE local_rag_fts_index;")
+                cursor.execute("""
+                    CREATE VIRTUAL TABLE local_rag_fts_index USING fts5(
+                        source,
+                        context,
+                        entity_name,
+                        category UNINDEXED,
+                        icd_code UNINDEXED,
+                        standard_days UNINDEXED,
+                        tokenize="unicode61"
+                    );
+                """)
+        except Exception as e:
+            print(f"-> [Warning] Failed to migrate FTS columns: {e}")
+
     cursor.execute("SELECT entity_name, context FROM local_rag_index;")
     existing_records = set((row[0], row[1]) for row in cursor.fetchall())
     print(f"Database loaded. Already contains {len(existing_records)} clinical facts.")
 
+    # 准备 purified markdown 的保存子目录
+    purified_dir = os.path.join(source_dir, "purified_markdown")
+    try:
+        os.makedirs(purified_dir, exist_ok=True)
+        print(f"Purified markdown files will be saved to: {purified_dir}")
+    except Exception as e:
+        print(f"[Warning] Failed to create purified markdown directory: {e}")
+
     new_facts_count = 0
-    # 2. 逐一提取和切片
+    # 2. 逐一提取、净化、保存和切片
     for idx, filepath in enumerate(target_files):
         print(f"\n[{idx+1}/{len(target_files)}] Processing: {os.path.basename(filepath)}")
         text_content = extract_text_from_doc(filepath)
@@ -182,27 +229,44 @@ def run_import(source_dir: str, db_path: str, index_path: str, max_docs: int = 3
             print(f"-> [Warning] Skip empty or failed document: {os.path.basename(filepath)}")
             continue
             
-        chunks = slice_text(text_content)
-        print(f"-> Sliced into {len(chunks)} chunks.")
-        
+        # 企业级净化流水线 (提取元数据、结构化截断、标准化排版)
         entity = clean_entity_name(os.path.basename(filepath))
+        purified_text, metadata = ClinicalPathwayPurifier.purify(text_content, os.path.basename(filepath))
+        
+        # 把净化后的标准 Markdown 内容保存到 purified_markdown 硬盘子目录
+        purified_md_path = os.path.join(purified_dir, os.path.splitext(os.path.basename(filepath))[0] + ".md")
+        try:
+            with open(purified_md_path, "w", encoding="utf-8") as f:
+                f.write(purified_text)
+            print(f"-> [Saved] Purified markdown saved: {os.path.basename(purified_md_path)}")
+        except Exception as e:
+            print(f"-> [Warning] Failed to save {os.path.basename(purified_md_path)}: {e}")
+            
+        # 对净化后的文本进行递归切块
+        chunks = slice_text(purified_text)
+        print(f"-> Extracted metadata: ICD-10={metadata['icd_code']}, StandardDays={metadata['standard_days']}")
+        print(f"-> Sliced into {len(chunks)} raw chunks.")
+        
+        # 头部上下文信息增强注入
+        enriched_chunks = ClinicalPathwayPurifier.enrich_chunks(chunks, metadata)
+        
         source_name = f"refs:《国家卫健委-2019版临床路径-{os.path.splitext(os.path.basename(filepath))[0]}》"
         
-        for chunk_idx, chunk in enumerate(chunks):
+        for chunk_idx, chunk in enumerate(enriched_chunks):
             # 去重检测
             if (entity, chunk) not in existing_records:
                 # 写入 SQLite Ordinary 表
                 cursor.execute("""
-                    INSERT INTO local_rag_index (entity_name, source, context, category)
-                    VALUES (?, ?, ?, ?);
-                """, (entity, f"{source_name}-段{chunk_idx+1}", chunk, "临床诊疗"))
+                    INSERT INTO local_rag_index (entity_name, source, context, category, icd_code, standard_days)
+                    VALUES (?, ?, ?, ?, ?, ?);
+                """, (entity, f"{source_name}-段{chunk_idx+1}", chunk, "临床诊疗", metadata["icd_code"], metadata["standard_days"]))
                 
                 # 写入 SQLite FTS 表
                 if fts_ok:
                     cursor.execute("""
-                        INSERT INTO local_rag_fts_index (entity_name, source, context, category)
-                        VALUES (?, ?, ?, ?);
-                    """, (entity, f"{source_name}-段{chunk_idx+1}", chunk, "临床诊疗"))
+                        INSERT INTO local_rag_fts_index (entity_name, source, context, category, icd_code, standard_days)
+                        VALUES (?, ?, ?, ?, ?, ?);
+                    """, (entity, f"{source_name}-段{chunk_idx+1}", chunk, "临床诊疗", metadata["icd_code"], metadata["standard_days"]))
                     
                 existing_records.add((entity, chunk))
                 new_facts_count += 1

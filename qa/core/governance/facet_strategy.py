@@ -3,6 +3,8 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Literal
+
+from core.enums import FacetAction, CompatibilityLevel
 from pydantic import BaseModel, Field
 from services.llm_service import ILLMService
 
@@ -10,11 +12,11 @@ logger = logging.getLogger("MedicalQA.FacetStrategy")
 
 class FacetGovernanceDecision(BaseModel):
     intent: str = Field(description="主问题的分类意图，如 DOSAGE_LIMIT, COMPONENT, CONTRAINDICATION 等")
-    facet_action: Literal["KEEP", "RENAME", "DROP", "REDIRECT_SIMPLE"] = Field(
+    facet_action: FacetAction = Field(
         description="针对切面的治理动作：KEEP(保持), RENAME(重命名并修复), DROP(废弃/脏切面), REDIRECT_SIMPLE(重定向至极简模式并重命名为规范切面)"
     )
     target_facet: str = Field(description="如果是 RENAME 或 REDIRECT_SIMPLE，则提供目标规范切面名（如：剂量用法、成分构成、禁忌人群、贮藏条件、临床事实核验等）；否则保持空或原名")
-    compatibility: Literal["COMPATIBLE", "COMPATIBLE_SIMPLE", "FORCED_SKIP"] = Field(
+    compatibility: CompatibilityLevel = Field(
         description="兼容性评估结果：COMPATIBLE(强兼容), COMPATIBLE_SIMPLE(简单兼容，极简推理), FORCED_SKIP(强套偏题，直接舍弃)"
     )
     reason: str = Field(description="治理决策的医学/逻辑判定理由")
@@ -55,9 +57,9 @@ class RedirectToSimpleStrategy(FacetGovernanceStrategy):
 
     async def apply(self, q: str, raw_facet: str, context: Dict[str, Any]) -> Dict[str, Any]:
         context["simplify"] = True
-        context["compatibility"] = "COMPATIBLE_SIMPLE"
+        context["compatibility"] = CompatibilityLevel.COMPATIBLE_SIMPLE.value
         context.setdefault("audit_log", []).append(
-            f"Redirected simple Q: '{q}' with facet '{raw_facet}' -> '{self.canonical_facet}' (COMPATIBLE_SIMPLE)"
+            f"Redirected simple Q: '{q}' with facet '{raw_facet}' -> '{self.canonical_facet}' ({CompatibilityLevel.COMPATIBLE_SIMPLE.value})"
         )
         return {"action": "simplify", "facet": self.canonical_facet, "simplify": True}
 
@@ -124,12 +126,12 @@ class FacetGovernanceFilter:
         except Exception as e:
             logger.error(f"Structured facet compatibility check failed: {e}. Defaulting to KEEP.")
             # Default fallback strategy is KEEP
-            action = "KEEP"
-            compatibility = "COMPATIBLE"
+            action = FacetAction.KEEP
+            compatibility = CompatibilityLevel.COMPATIBLE
             # If the rule detected a simple factual intent, fallback to REDIRECT_SIMPLE to be safe
             if intent in ["DOSAGE_LIMIT", "COMPONENT", "PACKAGING", "STORAGE"]:
-                action = "REDIRECT_SIMPLE"
-                compatibility = "COMPATIBLE_SIMPLE"
+                action = FacetAction.REDIRECT_SIMPLE
+                compatibility = CompatibilityLevel.COMPATIBLE_SIMPLE
             
             canonical_mapping = {
                 "DOSAGE_LIMIT": "剂量用法",

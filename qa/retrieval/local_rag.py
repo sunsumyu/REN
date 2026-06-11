@@ -85,10 +85,25 @@ class LocalRAGService:
                 entity_name TEXT,
                 source TEXT,
                 context TEXT,
-                category TEXT
+                category TEXT,
+                icd_code TEXT,
+                standard_days TEXT
             );
         """)
+        
+        # 增量检查普通表，不包含新字段则 Alter 新增
+        cursor.execute("PRAGMA table_info(local_rag_index);")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "icd_code" not in columns:
+            try:
+                cursor.execute("ALTER TABLE local_rag_index ADD COLUMN icd_code TEXT;")
+                cursor.execute("ALTER TABLE local_rag_index ADD COLUMN standard_days TEXT;")
+                logger.info("Database Schema Migrated: Added 'icd_code' and 'standard_days' columns to local_rag_index table.")
+            except Exception as e:
+                logger.warning(f"Failed to alter local_rag_index schema during initialization: {e}")
+
         # FTS5 虚拟表（带 unicode61 字符感知分词）
+        fts_ok = True
         try:
             cursor.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS local_rag_fts_index USING fts5(
@@ -96,11 +111,37 @@ class LocalRAGService:
                     context,
                     entity_name,
                     category UNINDEXED,
+                    icd_code UNINDEXED,
+                    standard_days UNINDEXED,
                     tokenize="unicode61"
                 );
             """)
         except sqlite3.OperationalError:
             logger.warning("FTS5 extension not compiled in host python. Virtual table creation bypassed.")
+            fts_ok = False
+            
+        # 如果 FTS5 已经存在但字段不匹配，则重建它
+        if fts_ok:
+            try:
+                cursor.execute("PRAGMA table_info(local_rag_fts_index);")
+                fts_columns = [row[1] for row in cursor.fetchall()]
+                if fts_columns and "icd_code" not in fts_columns:
+                    logger.info("FTS index schema is outdated. Rebuilding FTS virtual table...")
+                    cursor.execute("DROP TABLE local_rag_fts_index;")
+                    cursor.execute("""
+                        CREATE VIRTUAL TABLE local_rag_fts_index USING fts5(
+                            source,
+                            context,
+                            entity_name,
+                            category UNINDEXED,
+                            icd_code UNINDEXED,
+                            standard_days UNINDEXED,
+                            tokenize="unicode61"
+                        );
+                    """)
+            except Exception as e:
+                logger.warning(f"Failed to rebuild FTS index schema during initialization: {e}")
+
         self.conn.commit()
 
     def _init_vector_components(self):
