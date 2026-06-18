@@ -13,6 +13,7 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 from api_client import APIClient
 from pipeline import MedicalQAPipeline
+from core.pipeline_workflow import SampleQuarantineException
 from tests.run_evals import JUDGE_COMPREHENSIVE_PROMPT
 from tests.eval_models import ComprehensiveJudgeMetrics
 from dataset_db import save_dataset_record
@@ -21,13 +22,19 @@ import config
 from utils.logging_config import setup_logging
 setup_logging(log_file=os.path.join(os.path.dirname(__file__), "pipeline_execution.log"))
 logger = logging.getLogger("MedicalQA.Main")
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+TASK_OUTCOMES_PATH = os.path.join(LOGS_DIR, "generation_task_outcomes.jsonl")
 
 QUALITY_METRIC_LABELS = [
-    ("grounding", "事实忠实度"),
-    ("isolation", "领域隔离度"),
-    ("explainability", "可解释性"),
-    ("professionalism", "专业性"),
+    ("success", "成功度"),
+    ("recall", "查全率"),
+    ("precision", "精确度"),
+    ("faithfulness", "事实忠实度"),
     ("relevance", "相关性"),
+    ("professionalism", "专业度"),
+    ("interpretability", "可解释性"),
+    ("isolation", "领域隔离度"),
+    ("complexity", "推演复杂度"),
 ]
 
 # Global counter stats
@@ -95,6 +102,25 @@ def _preview_text(text: str, limit: int = 500) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def write_task_outcome(outcome: dict) -> None:
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    outcome.setdefault("time", datetime.now().isoformat(timespec="seconds"))
+    with open(TASK_OUTCOMES_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(outcome, ensure_ascii=False) + "\n")
+
+
+def _failed_dimensions_summary(audit: dict) -> str:
+    failed = audit.get("failed_dimensions", []) or []
+    if not failed and not audit.get("refusal_avoided", True):
+        return "summary 命中拒答/免责声明模式"
+    if not failed:
+        return "综合规则判定未通过"
+    return "; ".join(
+        f"{item.get('label', '')}={item.get('score', '')}/10"
+        for item in failed
+    )
+
+
 def _extract_answer_body(answer: str) -> str:
     if not answer:
         return ""
@@ -145,6 +171,8 @@ def build_quality_gate_audit(
             "answer_preview": _preview_text(_extract_answer_body(answer), 700),
         })
 
+    evidence_contract = dataset.get("evidence_contract") or {}
+
     return {
         "time": datetime.now().isoformat(timespec="seconds"),
         "task_label": task_label,
@@ -154,6 +182,9 @@ def build_quality_gate_audit(
         "planners": planners,
         "summary_preview": _preview_text(dataset.get("summary", ""), 1000),
         "refs_count": len(dataset.get("refs", []) or []),
+        "evidence_status": evidence_contract.get("evidence_status", "unknown"),
+        "allowed_fact_count": evidence_contract.get("allowed_fact_count", 0),
+        "forbidden_expansions": evidence_contract.get("forbidden_expansions", []),
         "avg_score": round(avg_score, 2),
         "refusal_avoided": refusal_avoided,
         "failed_dimensions": failed_dimensions,
@@ -162,10 +193,9 @@ def build_quality_gate_audit(
 
 
 def write_generation_rejection_report(audit: dict) -> None:
-    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    jsonl_path = os.path.join(logs_dir, "generation_rejections.jsonl")
-    latest_md_path = os.path.join(logs_dir, "generation_rejections.md")
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    jsonl_path = os.path.join(LOGS_DIR, "generation_rejections.jsonl")
+    latest_md_path = os.path.join(LOGS_DIR, "generation_rejections.md")
 
     with open(jsonl_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(audit, ensure_ascii=False) + "\n")
@@ -176,7 +206,15 @@ def write_generation_rejection_report(audit: dict) -> None:
         f.write(f"- 平均分: {audit['avg_score']}/10\n")
         f.write(f"- 防拒答通过: {audit['refusal_avoided']}\n")
         f.write(f"- refs 数量: {audit['refs_count']}\n")
+        f.write(f"- 证据状态: {audit.get('evidence_status', 'unknown')}\n")
+        f.write(f"- 允许事实数: {audit.get('allowed_fact_count', 0)}\n")
         f.write(f"- facets: {', '.join(audit['facets']) or 'N/A'}\n\n")
+
+        if audit.get("forbidden_expansions"):
+            f.write("### 证据契约禁止外推\n\n")
+            for item in audit["forbidden_expansions"]:
+                f.write(f"- {item}\n")
+            f.write("\n")
 
         f.write("### 不达标维度\n\n")
         if audit["failed_dimensions"]:
@@ -300,13 +338,17 @@ async def generate_and_save_single_task(
                 stage=f"[{task_label}] 生成数据集质检打分"
             )
             all_scores = [
-                metrics.grounding.score,
-                metrics.isolation.score,
-                metrics.explainability.score,
+                metrics.success.score,
+                metrics.recall.score,
+                metrics.precision.score,
+                metrics.faithfulness.score,
+                metrics.relevance.score,
                 metrics.professionalism.score,
-                metrics.relevance.score
+                metrics.interpretability.score,
+                metrics.isolation.score,
+                metrics.complexity.score
             ]
-            avg_score = sum(all_scores) / 5.0
+            avg_score = sum(all_scores) / 9.0
             
             # 4. 防拒答与主观打分双向过关判定
             import re
@@ -316,7 +358,7 @@ async def generate_and_save_single_task(
             is_success = refusal_avoided and all(s >= 6.0 for s in all_scores)
             
             logger.info(f"{log_prefix}质量网关评估完成 - 平均分: {avg_score:.1f}/10 (通过状态: {'✅ 通过' if is_success else '❌ 拦截'})")
-            logger.info(f"{log_prefix}[评分明细] 忠实度: {metrics.grounding.score}, 隔离: {metrics.isolation.score}, 可解释: {metrics.explainability.score}, 专业: {metrics.professionalism.score}, 相关: {metrics.relevance.score}")
+            logger.info(f"{log_prefix}[评分明细] 成功: {metrics.success.score}, 查全: {metrics.recall.score}, 精确: {metrics.precision.score}, 忠实: {metrics.faithfulness.score}, 相关: {metrics.relevance.score}, 专业: {metrics.professionalism.score}, 解释: {metrics.interpretability.score}, 隔离: {metrics.isolation.score}, 复杂: {metrics.complexity.score}")
             quality_audit = build_quality_gate_audit(task_label, dataset, metrics, avg_score, refusal_avoided, is_success)
             
             if not is_success:
@@ -328,6 +370,18 @@ async def generate_and_save_single_task(
                     dataset,
                 )
                 write_generation_rejection_report(quality_audit)
+                write_task_outcome({
+                    "task_label": task_label,
+                    "final_status": "quality_rejected",
+                    "failed_stage": "quality_gate",
+                    "question": query,
+                    "refs_count": len(refs or []),
+                    "facets": quality_audit.get("facets", []),
+                    "evidence_status": quality_audit.get("evidence_status", "unknown"),
+                    "allowed_fact_count": quality_audit.get("allowed_fact_count", 0),
+                    "root_cause": _failed_dimensions_summary(quality_audit),
+                    "quality_audit_ref": "logs/generation_rejections.jsonl",
+                })
                 logger.warning(f"{log_prefix}❌ 质量不达标或触发防拒答拦截，本次生成语料已被丢弃！")
                 logger.warning(f"{log_prefix}拦截问题 Q: {query}")
                 logger.warning(f"{log_prefix}候选 facets: {', '.join(quality_audit['facets']) or 'N/A'}")
@@ -366,10 +420,42 @@ async def generate_and_save_single_task(
                 save_dataset_record(today_str, query, dataset, metrics_dict)
                 
             logger.info(f"{log_prefix}🎉 质检通过！数据已成功写盘入库 (current/raw JSONL / qa_datasets.db)")
+            write_task_outcome({
+                "task_label": task_label,
+                "final_status": "passed",
+                "failed_stage": "",
+                "question": query,
+                "refs_count": len(refs or []),
+                "facets": quality_audit.get("facets", []),
+                "evidence_status": quality_audit.get("evidence_status", "unknown"),
+                "allowed_fact_count": quality_audit.get("allowed_fact_count", 0),
+                "root_cause": "",
+            })
             stats["total_passed"] += 1
             
+        except SampleQuarantineException as sqe:
+            logger.warning(f"{log_prefix}⚠️ 样本已安全隔离并跳过: {sqe}")
+            write_task_outcome({
+                "task_label": task_label,
+                "final_status": "quarantined",
+                "failed_stage": "generation_precheck_or_governance",
+                "question": "",
+                "refs_count": 0,
+                "facets": [],
+                "root_cause": str(sqe),
+            })
+            stats["total_failed"] += 1
         except Exception as e:
             logger.error(f"{log_prefix}❌ 任务运行期发生异常: {e}", exc_info=True)
+            write_task_outcome({
+                "task_label": task_label,
+                "final_status": "exception",
+                "failed_stage": "runtime",
+                "question": "",
+                "refs_count": 0,
+                "facets": [],
+                "root_cause": f"{type(e).__name__}: {e}",
+            })
             stats["total_failed"] += 1
 
 async def run_generator():
@@ -415,6 +501,7 @@ async def run_generator():
         logger.info(f"   - 成功生成入库样本数 (Passed): {stats['total_passed']} / {stats['total_attempted']}")
         logger.info(f"   - 丢弃/失败样本数 (Failed): {stats['total_failed']} / {stats['total_attempted']}")
         logger.info(f"   - 最终质量网关通过率: {(stats['total_passed']/stats['total_attempted'])*100:.1f}%")
+        logger.info(f"   - 单任务最终状态审计: {TASK_OUTCOMES_PATH}")
         logger.info("=============================================================")
         
     except Exception as e:

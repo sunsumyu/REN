@@ -33,20 +33,25 @@ graph TD
 
     %% ------------------ 阶段二：思维链提纯轨 ------------------
     subgraph Stage2["第二阶段：思维链提纯、学术自愈与质量门禁拦截 (Purification)"]
-        I["读取增量记录"] -->|动态行号| J["AI 视角安全校验网关 (Small Model Validator)"]
-        J -->|重置占位符| K["前置物理去噪过滤 (pre_strip_engineering_noise)"]
-        K --> L["循证医学刚性事实锚点注入 (refs fact-anchoring)"]
-        L --> M["LLM 探索性 CoT 提纯重写 (PurificationEngine)"]
-        M --> N["后置元描述与过渡词平滑 (post_strip_meta)"]
-        N --> O["学术实体与病生理常识自愈 (HealingService)"]
-        O --> P{"3-D 质量裁判门禁评分 (LLMJudgeStrategy)"}
-        P -->|不达标 & < 3次重试| Q["反馈控制环路 (De-contaminated Feedback)"]
-        Q -->|重写调整| M
-        P -->|一票否决/超限| R["❌ 物理拦截并无情丢弃 (Drop Facet)"]
-        P -->|✅ 达标通过| S["最终高熵纯净微调数据集 (medical_qa_dataset.jsonl)"]
+        I["读取增量记录"] -->|输入| FPB["事实抽取与分类 (FactPack Builder)"]
+        FPB -->|生成 CleanedFact | ESR["精细化证据分级路由 (Evidence Scope Router)"]
+        ESR -->|CORE / BOUNDARY / BLOCKED 分流| AR["回答正文重写与事实校验 (Answer Body Rewriter)"]
+        AR -->|生成 narrowed_answer 边界| CP["探索性 CoT 提纯重写 (CoT Purifier)"]
+        CP -->|输出 think, answer, summary| VAL["本地多层防御校验 (Validators)"]
+        subgraph VAL ["本地多层防御校验 (Validators)"]
+            SG["结构感知网关 (Structure Gate)"]
+            LS["全字段泄漏扫描 (Leakage Scanner)"]
+            SW["语义自愈与冒号平滑 (Semantic Wash)"]
+        end
+        VAL -->|清洗与格式核验通过| JDG{"循证参考引导裁判 (Reference-Guided Judge)"}
+        JDG -->|不达标 & 重试 < 3| FB["反馈控制环路 (Feedback Loop)"]
+        FB -->|重写指导| CP
+        JDG -->|最终评分与裁决| TM["局部失败隔离与事务管理 (Transaction Manager)"]
+        TM -->|全部失败 / 严重泄露| R["❌ 物理拦截并无情丢弃 (Rollback / Quarantine)"]
+        TM -->|全切面成功 / 部分切面成功| S["最终高熵纯净微调数据集 (medical_qa_dataset.jsonl)"]
     end
     class Stage2 purStage;
-    class P gate;
+    class JDG gate;
     class R gate;
     class S storage;
 
@@ -105,33 +110,34 @@ flowchart TD
     style Logic fill:#e1f5fe,stroke:#0288d1,stroke-width:1px;
     style Loop fill:#fffde7,stroke:#fbc02d,stroke-width:1px;
 
-    Start([开始提纯一轮数据]) --> J1{{"AI 视角语义网关校验 (verify_facet)"}}
+    Start([开始提纯当前行数据]) --> F1["抽取干净事实与脱敏引用 (FactPack Builder)"]
+    F1 --> F2["划分证据意图与封锁路由 (Evidence Scope Router)"]
+    F2 --> F3["回答正文窄域重写与事实校验 (Answer Body Rewriter)"]
     
-    J1 -- INVALID (占位符或报错) --> J2["重置为合法学术切面\n'临床用药安全'"]
-    J1 -- VALID --> K["前置物理去噪过滤\n(擦除原始JSON、RAG字样)"]
-    J2 --> K
-    
-    K --> L["事实白名单锚点注入\n(refs 刚性事实绑定)"]
-    
-    subgraph Loop ["反馈控制重试环 (最多3次)"]
-        M["LLM 提纯重写\n(动态认知推理流重构)"] --> N["学术实体与病生理常识自愈\n(HealingService)"]
-        N --> O["本地物理平滑\n(擦除'首先/其次/综上'等序号过渡词)"]
-        O --> P["3-D 裁判打分\n(Purity/Rigor/Depth)"]
+    subgraph Loop ["CoT 提纯重试环 (最多 3 次)"]
+        M["CoT 提纯重写 (CoT Purifier)"] --> SG["结构感知网关校验 (Structure Gate)"]
+        SG -- YES (检测到JSON泄露) --> R["反馈重试"]
+        SG -- NO (通过) --> LS["全字段泄漏扫描 (Leakage Scanner)"]
+        LS -- YES (高置信禁词) --> R
+        LS -- NO (通过) --> SW["中性语义清洗与自愈 (Semantic Wash)"]
+        SW --> JDG["循证裁判打分 (Reference-Guided Judge)"]
     end
     
-    L --> M
+    F3 -->|传入 narrowed_answer 边界| M
     
-    P --> Q{"是否达标且未发生\n结构/安全泄漏？"}
-    Q -- YES (达标通过) --> S["✅ 高熵纯净思维链落盘写入"]
-    Q -- NO & 重试次数 < 3 --> R["注入不达标报错反馈\n(Feedback Loop)"]
-    R --> M
+    JDG --> Q{"三维指标是否达标？<br/>(Purity/Rigor/Depth)"}
+    Q -- YES (达标通过) --> TM["局部失败隔离与保存 (Transaction Manager)"]
+    Q -- NO & 重试次数 < 3 --> R
+    R -->|注入报错反馈| M
     
-    Q -- NO & 超出最大重试 --> T{"判断是否触发\n防拷贝幻觉绕过？"}
-    T -- YES (存在严重工程垃圾) --> U["❌ 物理强行抛弃该切面 (Drop Facet)"]
-    T -- NO (无污染但质量一般) --> V["🛡️ 降级退回极简自愈兜底文本"]
-    V --> S
-    U --> End([结束当前行提纯])
-    S --> End
+    Q -- NO & 超出最大重试 --> TM
+    
+    TM --> TM_Check{"是否所有 Planner 全盘失败<br/>或核心切面彻底损坏？"}
+    TM_Check -- YES (严重损坏) --> Rollback["↩️ 整行回滚隔离 (Rollback / Quarantine)"]
+    TM_Check -- NO (局部或全部成功) --> Salvage["✅ 部分/全部成功切面持久化 (partial_success)"]
+    
+    Salvage --> End([结束当前行提纯])
+    Rollback --> End
 ```
 
 ---
@@ -142,9 +148,9 @@ flowchart TD
 
 | 评估维度 (Dimension) | 达标分数线 | 核心惩罚红线 (One-strike Penalty) | 优化处理机制 |
 | :--- | :--- | :--- | :--- |
-| **🟢 语义纯净度** | **85 / 100** | 包含 `JSON`、`Schema`、`refs` 等工程元数据；使用“首先、其次”等阶梯序号或出现“我将从以下切面回答”等元叙述。 | 一票否决降至 60 分以下，启动反馈控制环重写，若三次失败则**直接丢弃**。 |
-| **🩺 医学严谨度** | **90 / 100** | 与知识图谱 `refs` 事实（受体、基因型、发生率）冲突；或无确切文献公理支撑下虚构分子骨架/特异性结合效能。 | 图谱强Fact一致性对齐，触发伪学术幻觉一票否决扣至 50 分以下。 |
-| **🧠 逻辑深度** | **85 / 100** | 通篇为平淡无奇的说明书说明文，无动态摩擦词（“既然...必然...”），无探究性疑问反思（缺乏“?”疑问锚点）。 | 强制字数限制（需 > 150字），推导极简化直接惩罚扣分，通过重写激活参数化临床知识。 |
+| **🟢 语义纯净度** | **85 / 100** | think、answer_body、summary中包含 `JSON`、`Schema`、`refs` 等工程元数据或检索抱怨；出现“切面/视角”元叙述。 | 命中高置信禁词一票否决，启动反馈控制环重写，若三次失败则根据 Transaction 机制予以隔离或丢弃。 |
+| **🩺 医学严谨度** | **90 / 100** | 生成的 CoT 推导中包含无法被 FactPack 事实库支持的医学因果断言，或篡改批准文号与药理限制。 | 裁判引入脱敏后事实包，将新增医学事实与 facts 进行比对，若未通过 Fact Entailment Check 判定为幻觉。 |
+| **🧠 逻辑深度** | **85 / 100** | 简单适应症/剂量等事实题进行复杂的微观通路脑补；或者机制题缺乏推理心流与自我质疑疑问锚点（“?”）。 | 低证据题强制 simplify 缩窄深度；高证据题依据 planner 动态控制推理硬门槛与字数限制。 |
 
 ---
 
@@ -155,4 +161,4 @@ flowchart TD
 
 $$\text{核心矛盾解构} \xrightarrow{\text{因果推演}} \text{微观病生理逻辑} \xrightarrow{\text{假说排查}} \text{分叉与特殊情况} \xrightarrow{\text{核准校对}} \text{生理/安全极限} \xrightarrow{\text{自然合拢}} \text{决策得出}$$
 
-这套高度规范的流程图已与目前最新的代码库保持 100% 同步，并作为指导本项目未来工程化、工业级数据微调准备的重要技术规范。
+这套高度规范的流程图已与目前最新的代码库与重构蓝图保持 100% 同步，并作为指导本项目未来工程化、工业级数据微调准备的重要技术规范。

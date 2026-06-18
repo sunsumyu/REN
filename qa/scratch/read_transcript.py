@@ -1,7 +1,7 @@
 import json
 import os
 
-transcript_path = r"C:\Users\cf\.gemini\antigravity-ide\brain\0cecb9d1-fa8b-42aa-8e58-3ad808d47192\.system_generated\logs\transcript.jsonl"
+transcript_path = r"C:\Users\cf\.gemini\antigravity-ide\brain\54870a0b-7898-486b-9b4e-04623dea9ace\.system_generated\logs\transcript.jsonl"
 
 def read_transcript():
     if not os.path.exists(transcript_path):
@@ -22,7 +22,7 @@ def read_transcript():
                 if type_ in ["USER_INPUT", "PLANNER_RESPONSE"] or source in ["USER_EXPLICIT", "MODEL"]:
                     print(f"Step {step_index} | Source: {source} | Type: {type_}")
                     print("-" * 50)
-                    print(content[:500])
+                    print(content)
                     print("=" * 50)
             except Exception as e:
                 print(f"Error decoding line {idx}: {e}")

@@ -1,7 +1,9 @@
 import re
-from typing import List, Literal
+from typing import List
 
 from pydantic import BaseModel, Field, field_validator
+
+from core.enums import FacetCategory, RiskLevel
 
 
 FACET_FORBIDDEN_PATTERNS = [
@@ -30,19 +32,7 @@ class FacetCandidate(BaseModel):
         min_length=2,
         max_length=16,
     )
-    category: Literal[
-        "composition",
-        "efficacy",
-        "dosage",
-        "contraindication",
-        "adverse_reaction",
-        "pharmacokinetics",
-        "mechanism_boundary",
-        "storage_quality",
-        "population_safety",
-        "clinical_evidence",
-        "other_medical",
-    ] = Field(description="该视角所属的医学/药理类别枚举。")
+    category: FacetCategory = Field(description="该视角所属的医学/药理类别枚举。")
     answer_scope: str = Field(
         description="一句话说明该视角如何回答主问题，不得复述Schema或输出提示语。",
         min_length=4,
@@ -53,27 +43,19 @@ class FacetCandidate(BaseModel):
         min_length=4,
         max_length=80,
     )
-    risk_level: Literal["low", "medium", "high"] = Field(
+    risk_level: RiskLevel = Field(
         description="该视角诱发无依据外推的风险等级。简单事实题的深机制视角通常为 medium/high。"
     )
 
     @field_validator("label")
     @classmethod
     def validate_label(cls, value: str) -> str:
-        label = value.strip()
-        if label != value:
-            value = label
-        if "\n" in label or "\r" in label or "\t" in label:
-            raise ValueError("facet label must be a single short phrase")
-        if len(re.findall(r"[A-Za-z]", label)) > 8:
-            raise ValueError("facet label contains too much English text")
-        lowered = label.lower()
-        for pattern in FACET_FORBIDDEN_PATTERNS:
-            if re.search(pattern, lowered, flags=re.IGNORECASE):
-                raise ValueError(f"invalid facet label: forbidden pattern {pattern}")
-        if any(ch in label for ch in [":", "：", "。", "？", "?", "！", "!", "，", ","]):
-            raise ValueError("facet label must not contain sentence punctuation")
-        return label
+        from core.pipeline_workflow import validate_facet_label
+        ok, err = validate_facet_label(value)
+        if not ok:
+            raise ValueError(err)
+        return value.strip()
+
 
     @field_validator("answer_scope", "why_relevant")
     @classmethod

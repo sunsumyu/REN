@@ -19,10 +19,16 @@ def clear_cache():
     # 2. 清理包含 Mock 脏数据的 UGT2B7 缓存
     cursor.execute("DELETE FROM api_cache WHERE query = ? OR response_json LIKE '%辅助治疗%';", ("ugt2b7",))
     deleted_count = conn.total_changes
-    conn.commit()
     print(f"Deleted {deleted_count} dirty mock cache items.")
     
-    # 3. 再次确认剩余缓存项数量
+    # 3. 清理旧版无正文摘要的 PubMed 缓存
+    cursor.execute("DELETE FROM api_cache WHERE service_name = 'pubmed' AND response_json NOT LIKE '%文献正文摘要%';")
+    deleted_pubmed_count = conn.total_changes
+    print(f"Deleted {deleted_pubmed_count} outdated PubMed cache items (lacking abstract body).")
+    
+    conn.commit()
+    
+    # 4. 再次确认剩余缓存项数量
     cursor.execute("SELECT COUNT(*) FROM api_cache;")
     count_after = cursor.fetchone()[0]
     print(f"Total cache items after clearing: {count_after}")

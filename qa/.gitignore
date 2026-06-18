@@ -19,3 +19,5 @@ medical_qa_dataset.json
 .idea/
 .DS_Store
 Thumbs.db
+qa/local_rag.db
+qa/local_rag_vector.index

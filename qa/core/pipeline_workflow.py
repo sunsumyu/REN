@@ -18,6 +18,83 @@ from core.prompt_renderer import PromptRenderer
 logger = logging.getLogger("MedicalQA.PipelineWorkflow")
 GENERATION_AUDIT_PATH = Path(__file__).resolve().parent.parent / "logs" / "generation_audit.jsonl"
 
+HARD_FACT_RETRIEVAL_PATTERNS = [
+    r"推荐用法用量",
+    r"用法用量是什么",
+    r"主要不良反应",
+    r"不良反应有哪些",
+    r"什么类型.{0,8}临床试验",
+    r"临床试验.{0,8}什么类型",
+    r"规格是",
+    r"批准文号",
+    r"生产厂家",
+    r"具体数值",
+    r"具体剂量",
+    r"总\w{0,3}组数",
+    r"总\w{0,3}数量",
+    r"每组\w{0,4}数",
+    r"共\w{0,2}组",
+]
+
+SOFT_FACT_RETRIEVAL_PATTERNS = [
+    r"是多少",
+    r"有什么",
+    r"有哪些",
+    r"是什么",
+    r"什么类型",
+    r"如何分类",
+    r"列举",
+    r"有几",
+    r"是第几",
+    r"是哪\w{0,2}年",
+]
+
+CLINICAL_FRICTION_MARKERS = [
+    "患者",
+    "合并",
+    "既往",
+    "正在服用",
+    "肝功能",
+    "肾功能",
+    "禁忌",
+    "风险",
+    "权衡",
+    "机制",
+    "因果",
+    "鉴别",
+    "调整",
+    "特殊人群",
+    "外推",
+    "获益",
+    "冲突",
+    "边界",
+    "监测",
+]
+
+
+def is_fact_retrieval_question(question: str) -> bool:
+    """
+    Detect one-hop lookup questions that are too shallow for Think CoT training.
+    This gate is intentionally conservative: rejected samples are quarantined,
+    not written to the dataset.
+    """
+    q = (question or "").strip()
+    if not q:
+        return True
+    if any(re.search(pattern, q) for pattern in HARD_FACT_RETRIEVAL_PATTERNS):
+        return True
+    if not any(re.search(pattern, q) for pattern in SOFT_FACT_RETRIEVAL_PATTERNS):
+        return False
+    has_clinical_friction = any(marker in q for marker in CLINICAL_FRICTION_MARKERS)
+    return not (has_clinical_friction and len(q) >= 45)
+
+
+class SampleQuarantineException(Exception):
+    """
+    当样本因前置治理过滤、切面不足或质量不合格而需被正常隔离（quarantine）时的业务级非致命异常。
+    """
+    pass
+
 
 FACET_FORBIDDEN_PATTERNS = [
     r"示例\s*视角",
@@ -120,8 +197,13 @@ class PipelineWorkflow:
         
         # 延迟导入检索管理器
         from retrieval.retrieval_manager import RetrievalManager
-        retrieval_mgr = RetrievalManager()
+        retrieval_mgr = RetrievalManager(llm_service=self.llm_service)
         
+        # 纯数据容器型实体类型黑名单：这类实体只含实验参数，无机制信息，
+        # 生成的问题几乎只能是纯事实提取题（几只动物/几组等），对 CoT 训练无价值。
+        # 仍保留在 refs 供 CoT 回答时作为事实锚点引用。
+        FACT_CONTAINER_ENTITY_TYPES = {"group", "result", "measurement", "statistic"}
+
         # 格式化实体数据
         for entity in entities:
             name = entity.get("name", "未命名实体")
@@ -136,12 +218,19 @@ class PipelineWorkflow:
             item = {
                 "context": context_str,
                 "source": source_str,
-                "entity_id": str(ent_id)
+                "entity_id": str(ent_id),
+                "metadata": {"type": "entity", "entity_type": ent_type}
             }
-            context_list.append(item)
+            # 层次一过滤：纯数据容器型实体不加入 context_list（问题生成源），
+            # 但始终加入 refs（事实锚点），保留其数据价值。
+            if ent_type.lower() not in FACT_CONTAINER_ENTITY_TYPES:
+                context_list.append(item)
+            else:
+                logger.debug(f"[实体过滤] '{name}'（type={ent_type}）被识别为纯数据容器型实体，跳过加入 context_list，仅保留在 refs。")
             refs.append({
                 "context": f"概念定义: {name} (类型: {ent_type}) - {description}",
-                "source": f"refs:《实体库:{name}》"
+                "source": f"refs:《实体库:{name}》",
+                "metadata": {"type": "entity", "entity_type": ent_type}
             })
             
             # 尝试获取分层检索依据，注入到参考引用中
@@ -166,12 +255,14 @@ class PipelineWorkflow:
             
             item = {
                 "context": context_str,
-                "source": source_str
+                "source": source_str,
+                "metadata": {"type": "relationship", "relationship": relation}
             }
             context_list.append(item)
             refs.append({
                 "context": f"知识关联: 【{src}】 --({relation})--> 【{tgt}】",
-                "source": f"refs:《图谱关系:{src}-{tgt}》"
+                "source": f"refs:《图谱关系:{src}-{tgt}》",
+                "metadata": {"type": "relationship", "relationship": relation}
             })
             
         # 关闭检索管理器释放资源
@@ -188,21 +279,88 @@ class PipelineWorkflow:
         :return: 被随机选中的初始问题字符串
         :raises Exception: 如果未能从上下文中生成任何问题则抛出异常
         """
+        # 第一道物理防线：语料字数前置拦截
+        total_context_len = sum(len(c.get("context", "")) for c in context_list)
+        if total_context_len < 100:
+            logger.warning(f"[{task_id_label}] 第一道防线拦截：语料信息量极低 (仅 {total_context_len} 字)，直接阻断。")
+            raise SampleQuarantineException(f"上下文信息量过低（{total_context_len} 字），不足以支撑复杂推理题的构建。")
+
         # 渲染问题生成提示词
         prompt = PromptRenderer.render(prompts.QUESTION_CREATOR_TEMPLATE, context_list=context_list)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        # 调用轻量级大模型
-        response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}初始问题生成")
+        # 调用旗舰大模型（具备高指令服从度，支持源头熔断机制）
+        response = await self.llm_service.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}初始问题生成")
         
         # 安全解析JSON响应
         from pipeline import parse_json_safely
-        questions = parse_json_safely(response, [])
-        if not questions:
-            raise Exception("Failed to generate questions from context.")
+        parsed_result = parse_json_safely(response, {})
+        
+        if isinstance(parsed_result, dict):
+            questions = parsed_result.get("questions", [])
+        elif isinstance(parsed_result, list):
+            questions = parsed_result
+        else:
+            questions = []
             
+        if not questions:
+            # 提取图谱/路径的实体和来源诊断信息
+            sources = sorted(list(set(c.get("source", "Unknown") for c in context_list)))
+            entity_names = []
+            for src in sources:
+                # 尝试从临床路径格式中匹配病种
+                match = re.search(r'临床路径-(.+?)(?:临床路径)?(?:（\d+年版）)?$', src)
+                if match:
+                    entity_names.append(match.group(1))
+                else:
+                    # 或者从一般的《xxx》格式中匹配
+                    match2 = re.search(r'《(.+?)》', src)
+                    if match2:
+                        entity_names.append(match2.group(1))
+            entity_names = sorted(list(set(entity_names))) if entity_names else ["未知病种"]
+
+            error_msg = (
+                f"Failed to generate questions from context.\n"
+                f"  - Task Label: {task_id_label}\n"
+                f"  - Associated Entities: {entity_names}\n"
+                f"  - Sources: {sources}\n"
+                f"  - Raw LLM Response: {repr(response)}\n"
+                f"  - Parsed Result: {repr(parsed_result)}"
+            )
+            logger.error(f"{stage_prefix}{error_msg}")
+
+            raise Exception(
+                f"Failed to generate questions from context.\n"
+                f"    - Associated Entities: {entity_names}\n"
+                f"    - Context Sources: {sources[:3]}\n"
+                f"    - Raw Response Snippet (First 150 chars): {repr(response)[:150]}"
+            )
+
+        # 层次三：正则网关——移除事实提取型问题候选，最多重试 2 次
+        filtered = [q for q in questions if not is_fact_retrieval_question(q)]
+        retry_count = 0
+        while not filtered and retry_count < 2:
+            retry_count += 1
+            logger.warning(f"{stage_prefix}所有候选问题均为事实提取型，重新生成（第 {retry_count} 次重试）...")
+            resp2 = await self.llm_service.call_llm(prompt, model_pool="premium", stage=f"{stage_prefix}初始问题生成(重试{retry_count})")
+            parsed2 = parse_json_safely(resp2, {})
+            if isinstance(parsed2, dict):
+                questions2 = parsed2.get("questions", [])
+            elif isinstance(parsed2, list):
+                questions2 = parsed2
+            else:
+                questions2 = []
+            filtered = [q for q in questions2 if not is_fact_retrieval_question(q)]
+        if not filtered:
+            logger.error(f"{stage_prefix}第三道防线拦截：连续 {retry_count+1} 次生成的候选问题均为单跳事实查询题，斩断退路。")
+            raise SampleQuarantineException("连续生成的候选问题均为单跳事实查询题，系统拒绝入库。")
+
+        filtered_out = len(questions) - len(filtered)
+        if filtered_out > 0:
+            logger.info(f"{stage_prefix}事实提取题过滤：移除 {filtered_out} 题，剩余 {len(filtered)} 题可用。")
+
         # 随机选择一个问题
-        selected_q = random.choice(questions)
-        logger.info(f"Generated {len(questions)} questions. Selected: '{selected_q}'")
+        selected_q = random.choice(filtered)
+        logger.info(f"Generated {len(questions)} questions (filtered to {len(filtered)}). Selected: '{selected_q}'")
         return selected_q
 
     async def plan_facets(self, query: str, task_id_label: str = "") -> List[str]:
@@ -355,7 +513,17 @@ class PipelineWorkflow:
             # 切面数量为2，直接返回两个最贴切且互补的切面
             return facets
 
-    async def answer_single_facet(self, query: str, facet: str, refs: List[Dict[str, str]], semaphore: asyncio.Semaphore, task_id_label: str = "") -> Tuple[str, str]:
+    async def answer_single_facet(
+        self,
+        query: str,
+        facet: str,
+        refs: List[Dict[str, str]],
+        semaphore: asyncio.Semaphore,
+        simplify: bool = False,
+        boundary_refs: List[Dict[str, str]] = None,
+        evidence_contract: Dict[str, Any] = None,
+        task_id_label: str = ""
+    ) -> Tuple[str, str]:
         """
         为单个视角（切面）调用图问答智能体进行深度问答。
         核心生成步骤：必须路由至高级模型执行。
@@ -365,10 +533,13 @@ class PipelineWorkflow:
         :param facet: 当前切面名称
         :param refs: 参考文献列表
         :param semaphore: 异步并发信号量，控制并发数
+        :param simplify: 是否启用极简推理模式
+        :param boundary_refs: 边界限制的参考文献列表
         :param task_id_label: 任务ID标签，用于日志追踪
         :return: 元组，包含(切面名称, 生成的回答内容)，若质量把控失败则回答内容为None
         """
         from strategies.quality_gate.answer_guard import check_answer_quality
+        from core.evidence_contract import detect_forbidden_expansion, render_evidence_contract_prompt
 
         is_valid_facet, invalid_reason = validate_facet_label(facet)
         if not is_valid_facet:
@@ -384,11 +555,27 @@ class PipelineWorkflow:
             return facet, None
         
         async with semaphore:
-            # 构造系统提示词和多层级的用户提示词
+            # 构造系统提示词 and 多层级的用户提示词
             system_prompt = PromptRenderer.get_l1_meta()
             task_prompt = PromptRenderer.get_l2_execution(facet)
             context_prompt = PromptRenderer.get_l3_context(query, refs, [])
-            user_prompt = f"{task_prompt}\n\n{context_prompt}"
+            contract_prompt = render_evidence_contract_prompt(evidence_contract)
+            user_prompt = f"{task_prompt}\n\n{context_prompt}{contract_prompt}"
+            
+            # 打印注入大模型的 PubMed 文献日志，便于用户追踪
+            pubmed_sources = [r.get("source") for r in refs if r and "PubMed" in r.get("source", "")]
+            stage_prefix = f"[{task_id_label}] " if task_id_label else ""
+            if pubmed_sources:
+                logger.info(f"{stage_prefix}Injecting PubMed references to LLM for facet '{facet}': {', '.join(pubmed_sources)}")
+            else:
+                logger.info(f"{stage_prefix}No PubMed references injected to LLM for facet '{facet}'.")
+            
+            if simplify:
+                user_prompt += "\n\n【⚠️ 极简推理特别指令】：当前问题属于简单事实查询。你必须极度简化推理和回答。在 evidences、reasoning_chains 和 answer_body 中，严禁脑补复杂的生化机制、受体或分子通路，只列出直接相关的临床证据，进行 1-2 步极简因果推导即可。"
+                
+            if boundary_refs:
+                boundary_texts = "\n".join([f"- [{r.get('source')}] {r.get('context')}" for r in boundary_refs])
+                user_prompt += f"\n\n【⚠️ 边界限制事实对齐边界】：\n{boundary_texts}\n【⚠️ 边界限制硬性约束】：上述限制事实仅限在思考过程（Think）与最终答案（Answer）中各用最多一句话简要提及，严禁针对其展开长篇大论或虚构衍生逻辑分支！"
             
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -416,8 +603,30 @@ class PipelineWorkflow:
                     # 检查回答质量
                     is_passed, reason = check_answer_quality(
                         result.answer_body, 
-                        getattr(result, "_reasoning_content", "")
+                        getattr(result, "_reasoning_content", ""),
+                        simplify=simplify
                     )
+                    if is_passed:
+                        structured_check_text = "\n".join([
+                            result.answer_body,
+                            getattr(result, "_reasoning_content", ""),
+                            result.final_conclusion_summary,
+                            "\n".join(e.summary for e in result.evidences),
+                            "\n".join(step.logic for step in result.reasoning_chains),
+                        ])
+                        violations = detect_forbidden_expansion(structured_check_text, evidence_contract)
+                        if violations:
+                            is_passed = False
+                            reason = f"evidence contract violation: {violations}"
+                            record_generation_audit({
+                                "stage": "answer_evidence_contract",
+                                "status": "violation",
+                                "task_id": task_id_label,
+                                "query": query,
+                                "facet": facet,
+                                "attempt": q_attempt + 1,
+                                "violations": violations,
+                            })
                     if is_passed:
                         break
                     logger.warning(f"Quality Guardrail FAILED on structured QA attempt {q_attempt} for facet '{facet}': {reason}. Retrying...")
@@ -425,6 +634,24 @@ class PipelineWorkflow:
                 # 如果多次尝试仍未通过质量检查，抛出异常进入降级流程
                 if not is_passed:
                     raise ValueError(f"Quality guardrail failed repeatedly for structured output: {reason}")
+                
+                # 打印日志以说明 LLM 最终生成的结果中是否包含了对 PubMed 的真实使用，以及具体的利用方式
+                used_evidences = [ev for ev in result.evidences if "PubMed" in ev.source]
+                if used_evidences:
+                    logger.info(f"{stage_prefix}★ [PubMed Citation Verified] LLM successfully utilized and cited PubMed references in its structured output for facet '{facet}':")
+                    for ev in used_evidences:
+                        logger.info(f"    ▶ [证据来源]: {ev.source} (定位: {ev.location})")
+                        logger.info(f"    ▶ [提取核心事实]: {ev.summary}")
+                    
+                    # 查找并打印利用了该证据的推理链步骤
+                    for step in result.reasoning_chains:
+                        # 检查推理步骤是否提到 PMID 或证据
+                        if any(ev.source in step.logic or "pmid" in step.logic.lower() for ev in used_evidences):
+                            logger.info(f"    ▶ [医学推理逻辑 ({step.step_id})]: {step.logic}")
+                else:
+                    pubmed_sources = [r.get("source") for r in refs if r and "PubMed" in r.get("source", "")]
+                    if pubmed_sources:
+                        logger.warning(f"{stage_prefix}⚠ [PubMed Citation Check] LLM did NOT reference the provided PubMed references ({', '.join(pubmed_sources)}) in its structured output for facet '{facet}'.")
                 
                 # 处理推理过程内容
                 reasoning_content = getattr(result, "_reasoning_content", "")
@@ -483,7 +710,25 @@ class PipelineWorkflow:
                             if len(parts) > 1:
                                 reasoning_content = parts[1].strip()
                         
-                    is_passed, reason = check_answer_quality(check_body, reasoning_content)
+                    is_passed, reason = check_answer_quality(check_body, reasoning_content, simplify=simplify)
+                    if is_passed:
+                        violations = detect_forbidden_expansion(
+                            f"{check_body}\n{reasoning_content}",
+                            evidence_contract,
+                        )
+                        if violations:
+                            is_passed = False
+                            reason = f"evidence contract violation: {violations}"
+                            record_generation_audit({
+                                "stage": "answer_evidence_contract",
+                                "status": "violation",
+                                "task_id": task_id_label,
+                                "query": query,
+                                "facet": facet,
+                                "attempt": fb_attempt + 1,
+                                "fallback": True,
+                                "violations": violations,
+                            })
                     if is_passed:
                         break
                     logger.warning(f"Quality Guardrail FAILED on fallback attempt {fb_attempt}: {reason}. Retrying...")
@@ -507,17 +752,94 @@ class PipelineWorkflow:
                     
             return facet, response
 
-    async def run_parallel_answers(self, query: str, facets: List[str], refs: List[Dict[str, str]], task_id_label: str = "") -> List[Dict[str, str]]:
+    async def _govern_single_facet(self, query: str, facet: str, gov_filter, gov_context: dict) -> dict:
+        from core.governance.facet_strategy import DropDirtyFacetStrategy, RenameAndRepairStrategy, RedirectToSimpleStrategy
+        decision = await gov_filter.evaluate_compatibility(query, facet)
+        
+        if decision.facet_action == "DROP" or decision.compatibility == "FORCED_SKIP":
+            strategy = DropDirtyFacetStrategy()
+            res = await strategy.apply(query, facet, gov_context)
+        elif decision.facet_action == "RENAME":
+            strategy = RenameAndRepairStrategy(decision.target_facet)
+            res = await strategy.apply(query, facet, gov_context)
+        elif decision.facet_action == "REDIRECT_SIMPLE" or decision.compatibility == "COMPATIBLE_SIMPLE":
+            strategy = RedirectToSimpleStrategy(decision.target_facet or facet)
+            res = await strategy.apply(query, facet, gov_context)
+        else: # KEEP
+            res = {"action": "keep", "facet": facet, "simplify": False}
+        return res
+
+    async def _govern_facets_with_audit(self, query: str, facets: List[str], task_id_label: str) -> List[Dict[str, Any]]:
+        from core.governance.facet_strategy import FacetGovernanceFilter
+        gov_filter = FacetGovernanceFilter(self.llm_service)
+        gov_context = {"audit_log": []}
+        
+        tasks = [self._govern_single_facet(query, facet, gov_filter, gov_context) for facet in facets]
+        results = await asyncio.gather(*tasks)
+        
+        governed_facets = []
+        for res in results:
+            if res["action"] != "drop" and res["facet"]:
+                governed_facets.append({
+                    "facet": res["facet"],
+                    "simplify": res.get("simplify", False)
+                })
+
+        if gov_context["audit_log"]:
+            try:
+                from utils.visual_printer import print_facet_governance_audit
+                print_facet_governance_audit(query, gov_context["audit_log"], task_id_label)
+            except Exception as e:
+                logger.error(f"[VisualPrinter Error] Failed to print facet governance audit: {e}")
+                logger.info(f"Facet governance audit for query '{query}': {gov_context['audit_log']}")
+                
+            for log in gov_context["audit_log"]:
+                record_generation_audit({
+                    "stage": "facet_governance",
+                    "status": "governed",
+                    "task_id": task_id_label,
+                    "query": query,
+                    "log": log
+                })
+        return governed_facets
+
+    async def _emergency_replan_facets(self, query: str, old_facets: List[str], task_id_label: str) -> List[str]:
+        import prompts
+        from pipeline import parse_json_safely
+        logger.warning(f"No valid facets remain after initial governance for query '{query}'. Retrying with explicit negative examples...")
+        
+        domain_name = getattr(config, "DOMAIN_NAME", "医学")
+        prompt = prompts.render_prompt(
+            prompts.EMERGENCY_REPLAN_TEMPLATE, 
+            domain_name=domain_name, 
+            query=query, 
+            old_facets=old_facets
+        )
+        
+        try:
+            response = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"[{task_id_label}] 视角切面紧急重新规划" if task_id_label else "视角切面紧急重新规划")
+            new_facets = parse_json_safely(response, [])
+            new_facets, _ = filter_valid_facets(new_facets)
+            if len(new_facets) >= 1:
+                logger.info(f"Successfully replanned new facets: {new_facets} for query '{query}'")
+                return new_facets
+        except Exception as e:
+            logger.error(f"Failed to replan facets for query '{query}': {e}")
+        return []
+
+    async def run_parallel_answers(
+        self,
+        query: str,
+        facets: List[str],
+        refs: List[Dict[str, str]],
+        task_id_label: str = ""
+    ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
         """
         并发运行所有切面的问答智能体。
         使用信号量控制最大并发数。
-        
-        :param query: 当前查询问题
-        :param facets: 切面列表
-        :param refs: 参考文献列表
-        :param task_id_label: 任务ID标签，用于日志追踪
-        :return: 包含各切面及其对应回答的字典列表，如: [{"planner": 切面, "answer": 回答}, ...]
         """
+        from core.rag.evidence_scope_router import EvidenceScopeRouter
+
         semaphore = asyncio.Semaphore(config.CONCURRENT_QA_LIMIT)
         facets, invalid_facets = filter_valid_facets(facets)
         if invalid_facets:
@@ -532,13 +854,84 @@ class PipelineWorkflow:
         if len(facets) < 2:
             logger.critical(f"Parallel answer generation aborted: fewer than 2 valid facets for query '{query}'.")
             return []
-        # 创建并发任务列表
-        tasks = [self.answer_single_facet(query, facet, refs, semaphore, task_id_label=task_id_label) for facet in facets]
+
+        # 1. 🚦 Q-Facet 并发兼容过滤器治理
+        governed_facets = await self._govern_facets_with_audit(query, facets, task_id_label)
+
+        # 兜底重规划
+        if len(governed_facets) < 1:
+            new_facets = await self._emergency_replan_facets(query, facets, task_id_label)
+            if new_facets:
+                governed_facets = await self._govern_facets_with_audit(query, new_facets, task_id_label)
+
+        if len(governed_facets) < 1:
+            logger.critical(f"Parallel answer generation aborted: no valid facets remain after governance for query '{query}'.")
+            return []
+
+        # 2. 🚦 证据域 RAG 检索分级路由过滤
+        router = EvidenceScopeRouter()
+        from core.evidence_contract import build_evidence_contract
+        from core.governance.facet_strategy import classify_intent_by_rule
+        intent = classify_intent_by_rule(query)
+        routed_refs = await router.route_references(query, intent, refs or [], task_id_label=task_id_label)
+        
+        # 隔离物理屏蔽与无用证据，只保留 CORE 和 BOUNDARY
+        active_refs = routed_refs["CORE"] + routed_refs["BOUNDARY"]
+        boundary_refs = routed_refs["BOUNDARY"]
+        evidence_contract = build_evidence_contract(query, refs or [], routed_refs)
+        
+        # 打印详细的 RAG 路由与过滤日志，便于分析为什么没有注入
+        original_sources = [r.get("source") for r in (refs or [])]
+        active_sources = [r.get("source") for r in active_refs]
+        logger.info(f"[{task_id_label}] RAG Router Intent: '{intent}'")
+        logger.info(f"[{task_id_label}] Original reference sources: {original_sources}")
+        logger.info(f"[{task_id_label}] Active references (CORE+BOUNDARY) sources: {active_sources}")
+        logger.info(f"[{task_id_label}] Blocked/Unused references count: BLOCKED={len(routed_refs['BLOCKED'])}, UNUSED={len(routed_refs['UNUSED'])}")
+        
+        # 记录 RAG 路由审计日志
+        blocked_count = len(routed_refs["BLOCKED"])
+        unused_count = len(routed_refs["UNUSED"])
+        record_generation_audit({
+            "stage": "evidence_contract",
+            "status": evidence_contract.get("evidence_status", "unknown"),
+            "task_id": task_id_label,
+            "query": query,
+            "allowed_fact_count": evidence_contract.get("allowed_fact_count", 0),
+            "core_fact_count": evidence_contract.get("core_fact_count", 0),
+            "boundary_fact_count": evidence_contract.get("boundary_fact_count", 0),
+            "forbidden_expansions": evidence_contract.get("forbidden_expansions", []),
+        })
+        if blocked_count > 0 or unused_count > 0:
+            log_msg = f"EvidenceScopeRouter: filtered out {blocked_count} blocked and {unused_count} unused refs."
+            logger.info(log_msg)
+            record_generation_audit({
+                "stage": "evidence_scope_routing",
+                "status": "routed",
+                "task_id": task_id_label,
+                "query": query,
+                "blocked_count": blocked_count,
+                "unused_count": unused_count,
+                "log": log_msg
+            })
+
+        # 3. 创建并发任务列表，分发治理后属性及过滤后 refs
+        tasks = [
+            self.answer_single_facet(
+                query, 
+                f_info["facet"], 
+                active_refs, 
+                semaphore, 
+                simplify=f_info["simplify"], 
+                boundary_refs=boundary_refs,
+                evidence_contract=evidence_contract,
+                task_id_label=task_id_label
+            ) 
+            for f_info in governed_facets
+        ]
         # 并发执行所有任务
         results = await asyncio.gather(*tasks)
         
         planners = []
-        # 过滤掉被丢弃(返回None)的切面，组装结果
         for facet, answer in results:
             if answer is None:
                 continue
@@ -546,9 +939,15 @@ class PipelineWorkflow:
                 "planner": facet,
                 "answer": answer
             })
-        return planners
+        return planners, evidence_contract
 
-    async def synthesize_answers(self, query: str, planners: List[Dict[str, str]], task_id_label: str = "") -> str:
+    async def synthesize_answers(
+        self,
+        query: str,
+        planners: List[Dict[str, str]],
+        task_id_label: str = "",
+        evidence_contract: Dict[str, Any] = None
+    ) -> str:
         """
         将过滤后的各切面回答综合凝练为单一的连贯最终摘要回答。
         路由至轻量级大模型执行。
@@ -571,10 +970,40 @@ class PipelineWorkflow:
             
         # 渲染综合凝练提示词并调用轻量级大模型
         prompt = PromptRenderer.render(prompts.MULTI_ANSWER_SYNTHESIS_TEMPLATE, query=query, answers=answers_clean)
+        if evidence_contract:
+            from core.evidence_contract import detect_forbidden_expansion, render_evidence_contract_prompt
+            prompt += render_evidence_contract_prompt(evidence_contract)
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        summary = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}切面问答综合凝练")
-        logger.info("Successfully synthesized final answer summary.")
-        return summary
+        feedback = ""
+        for attempt in range(3):
+            summary = await self.llm_service.call_llm(
+                prompt + feedback,
+                model_pool="lightweight",
+                stage=f"{stage_prefix}切面问答综合凝练 attempt-{attempt + 1}"
+            )
+            violations = detect_forbidden_expansion(summary, evidence_contract) if evidence_contract else []
+            if not violations:
+                logger.info("Successfully synthesized final answer summary.")
+                return summary
+
+            record_generation_audit({
+                "stage": "summary_evidence_contract",
+                "status": "violation",
+                "task_id": task_id_label,
+                "query": query,
+                "attempt": attempt + 1,
+                "violations": violations,
+            })
+            logger.warning(
+                f"{stage_prefix}Summary evidence contract violation on attempt {attempt + 1}: {violations}"
+            )
+            feedback = (
+                "\n\n【上一版输出违反证据契约】\n"
+                f"违规项: {violations}\n"
+                "请重新综合。只能保留允许事实；对于证据未提供的信息，只能说明证据不足，禁止补写具体药代、替代药或临床研究结论。\n"
+            )
+
+        raise SampleQuarantineException(f"Summary repeatedly violated evidence contract for query: {query}")
 
     async def generate_next_question(self, context_list: List[Dict[str, str]], history: List[Dict[str, Any]], previous_summary: str, task_id_label: str = "") -> str:
         """
@@ -595,11 +1024,31 @@ class PipelineWorkflow:
             summary=previous_summary
         )
         stage_prefix = f"[{task_id_label}] " if task_id_label else ""
-        # 调用轻量级大模型
-        next_q = await self.llm_service.call_llm(prompt, model_pool="lightweight", stage=f"{stage_prefix}多轮对话下一问生成")
-        # 清理多余的引号和空格
-        next_q = next_q.strip().strip('"').strip("'")
-        return next_q
+        feedback = ""
+        for attempt in range(3):
+            retry_prompt = prompt + feedback
+            next_q = await self.llm_service.call_llm(
+                retry_prompt,
+                model_pool="lightweight",
+                stage=f"{stage_prefix}多轮对话下一问生成 attempt-{attempt + 1}"
+            )
+            # 清理多余的引号和空格
+            next_q = next_q.strip().strip('"').strip("'")
+            if not is_fact_retrieval_question(next_q):
+                return next_q
+
+            logger.warning(
+                f"{stage_prefix}下一轮问题命中事实提取型拦截（attempt {attempt + 1}）：{next_q}"
+            )
+            feedback = (
+                "\n\n<previous_validation_failure>\n"
+                f"上一次输出 `{next_q}` 属于单跳事实查询题，会被质量网关判定为推演复杂度不及格。"
+                "请改写为带患者背景、合并症/禁忌/药代冲突或证据边界权衡的临床推理题；"
+                "不要问“是什么/有哪些/用法用量/试验类型”等可直接摘录的问题。\n"
+                "</previous_validation_failure>"
+            )
+
+        raise SampleQuarantineException("连续生成的下一轮问题均为单跳事实查询题，系统拒绝入库。")
 
     async def generate_single_round(
         self, 
@@ -623,17 +1072,17 @@ class PipelineWorkflow:
         # 1. 规划初始切面
         initial_facets = await self.plan_facets(query, task_id_label=task_id_label)
         if not initial_facets:
-            raise RuntimeError(f"Facet planning failed validation; sample quarantined for query: {query}")
+            raise SampleQuarantineException(f"Facet planning failed validation; sample quarantined for query: {query}")
             
         # 2. 预处理切面（缩减或扩充）
         final_facets = await self.preprocess_facets(query, initial_facets, task_id_label=task_id_label)
         if len(final_facets) < 2:
-            raise RuntimeError(f"Facet preprocessing produced fewer than 2 valid facets; sample quarantined for query: {query}")
+            raise SampleQuarantineException(f"Facet preprocessing produced fewer than 2 valid facets; sample quarantined for query: {query}")
 
         # 3. 并发生成各切面回答
-        planners = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
+        planners, evidence_contract = await self.run_parallel_answers(query, final_facets, refs, task_id_label=task_id_label)
         if not planners:
-            raise RuntimeError(f"No valid facet answers generated; sample quarantined for query: {query}")
+            raise SampleQuarantineException(f"No valid facet answers generated; sample quarantined for query: {query}")
         
         # 4. 使用策略模式执行冗余过滤
         non_redundant_planners = await self.redundancy_filter.filter_redundancy(
@@ -645,14 +1094,20 @@ class PipelineWorkflow:
             non_redundant_planners = planners
             
         # 5. 综合凝练最终摘要
-        summary = await self.synthesize_answers(query, non_redundant_planners, task_id_label=task_id_label)
+        summary = await self.synthesize_answers(
+            query,
+            non_redundant_planners,
+            task_id_label=task_id_label,
+            evidence_contract=evidence_contract
+        )
         
         # 组装单轮结果数据
         round_data = {
             "Q": query,
             "planners": non_redundant_planners,
             "history": list(history) if history else [],
-            "summary": summary
+            "summary": summary,
+            "evidence_contract": evidence_contract
         }
         return round_data
 
@@ -672,6 +1127,7 @@ class PipelineWorkflow:
         # 1. 获取随机知识图谱数据
         try:
             graph_data = await self.graph_service.fetch_random_knowledge_graph(count=1)
+            logger.info(f"{log_prefix}AAA Fetched KG graph_data successfully.")
         except Exception as e:
             logger.critical(f"{log_prefix}Failed to fetch random KG: {e}")
             graph_data = {"entities": [], "relationships": []}
@@ -713,8 +1169,11 @@ class PipelineWorkflow:
                 
         logger.info(f"{log_prefix}--- Intention-Guided Graph-RAG Theme: '{selected_theme}' ---")
         
-        # 3. 准备上下文和参考引用，生成初始问题
+        # 3. 准备上下文和参考引用
         context_list, refs = await self._prepare_context_and_refs(graph_data, query=selected_theme)
+        logger.info(f"{log_prefix}AAABPrepared context_list: {len(context_list)} items, refs: {len(refs)} items")
+
+        # 生成初始问题
         q1 = await self.generate_initial_question(context_list, task_id_label=task_id_label)
         
         history = []

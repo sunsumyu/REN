@@ -17,21 +17,95 @@ logger = logging.getLogger("MedicalQA.LLMService")
 class ILLMService(ABC):
     @abstractmethod
     async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> str:
+        """
+        调用大语言模型生成文本回复。
+
+        Args:
+            prompt (str): 用户输入的主要提示词。
+            system_prompt (str, optional): 系统级指令，用于设定模型角色或行为准则。默认为空字符串。
+            model_pool (str, optional): 模型池标识，如 "premium" 或 "lightweight"，用于选择不同性能/成本的模型。默认为 "premium"。
+            stage (str, optional): 当前业务阶段标识，用于日志记录和监控追踪。默认为空字符串。
+            max_tokens (int, optional): 限制生成的最大 token 数量。默认为 None（使用默认配置）。
+
+        Returns:
+            str: 模型生成的文本内容。
+        """
         pass
         
     @abstractmethod
     async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> Tuple[str, str]:
+        """
+        调用大语言模型生成文本回复，并额外获取模型的推理过程内容。
+
+        Args:
+            prompt (str): 用户输入的主要提示词。
+            system_prompt (str, optional): 系统级指令，用于设定模型角色或行为准则。默认为空字符串。
+            model_pool (str, optional): 模型池标识，如 "premium" 或 "lightweight"。默认为 "premium"。
+            stage (str, optional): 当前业务阶段标识，用于日志记录和监控追踪。默认为空字符串。
+            max_tokens (int, optional): 限制生成的最大 token 数量。默认为 None。
+
+        Returns:
+            Tuple[str, str]: 一个元组，包含 (最终回答内容, 推理过程内容)。
+        """
         pass
         
     @abstractmethod
     async def call_llm_structured(self, messages: List[Dict[str, str]], response_model: type, model_pool: str = "premium", stage: str = "") -> Any:
+        """
+        调用大语言模型进行结构化输出，确保返回结果符合指定的 Pydantic 模型结构。
+
+        Args:
+            messages (List[Dict[str, str]]): 对话消息列表，包含 role 和 content。
+            response_model (type): 期望返回数据的 Pydantic BaseModel 类。
+            model_pool (str, optional): 模型池标识。默认为 "premium"。
+            stage (str, optional): 当前业务阶段标识。默认为空字符串。
+
+        Returns:
+            Any: 实例化的 response_model 对象。
+        """
         pass
+
+class AsyncRateLimiter:
+    def __init__(self, max_rate: float, time_period: float = 1.0):
+        self.max_rate = max_rate
+        self.time_period = time_period
+        self.tokens = max_rate
+        self.last_update = asyncio.get_event_loop().time()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            while True:
+                now = asyncio.get_event_loop().time()
+                elapsed = now - self.last_update
+                self.tokens = min(self.max_rate, self.tokens + elapsed * (self.max_rate / self.time_period))
+                self.last_update = now
+
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                else:
+                    wait_time = (1.0 - self.tokens) * (self.time_period / self.max_rate)
+                    await asyncio.sleep(wait_time)
 
 class LLMService(ILLMService):
     def __init__(self, http_client: httpx.AsyncClient, global_semaphore: asyncio.Semaphore):
+        """
+        初始化 LLM 服务实例。
+
+        Args:
+            http_client (httpx.AsyncClient): 异步 HTTP 客户端实例，用于发送请求。
+            global_semaphore (asyncio.Semaphore): 全局并发控制信号量，用于限制同时进行的 API 调用数量。
+        """
         self.client = http_client
         self.global_semaphore = global_semaphore
         self.supported_models: List[str] = []
+        
+        # Initialize token bucket rate limiter reusing GLOBAL_API_SEMAPHORE as RPS
+        self.rate_limiter = None
+        if hasattr(config, "GLOBAL_API_SEMAPHORE") and config.GLOBAL_API_SEMAPHORE > 0:
+            self.rate_limiter = AsyncRateLimiter(max_rate=float(config.GLOBAL_API_SEMAPHORE))
+            logger.info(f"Global LLM Rate Limiter initialized: {config.GLOBAL_API_SEMAPHORE} RPS (Derived from Semaphore)")
 
     STRUCTURED_LEAK_PATTERNS = [
         r"rigorous\s+data\s+processing\s+api",
@@ -48,6 +122,16 @@ class LLMService(ILLMService):
 
     @classmethod
     def _find_structured_prompt_leak(cls, value: Any, path: str = "$") -> Tuple[str, str]:
+        """
+        递归检查数据结构中是否包含提示词泄露或 Schema 描述信息。
+
+        Args:
+            value (Any): 待检查的数据值（字符串、字典或列表）。
+            path (str, optional): 当前数据在结构中的路径标识，用于错误定位。默认为 "$"。
+
+        Returns:
+            Tuple[str, str]: 如果发现泄露，返回 (泄露位置路径, 匹配的正则模式)；否则返回 ("", "")。
+        """
         if isinstance(value, str):
             lowered = value.lower()
             for pattern in cls.STRUCTURED_LEAK_PATTERNS:
@@ -68,6 +152,16 @@ class LLMService(ILLMService):
 
     @classmethod
     def _assert_no_structured_prompt_leak(cls, obj: Any, response_model: type) -> None:
+        """
+        验证结构化输出对象中是否包含不应出现的提示词或 Schema 泄露内容。
+
+        Args:
+            obj (Any): 待验证的对象，通常为 Pydantic 模型实例或字典。
+            response_model (type): 预期的响应模型类，用于错误提示信息。
+
+        Raises:
+            ValueError: 如果检测到提示词泄露，抛出异常并指出泄露位置。
+        """
         try:
             payload = obj.model_dump(mode="json") if hasattr(obj, "model_dump") else obj
         except Exception:
@@ -78,10 +172,27 @@ class LLMService(ILLMService):
                 f"{response_model.__name__} contains structured prompt/schema leakage at {leak_path}: {pattern}"
             )
 
+    @staticmethod
+    def _models_url(chat_url: str) -> str:
+        return chat_url.replace("/chat/completions", "/models")
+
+    @staticmethod
+    def _format_http_exception(error: Exception) -> str:
+        if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+            body = (error.response.text or "")[:1000].replace("\n", " ")
+            return (
+                f"{type(error).__name__}: HTTP {error.response.status_code}; "
+                f"body={body!r}; message={str(error)}"
+            )
+        return f"{type(error).__name__}: {str(error)}"
+
     async def init_supported_models(self, force: bool = False):
         """
-        Dynamically fetch the list of supported models from the gateway.
-        Supports offline caching in 'supported_models_cache.json' to handle network glitches.
+        动态从网关获取支持的模型列表。
+        支持离线缓存 'supported_models_cache.json' 以应对网络故障。
+
+        Args:
+            force (bool, optional): 是否强制刷新模型列表，忽略本地缓存。默认为 False。
         """
         cache_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "supported_models_cache.json")
         
@@ -101,7 +212,7 @@ class LLMService(ILLMService):
             headers["Authorization"] = "Bearer dummy"
             
         # Dynamically build standard OpenAI models endpoint
-        url = config.LLM_API_URL.replace("/chat/completions", "/models")
+        url = self._models_url(config.LLM_API_URL)
         try:
             response = await self.client.get(url, headers=headers, timeout=10.0)
             if response.status_code == 200:
@@ -117,7 +228,7 @@ class LLMService(ILLMService):
                     raise je
                 if isinstance(res_data, dict) and "data" in res_data:
                     self.supported_models = [item.get("id") for item in res_data["data"] if item.get("id")]
-                    logger.info(f"Successfully loaded {len(self.supported_models)} supported models dynamically from gateway!")
+                    logger.info(f"Successfully loaded {len(self.supported_models)} supported models dynamically from gateway: {url}")
                     # Write to local cache
                     try:
                         with open(cache_file, "w", encoding="utf-8") as f:
@@ -127,9 +238,9 @@ class LLMService(ILLMService):
                         logger.warning(f"Failed to save supported models to cache: {cache_err}")
                     return
             else:
-                logger.warning(f"Failed to query supported models from {url}: HTTP {response.status_code}")
+                logger.warning(f"Failed to query supported models from {url}: HTTP {response.status_code}, body={response.text[:500]!r}")
         except Exception as e:
-            logger.warning(f"Error querying supported models from {url}: {e}")
+            logger.warning(f"Error querying supported models from {url}: {self._format_http_exception(e)}")
             
         # Fallback to local cache if query failed or gateway was unreachable
         if os.path.exists(cache_file):
@@ -142,8 +253,16 @@ class LLMService(ILLMService):
 
     async def _resolve_model(self, model_pool: str, is_structured: bool = False, force_refresh_on_missing: bool = True) -> str:
         """
-        Resolve the model pool name to the actual model identifier from config.
-        If model candidate is not found in currently loaded list, dynamically force-refresh from gateway.
+        将模型池名称解析为实际使用的模型标识符。
+        如果候选模型不在当前加载的列表中，则动态从网关强制刷新。
+
+        Args:
+            model_pool (str): 模型池名称（如 "lightweight", "judge", "premium"）。
+            is_structured (bool, optional): 是否为结构化输出调用。如果是，可能会自动升级模型以保证 Schema 兼容性。默认为 False。
+            force_refresh_on_missing (bool, optional): 当模型未找到时是否强制刷新列表。默认为 True。
+
+        Returns:
+            str: 解析后的实际模型 ID。
         """
         pool = model_pool.lower()
         
@@ -152,11 +271,21 @@ class LLMService(ILLMService):
             logger.info("Structured call detected in lightweight pool. Routing to premium pool for schema compatibility.")
             pool = "premium"
             
+        # 如果传入的 pool 就是一个已验证支持的具体模型 ID，直接使用它
+        if self.supported_models:
+            for m in self.supported_models:
+                if m.lower() == pool:
+                    return m
+            
         # Map pool to configured model name
         if pool == "lightweight":
             model_candidate = config.MODEL_POOL_LIGHTWEIGHT
         elif pool == "judge":
             model_candidate = config.MODEL_POOL_JUDGE
+        elif pool == "audit":
+            model_candidate = config.AUDIT_MODEL
+        elif pool == "report":
+            model_candidate = config.REPORT_MODEL
         else:
             model_candidate = config.MODEL_POOL_PREMIUM
             
@@ -198,15 +327,36 @@ class LLMService(ILLMService):
 
     async def _request_with_retry(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
         """
-        Executes HTTP requests with exponential backoff on transient errors.
-        Respects global concurrency semaphore rate limiting.
+        执行带有指数退避重试机制的 HTTP 请求。
+        遵守全局并发信号量的速率限制。
+
+        Args:
+            method (str): HTTP 请求方法（如 "GET", "POST"）。
+            url (str): 请求 URL。
+            **kwargs: 传递给 httpx 客户端的其他参数（如 headers, json 等）。
+
+        Returns:
+            Dict[str, Any]: 解析后的 JSON 响应数据。
+
+        Raises:
+            Exception: 当达到最大重试次数后仍然失败时抛出异常。
         """
         retries = 0
         backoff = 2.0
+        last_error = None
         
         while True:
+            # 1. Jitter (Strategy B): Prevent thundering herd by adding random micro-delay
+            if hasattr(config, "LLM_REQUEST_JITTER") and config.LLM_REQUEST_JITTER > 0:
+                await asyncio.sleep(random.uniform(0, config.LLM_REQUEST_JITTER))
+                
+            # 2. Token Bucket Rate Limiter (Strategy C): Smooth out bursts using Semaphore-derived RPS
+            if hasattr(self, "rate_limiter") and self.rate_limiter:
+                await self.rate_limiter.acquire()
+                
             req_start_time = time.time()
             try:
+                # 3. Global Semaphore (Strategy A): Cap the maximum concurrent active connections
                 async with self.global_semaphore:
                     response = await self.client.request(method, url, timeout=120.0, **kwargs)
                     response.raise_for_status()
@@ -235,7 +385,11 @@ class LLMService(ILLMService):
                     return res_json
             except (httpx.HTTPStatusError, httpx.HTTPError, httpx.NetworkError) as e:
                 elapsed = time.time() - req_start_time
-                logger.error(f"HTTP/API error on request {method} {url} (elapsed: {elapsed:.2f}s): {e}")
+                last_error = e
+                logger.error(
+                    f"HTTP/API error on request {method} {url} (elapsed: {elapsed:.2f}s): "
+                    f"{self._format_http_exception(e)}"
+                )
                 # 🚨 [504 Gateway Timeout 退避重试]：
                 # 如果是网关对大模型超时未返回强行进行了 HTTP 504 关闭，改为允许退避重试以增加容错性
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code == 504:
@@ -243,15 +397,21 @@ class LLMService(ILLMService):
             
             retries += 1
             if retries > config.MAX_RETRIES:
-                logger.critical(f"Max retries ({config.MAX_RETRIES}) reached for {url}. Raising error.")
-                raise Exception(f"Failed to fetch from {url} after {config.MAX_RETRIES} attempts.")
+                detail = self._format_http_exception(last_error) if last_error else "unknown error"
+                logger.critical(f"Max retries ({config.MAX_RETRIES}) reached for {url}. Last error: {detail}")
+                raise Exception(f"Failed to fetch from {url} after {config.MAX_RETRIES} attempts. Last error: {detail}") from last_error
             
             sleep_time = (backoff ** retries) + random.uniform(0.1, 0.5)
             logger.info(f"Sleeping for {sleep_time:.2f} seconds before retry {retries}...")
             await asyncio.sleep(sleep_time)
 
     def _build_request_headers(self) -> Dict[str, str]:
-        """集中构造具有授权签名的 HTTP 请求头"""
+        """
+        集中构造具有授权签名的 HTTP 请求头。
+
+        Returns:
+            Dict[str, str]: 包含 Content-Type 和 Authorization 的请求头字典。
+        """
         headers = {
             "Content-Type": "application/json"
         }
@@ -266,7 +426,16 @@ class LLMService(ILLMService):
         return headers
 
     def _prepare_messages(self, prompt: str, system_prompt: str = "") -> List[Dict[str, str]]:
-        """集中包装对话上下文消息队列"""
+        """
+        集中包装对话上下文消息队列。
+
+        Args:
+            prompt (str): 用户提示词。
+            system_prompt (str, optional): 系统提示词。默认为空字符串。
+
+        Returns:
+            List[Dict[str, str]]: 格式化后的消息列表。
+        """
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -279,11 +448,25 @@ class LLMService(ILLMService):
         data: Dict[str, Any], 
         resolved_model: str, 
         model_pool: str, 
-        stage: str, 
-        attempt: int = 0
-    ) -> Tuple[Dict[str, Any], str]:
-        """集中控制 HTTP 调用生命周期，实现计时、弹性降级路由及 Token 漂亮打印的极致 DRY 抽取"""
-        start_time = time.time()
+        stage: str
+    ) -> Tuple[Dict[str, Any], str, float]:
+        """
+        集中控制 HTTP 调用生命周期，实现计时和弹性降级路由。
+
+        Args:
+            headers (Dict[str, str]): HTTP 请求头。
+            data (Dict[str, Any]): 请求体数据。
+            resolved_model (str): 已解析的目标模型 ID。
+            model_pool (str): 模型池标识。
+            stage (str): 业务阶段标识。
+
+        Returns:
+            Tuple[Dict[str, Any], str, float]: 包含 (响应数据, 实际使用的模型ID, 耗时秒数) 的元组。
+
+        Raises:
+            Exception: 如果请求失败且无法通过降级恢复，则抛出原始异常。
+        """
+        total_start_time = time.time()
         try:
             response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
         except Exception as e:
@@ -292,21 +475,27 @@ class LLMService(ILLMService):
                 resolved_model = config.LLM_MODEL
                 data["model"] = resolved_model
                 logger.info(f"Retrying Call with Fallback LLM ({resolved_model})...")
-                start_time = time.time()
                 response_data = await self._request_with_retry("POST", config.LLM_API_URL, headers=headers, json=data)
             else:
                 raise e
         
-        duration = time.time() - start_time
-        usage = response_data.get("usage", {})
-        
-        current_stage = stage
-        if attempt > 0:
-            current_stage = f"{stage} (自愈重试 {attempt})"
-        print_token_usage(current_stage, resolved_model, duration, usage)
-        return response_data, resolved_model
+        duration = time.time() - total_start_time
+        return response_data, resolved_model, duration
 
     async def call_llm(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> str:
+        """
+        调用大语言模型生成文本回复。
+
+        Args:
+            prompt (str): 用户输入的主要提示词。
+            system_prompt (str, optional): 系统级指令。默认为空字符串。
+            model_pool (str, optional): 模型池标识。默认为 "premium"。
+            stage (str, optional): 业务阶段标识。默认为空字符串。
+            max_tokens (int, optional): 最大生成 token 数。默认为 None。
+
+        Returns:
+            str: 模型生成的文本内容。
+        """
         await self.init_supported_models()
         headers = self._build_request_headers()
         messages = self._prepare_messages(prompt, system_prompt)
@@ -330,7 +519,8 @@ class LLMService(ILLMService):
             logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] (Current Active/Limit: {active_count}/{total_sem})...")
         else:
             logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}]...")
-        response_data, resolved_model = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
+        response_data, resolved_model, duration = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
+        print_token_usage(stage, resolved_model, duration, response_data.get("usage", {}))
         
         try:
             content = response_data["choices"][0]["message"]["content"]
@@ -340,6 +530,19 @@ class LLMService(ILLMService):
             raise Exception(f"Invalid LLM response format: {e}")
 
     async def call_llm_with_reasoning(self, prompt: str, system_prompt: str = "", model_pool: str = "premium", stage: str = "", max_tokens: int = None) -> Tuple[str, str]:
+        """
+        调用大语言模型生成文本回复，并额外获取模型的推理过程内容。
+
+        Args:
+            prompt (str): 用户输入的主要提示词。
+            system_prompt (str, optional): 系统级指令。默认为空字符串。
+            model_pool (str, optional): 模型池标识。默认为 "premium"。
+            stage (str, optional): 业务阶段标识。默认为空字符串。
+            max_tokens (int, optional): 最大生成 token 数。默认为 None。
+
+        Returns:
+            Tuple[str, str]: 一个元组，包含 (最终回答内容, 推理过程内容)。
+        """
         await self.init_supported_models()
         headers = self._build_request_headers()
         messages = self._prepare_messages(prompt, system_prompt)
@@ -363,7 +566,8 @@ class LLMService(ILLMService):
             logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}] (Current Active/Limit: {active_count}/{total_sem})...")
         else:
             logger.info(f"Calling LLM with reasoning ({resolved_model}) [Pool: {model_pool}]...")
-        response_data, resolved_model = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
+        response_data, resolved_model, duration = await self._execute_with_fallback(headers, data, resolved_model, model_pool, stage)
+        print_token_usage(stage, resolved_model, duration, response_data.get("usage", {}))
         
         try:
             message = response_data["choices"][0]["message"]
@@ -376,7 +580,20 @@ class LLMService(ILLMService):
 
     async def call_llm_structured(self, messages: List[Dict[str, str]], response_model: type, model_pool: str = "premium", stage: str = "") -> Any:
         """
-        Calls the LLM using API-level Structured Outputs with JSON Schema strict constraints.
+        调用大语言模型进行结构化输出，确保返回结果符合指定的 Pydantic 模型结构。
+        支持自愈重试机制，当解析失败时自动反馈错误给模型进行修正。
+
+        Args:
+            messages (List[Dict[str, str]]): 对话消息列表。
+            response_model (type): 期望返回数据的 Pydantic BaseModel 类。
+            model_pool (str, optional): 模型池标识。默认为 "premium"。
+            stage (str, optional): 业务阶段标识。默认为空字符串。
+
+        Returns:
+            Any: 实例化的 response_model 对象，其中包含额外的 _reasoning_content 属性。
+
+        Raises:
+            Exception: 当所有自愈重试尝试均失败时抛出异常。
         """
         await self.init_supported_models()
         headers = self._build_request_headers()
@@ -385,7 +602,9 @@ class LLMService(ILLMService):
         current_messages = list(messages)
         resolved_model = await self._resolve_model(model_pool, is_structured=True)
         
-        is_openai = resolved_model.lower().startswith("gpt")
+        model_name = resolved_model.lower()
+        is_openai = model_name.startswith("gpt")
+        supports_json_object = any(name in model_name for name in ["deepseek", "qwen", "glm-5.1", "glm-5"])
         
         if is_openai:
             response_format = {
@@ -397,7 +616,7 @@ class LLMService(ILLMService):
                 }
             }
         else:
-            response_format = None
+            response_format = {"type": "json_object"} if supports_json_object else None
             schema_str = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
             current_messages.insert(0, {
                 "role": "system", 
@@ -413,7 +632,7 @@ class LLMService(ILLMService):
             data = {
                 "model": resolved_model,
                 "messages": current_messages,
-                "temperature": config.LLM_TEMPERATURE,
+                "temperature": getattr(config, "LLM_STRUCTURED_TEMPERATURE", 0.0),
                 "top_p": config.LLM_TOP_P,
                 "frequency_penalty": config.LLM_FREQUENCY_PENALTY,
             }
@@ -436,9 +655,13 @@ class LLMService(ILLMService):
                 else:
                     logger.info(f"Calling LLM ({resolved_model}) [Pool: {model_pool}] in Structured Output Mode for {response_model.__name__}...")
                 
-            response_data, resolved_model = await self._execute_with_fallback(
-                headers, data, resolved_model, model_pool, stage, attempt=attempt
+            response_data, resolved_model, duration = await self._execute_with_fallback(
+                headers, data, resolved_model, model_pool, stage
             )
+            current_stage = stage
+            if attempt > 0:
+                current_stage = f"{stage} (自愈重试 {attempt})"
+            print_token_usage(current_stage, resolved_model, duration, response_data.get("usage", {}))
             
             try:
                 message = response_data["choices"][0]["message"]

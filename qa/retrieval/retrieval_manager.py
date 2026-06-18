@@ -17,13 +17,13 @@ from retrieval.restricted_search import RestrictedSearchService
 logger = logging.getLogger("MedicalQA.RetrievalManager")
 
 class RetrievalManager:
-    def __init__(self, workspace_dir: str = "."):
+    def __init__(self, workspace_dir: str = ".", llm_service: Any = None):
         """
         初始化三级检索管理中心。自动拉起本地私有 RAG、API 接口网关和受限联网搜索服务。
         """
         self.workspace_dir = workspace_dir
-        self.local_rag = LocalRAGService() # 内存型倒排全文检索，冷启动极速
-        self.api_gateway = APIGatewayService(db_dir=workspace_dir) # 本地持久化 SQLite3 缓存网关
+        self.local_rag = LocalRAGService(workspace_dir=workspace_dir) # 内存型倒排全文检索，冷启动极速
+        self.api_gateway = APIGatewayService(db_dir=workspace_dir, llm_service=llm_service) # 本地持久化 SQLite3 缓存网关
         self.restricted_search = RestrictedSearchService() # 域名白名单受限搜索引擎
 
     async def get_grounding_references(self, query: str, entity_name: str) -> Tuple[List[Dict[str, str]], str]:
@@ -40,7 +40,7 @@ class RetrievalManager:
 
         # --- Tier 1: Local Private RAG ---
         try:
-            local_refs = self.local_rag.search(query, entity_name)
+            local_refs = await self.local_rag.search(query, entity_name)
             if local_refs:
                 logger.info(f"--- Routing Success: Hit TIER 1 (Local RAG) for '{entity_name}' ---")
                 formatted = [item.to_pipeline_format() for item in local_refs]

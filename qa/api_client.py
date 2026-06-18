@@ -19,7 +19,7 @@ class APIClient:
     """
     def __init__(self):
         # Instantiate modularized httpx client and Semaphore locally to preserve compatibility
-        self.httpx_client = httpx.AsyncClient(timeout=60.0)
+        self.httpx_client = httpx.AsyncClient(timeout=60.0, trust_env=False)
         self.global_semaphore = asyncio.Semaphore(config.GLOBAL_API_SEMAPHORE)
         
         # Instantiate services via Dependency Injection

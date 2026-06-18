@@ -56,6 +56,13 @@ class LLMRedundancyFilterStrategy(IRedundancyFilterStrategy):
         logger.info(f"Redundancy detector indices to remove (0-indexed): {indices_to_remove}")
         
         filtered_planners = []
+        max_idx = len(planners) - 1
+        
+        # 校验索引越界风险，记录无效逻辑
+        for idx in indices_to_remove:
+            if not isinstance(idx, int) or idx < 0 or idx > max_idx:
+                logger.warning(f"Redundancy detector hallucinated invalid index: {idx}. Valid range is 0 to {max_idx}.")
+
         for i, p in enumerate(planners):
             if i not in indices_to_remove:
                 filtered_planners.append(p)

@@ -1,4 +1,7 @@
 [
+  "qwen3.7-max",
+  "minimax-m3",
+  "qwen3.7-plus",
   "mimo-v2.5",
   "mimo-v2.5-pro",
   "deepseek-v4-pro",
@@ -13,7 +16,6 @@
   "minimax-m2.5",
   "glm-4.7",
   "glm-4.5v",
-  "glm-4.5",
   "conan",
   "qwen3.6-35b-a3b"
 ]

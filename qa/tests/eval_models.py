@@ -10,11 +10,15 @@ class JudgeMetric(BaseModel):
     reason: str = Field(description="详细的打分理由，客观分析生成答案 of 优缺点")
 
 class ComprehensiveJudgeMetrics(BaseModel):
-    grounding: JudgeMetric = Field(description="事实忠实度评分。评估生成的医学内容是否基于且只基于 refs 事实，是否存在凭空幻觉或严重偏离事实")
-    isolation: JudgeMetric = Field(description="领域隔离度与防污染评分。评估生成的医学内容是否被 initial few-shot（如法律合规/供应链/数据隐私等）污染跑题，完全符合医学范式为 10.0 分")
-    explainability: JudgeMetric = Field(description="可解释性评分。评估答案是否有清晰的逻辑推导和证据来源引用，而不是简单生硬地给出结论")
-    professionalism: JudgeMetric = Field(description="专业性评分。评估使用的医学术语是否规范、文风是否像严谨的临床医学专家")
+    success: JudgeMetric = Field(description="成功度评分。评估生成的输出是否完整包含所需结构（如<think>等），以及任务是否完整执行")
+    recall: JudgeMetric = Field(description="查全率评分。评估无发现或拒答时是否有合理的边界扫描证据，而非随意拒答")
+    precision: JudgeMetric = Field(description="精确度评分。评估医学推论、剂量匹配或药效陈述是否百分百精确无误")
+    faithfulness: JudgeMetric = Field(description="事实忠实度评分。评估生成的医学内容是否基于且只基于 refs 事实，是否存在凭空幻觉或严重偏离事实")
     relevance: JudgeMetric = Field(description="相关性评分。评估回答是否直击提问者的核心诉求，有无冗余和避重就轻")
+    professionalism: JudgeMetric = Field(description="专业度评分。评估使用的医学术语是否规范、文风是否像严谨的临床医学专家")
+    interpretability: JudgeMetric = Field(description="可解释性评分。评估答案是否有清晰的逻辑推导和证据来源引用，而不是简单生硬地给出结论")
+    isolation: JudgeMetric = Field(description="领域隔离度与防污染评分。评估生成的医学内容是否被不相关的语境（如法律合规/供应链/数据隐私等）污染跑题，坚守医学专业边界为 10.0 分")
+    complexity: JudgeMetric = Field(description="推演复杂度评分。评估问题本身的认知深度及对应回答是否展现了真实的逻辑推演链。若问题属单跳查询（仅需查阅无推演）直接给予严重扣分（不及格）；涉及多条件冲突消解与深度诊断可给高分")
 
 class EvalResultItem(BaseModel):
     case_id: str = Field(description="测试用例ID，例如 TC_01, TC_02...")

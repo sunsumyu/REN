@@ -12,6 +12,9 @@ if _no_proxy_val:
     os.environ["NO_PROXY"] = _no_proxy_val
     os.environ["no_proxy"] = _no_proxy_val
 
+# 系统当前业务所属领域 (用于动态解除硬编码的领域锁死，如 "医学"、"金融")
+DOMAIN_NAME = os.getenv("DOMAIN_NAME", "医学")
+
 # 医药知识图谱 API 配置
 GRAPH_API_URL = "https://ai.yzint.cn/api/knowledge/v1/graph/entity/random"
 DEFAULT_KNOWLEDGE_BASE_ID = 201
@@ -19,7 +22,7 @@ DEFAULT_ENTITY_COUNT = 2
 DEFAULT_HOP_COUNT = 2
 
 # 大模型 API 配置
-LLM_API_URL = os.getenv("LLM_API_URL", "https://volley.yzint.cn/api/v1/chat/completions")
+LLM_API_URL = os.getenv("LLM_API_URL", "https://volley.inner.yzint.cn/v1/chat/completions")
 # 从环境变量中读取 API Key
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
@@ -80,11 +83,15 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))                  # 单次并发�
 BATCH_CONCURRENCY_LIMIT = int(os.getenv("BATCH_CONCURRENCY_LIMIT", "3"))  # 同时进行的多轮对话生成任务上限
 GLOBAL_API_SEMAPHORE = int(os.getenv("GLOBAL_API_SEMAPHORE", "6"))      # 全局大模型并发限制（防429）
 
+# 请求前的随机抖动延迟上限（秒），用于打散并发请求，防止惊群效应 (0.0 表示不抖动)
+LLM_REQUEST_JITTER = float(os.getenv("LLM_REQUEST_JITTER", "0.1"))
+
 # 裁判打分阶段前的缓冲避让冷却（秒）
 SOFT_DELAY_BEFORE_JUDGE = float(os.getenv("SOFT_DELAY_BEFORE_JUDGE", "3.0"))
 
 # LLM 生成超参数
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+LLM_STRUCTURED_TEMPERATURE = float(os.getenv("LLM_STRUCTURED_TEMPERATURE", "0.0"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
 LLM_FREQUENCY_PENALTY = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.2"))
 
@@ -94,6 +101,12 @@ PURIFY_LIMIT = int(PURIFY_LIMIT_RAW) if PURIFY_LIMIT_RAW and PURIFY_LIMIT_RAW.is
 
 # 提纯进程在全链路大并发时的最大并发度限制
 PURIFY_CONCURRENCY = int(os.getenv("PURIFY_CONCURRENCY", "25"))
+
+# 严格医疗事实/化学推演质检开关，开启时轻微幻觉或错词扣分将直接触发回滚
+PURIFY_STRICT_RIGOR = os.getenv("PURIFY_STRICT_RIGOR", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# 提纯失败时是否物理删除并隔离数据
+PURIFY_DELETE_ON_FAIL = os.getenv("PURIFY_DELETE_ON_FAIL", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # 净化起始行号 (1-based index)
 PURIFY_START_LINE_RAW = os.getenv("PURIFY_START_LINE", "").strip()
@@ -110,3 +123,7 @@ if PURIFY_LINES_RAW:
         PURIFY_LINES = []
 else:
     PURIFY_LINES = []
+
+# PubMed (NCBI API) 访问与限流控制配置
+PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "").strip()
+PUBMED_RATE_LIMIT = float(os.getenv("PUBMED_RATE_LIMIT", "10"))

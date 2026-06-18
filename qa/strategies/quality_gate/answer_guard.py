@@ -5,7 +5,7 @@ from typing import Tuple
 
 logger = logging.getLogger("MedicalQA.AnswerGuard")
 
-def check_answer_quality(answer_body: str, reasoning_content: str = "") -> Tuple[bool, str]:
+def check_answer_quality(answer_body: str, reasoning_content: str = "", simplify: bool = False) -> Tuple[bool, str]:
     """
     Runs quality guardrails to filter out refusals, lazy reasoning, and prompt pollutions.
     """
@@ -17,7 +17,7 @@ def check_answer_quality(answer_body: str, reasoning_content: str = "") -> Tuple
     if pollution_pattern.search(answer_body):
         return False, "prompt pollution"
         
-    if reasoning_content:
+    if reasoning_content and not simplify:
         cleaned_reasoning = reasoning_content.replace("<think>", "").replace("</think>", "").strip()
         if len(cleaned_reasoning) < 120:
             return False, f"lazy reasoning (too short: {len(cleaned_reasoning)} chars)"
